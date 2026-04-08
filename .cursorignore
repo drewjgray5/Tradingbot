@@ -1,0 +1,52 @@
+﻿# Dependencies & virtual envs
+**/node_modules/
+**/.venv/
+**/venv/
+
+# Python bytecode & tooling caches
+**/__pycache__/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.pytest_cache/
+**/.coverage
+**/htmlcov/
+
+# Logs & rotated logs (Extension Host / indexer friendly)
+**/*.log
+**/*.log.*
+**/trading_bot.log*
+
+# Large simulation / validation outputs
+**/mirofish_sims/
+**/artifacts/
+**/validation_artifacts/
+
+# Local DB / offline stacks (from .gitignore)
+**/.neo4j/
+**/neo4j_data/
+**/ollama/
+
+# Binary / model artifacts
+**/*.engine
+
+# Runtime JSON caches (order IDs, market data, filings — not source)
+**/.backtest_results.json
+**/.watchlist_cache.json
+**/.mirofish_cache.json
+**/.trade_outcomes.json
+**/.self_study.json
+**/.signal_alert_history.json
+**/.positions_tracker.json
+**/.forensic_cache.json
+**/.sector_map_cache.json
+**/.sec_cache.json
+**/.sec_filing_cache.json
+**/guardrail_trades.json
+**/execution_safety_metrics.json
+
+# Secrets (never index)
+**/.env
+**/.env.*
+**/*.enc
+**/*.pem
+**/*.key

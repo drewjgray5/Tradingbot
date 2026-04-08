@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Ruff
+        run: python -m ruff check .
+
+      - name: Pytest
+        run: python -m pytest -q
+
+      - name: Mypy
+        run: python -m mypy
+
+  strategy_quick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Strategy quick validators
+        run: |
+          python scripts/validate_hypothesis_chain.py
+          python scripts/validate_signal_quality.py
+          python scripts/validate_scanner_parallelization.py
+          python scripts/validate_shadow_mode.py
+
+      - name: Upload quick validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-strategy-quick-artifacts
+          path: |
+            validation_artifacts/**
+            .backtest_results.json
+          if-no-files-found: ignore

@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TradingBot Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#mainContent">Skip to main content</a>
+    <div class="bg-blur bg1"></div>
+    <div class="bg-blur bg2"></div>
+    <div class="bg-blur bg3"></div>
+
+    <main id="mainContent" class="container">
+      <header class="hero card">
+        <div>
+          <p class="eyebrow">Schwab + Strategy Control Center</p>
+          <h1>TradingBot Web Dashboard</h1>
+          <p class="muted">
+            Run scans, inspect diagnostics, review portfolio health, and approve/reject trade candidates in one place.
+          </p>
+          <div class="inline-form compact">
+            <label class="field-label" for="jwtInput">JWT</label>
+            <input id="jwtInput" type="password" placeholder="Supabase access token (Bearer JWT)" />
+            <button id="saveJwtBtn" class="btn small secondary" type="button">Save Token</button>
+          </div>
+        </div>
+        <div class="hero-actions">
+          <button id="refreshBtn" class="btn secondary">Refresh All</button>
+          <button id="scanBtn" class="btn primary">Run Scan</button>
+        </div>
+      </header>
+
+      <section id="healthRibbon" class="card health-ribbon" aria-label="System health ribbon">
+        <div class="health-item">
+          <span class="health-label">Auth</span>
+          <strong id="ribbonAuth" class="health-badge bg-red-900">Disconnected</strong>
+        </div>
+        <div class="health-item">
+          <span class="health-label">Quotes</span>
+          <strong id="ribbonQuotes" class="health-badge bg-red-900">Degraded</strong>
+        </div>
+        <div class="health-item">
+          <span class="health-label">API Error Rate</span>
+          <strong id="ribbonApiErrorRate" class="health-badge bg-green-900">0.0%</strong>
+        </div>
+        <div class="health-item">
+          <span class="health-label">Validation</span>
+          <strong id="ribbonValidation" class="health-badge bg-red-900">Unknown</strong>
+        </div>
+      </section>
+
+      <section id="blockersAlertSection" class="card blockers-alert hidden" aria-live="polite">
+        <strong>Top Blockers</strong>
+        <ul id="blockersAlertList" class="report-bullets"></ul>
+      </section>
+
+      <nav class="section-nav card" aria-label="Dashboard sections">
+        <a href="#onboardingSection">Onboarding</a>
+        <a href="#settingsSection">Presets</a>
+        <a href="#decisionSection">Decision</a>
+        <a href="#statusSection">Status</a>
+        <a href="#scanSection">Scan</a>
+        <a href="#pendingSection">Pending</a>
+        <a href="#portfolioSection">Portfolio</a>
+        <a href="#performanceSection">Performance</a>
+        <a href="#recoverySection">Recovery</a>
+        <a href="#quickCheckSection">Quick Check</a>
+        <a href="#reportSectionCard">Report</a>
+        <a href="#secCompareSection">SEC Compare</a>
+        <a href="#activitySection">Activity</a>
+      </nav>
+
+      <section id="actionCenter" class="card action-center" aria-live="polite">
+        <strong id="actionCenterTitle">System Messages</strong>
+        <p id="actionCenterText" class="muted">Ready. Use Run Scan or Refresh All to begin.</p>
+      </section>
+
+      <section class="layout-2">
+        <article id="onboardingSection" class="card">
+          <div class="section-title">
+            <h2>Onboarding Wizard</h2>
+            <small id="onboardingMeta" class="muted">Target completion: under 20 minutes</small>
+          </div>
+          <div class="inline-form">
+            <button id="onboardingStartBtn" class="btn secondary">Start Wizard</button>
+            <button id="onboardingConnectBtn" class="btn small secondary">1) Connect</button>
+            <button id="onboardingVerifyBtn" class="btn small secondary">2) Verify Token Health</button>
+            <button id="onboardingScanBtn" class="btn small secondary">3) Test Scan</button>
+            <button id="onboardingPaperBtn" class="btn small secondary">4) Test Paper Order</button>
+          </div>
+          <pre id="onboardingOutput" class="code-block">Wizard not started.</pre>
+        </article>
+        <article id="settingsSection" class="card">
+          <div class="section-title">
+            <h2>Strategy Presets</h2>
+            <small class="muted">Raw env settings hidden unless Expert mode is enabled.</small>
+          </div>
+          <div class="inline-form">
+            <label class="field-label" for="profileSelect">Profile</label>
+            <select id="profileSelect">
+              <option value="conservative">Conservative</option>
+              <option value="balanced" selected>Balanced</option>
+              <option value="aggressive">Aggressive</option>
+            </select>
+            <label class="field-label" for="settingsModeSelect">Mode</label>
+            <select id="settingsModeSelect">
+              <option value="standard" selected>Standard</option>
+              <option value="expert">Expert</option>
+            </select>
+            <label class="muted"><input id="automationOptIn" type="checkbox" /> opt into live automation</label>
+            <button id="applyProfileBtn" class="btn secondary">Apply Preset</button>
+          </div>
+          <pre id="profileOutput" class="code-block">No preset applied yet.</pre>
+        </article>
+      </section>
+
+      <section class="layout-2">
+        <article id="decisionSection" class="card">
+          <div class="section-title">
+            <h2>Single Trade Decision Card</h2>
+            <small class="muted">Take/Pass decision support in under 30 seconds.</small>
+          </div>
+          <div class="inline-form">
+            <label class="field-label" for="decisionTickerInput">Ticker</label>
+            <input id="decisionTickerInput" placeholder="AAPL" />
+            <button id="decisionBtn" class="btn secondary">Load Decision Card</button>
+          </div>
+          <pre id="decisionOutput" class="code-block">Run a scan, then load a ticker decision card.</pre>
+        </article>
+        <article id="recoverySection" class="card">
+          <div class="section-title">
+            <h2>Failure Recovery</h2>
+            <small class="muted">Plain-language next steps for auth/data/order errors.</small>
+          </div>
+          <div class="inline-form">
+            <label class="field-label" for="recoverySource">Source</label>
+            <select id="recoverySource">
+              <option value="schwab_auth">schwab_auth</option>
+              <option value="market_data">market_data</option>
+              <option value="execution">execution</option>
+            </select>
+            <input id="recoveryMessage" placeholder="Paste an error message..." />
+            <button id="recoveryBtn" class="btn secondary">Fix It Path</button>
+          </div>
+          <pre id="recoveryOutput" class="code-block">Paste an error to map recovery steps.</pre>
+        </article>
+      </section>
+
+      <section id="statusSection" class="stats">
+        <article id="statusMarketToken" class="card stat">
+          <span class="stat-label">Market Token</span>
+          <strong id="marketToken" class="pill neutral">Checking...</strong>
+        </article>
+        <article id="statusAccountToken" class="card stat">
+          <span class="stat-label">Account Token</span>
+          <strong id="accountToken" class="pill neutral">Checking...</strong>
+        </article>
+        <article id="statusLastScan" class="card stat">
+          <span class="stat-label">Last Scan</span>
+          <strong id="lastScan" class="pill neutral">Never</strong>
+        </article>
+        <article id="statusPendingTrades" class="card stat">
+          <span class="stat-label">Pending Trades</span>
+          <strong id="pendingCount" class="pill neutral">0</strong>
+        </article>
+        <article id="statusQuoteHealth" class="card stat">
+          <span class="stat-label">Quote Health</span>
+          <strong id="quoteHealth" class="pill neutral">Checking...</strong>
+        </article>
+        <article id="statusApiErrors" class="card stat">
+          <span class="stat-label">API Error Rate</span>
+          <strong id="apiErrorRate" class="pill neutral">--</strong>
+        </article>
+        <article id="statusValidation" class="card stat">
+          <span class="stat-label">Validation Health</span>
+          <strong id="validationHealth" class="pill neutral">Unknown</strong>
+          <small id="validationAge" class="muted">No validation artifact yet.</small>
+          <small id="validationProgress" class="muted">Progress: --</small>
+          <details id="validationRecentWrap" class="validation-steps">
+            <summary>Recent validation steps</summary>
+            <ul id="validationRecentSteps" class="validation-steps-list">
+              <li class="muted">No validation steps yet.</li>
+            </ul>
+          </details>
+        </article>
+      </section>
+
+      <section class="layout-2">
+        <article id="scanSection" class="card">
+          <div class="section-title">
+            <h2>Scan Results</h2>
+            <div class="scan-title-meta">
+              <small id="scanMeta" class="muted">No scan run yet.</small>
+              <span id="scanTopStrategy" class="chip">Top Strategy: --</span>
+            </div>
+          </div>
+          <div class="scan-insights">
+            <div class="scan-block">
+              <h3>Top Blockers</h3>
+              <ul id="scanBlockers" class="report-bullets"></ul>
+            </div>
+            <div class="scan-block">
+              <h3>Pass Funnel</h3>
+              <div id="scanFunnel" class="funnel-grid"></div>
+            </div>
+          </div>
+          <div id="scanDiagnostics" class="chip-row"></div>
+          <div class="table-wrap">
+            <table>
+              <caption class="visually-hidden">Signal candidates table</caption>
+              <thead>
+                <tr>
+                  <th>Ticker</th>
+                  <th>Strategy</th>
+                  <th>Price</th>
+                  <th>Score</th>
+                  <th>P(up 10d)</th>
+                  <th>Confidence</th>
+                  <th>Conviction</th>
+                  <th>Sector</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="scanTableBody">
+                <tr><td colspan="9" class="muted">Run a scan to load candidates.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article id="pendingSection" class="card">
+          <div class="section-title">
+            <h2>Pending Task Board</h2>
+            <small class="muted">Grouped by sector for rapid take/pass decisions.</small>
+          </div>
+          <div class="inline-form compact">
+            <label class="muted">Status
+              <select id="pendingFilter">
+                <option value="all">All</option>
+                <option value="pending">Pending</option>
+                <option value="executed">Executed</option>
+                <option value="rejected">Rejected</option>
+                <option value="failed">Failed</option>
+              </select>
+            </label>
+            <label class="muted">Sort
+              <select id="pendingSort">
+                <option value="newest">Newest</option>
+                <option value="oldest">Oldest</option>
+              </select>
+            </label>
+          </div>
+          <div id="pendingBoard" class="task-board">
+            <div class="task-empty muted">No trades yet.</div>
+          </div>
+        </article>
+      </section>
+
+      <section class="layout-2">
+        <article id="portfolioSection" class="card">
+          <div class="section-title">
+            <h2>Portfolio</h2>
+            <small id="portfolioMeta" class="muted">Loading...</small>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <caption class="visually-hidden">Portfolio positions table</caption>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Qty</th>
+                  <th>Last</th>
+                  <th>Market Value</th>
+                  <th>P/L %</th>
+                </tr>
+              </thead>
+              <tbody id="portfolioBody">
+                <tr><td colspan="5" class="muted">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article id="sectorsSection" class="card">
+          <div class="section-title">
+            <h2>Sectors</h2>
+            <small class="muted">21-day relative performance vs SPY</small>
+          </div>
+          <div id="sectorGrid" class="sector-grid"></div>
+        </article>
+      </section>
+
+      <section class="layout-2">
+        <article id="performanceSection" class="card">
+          <div class="section-title">
+            <h2>Performance</h2>
+            <small class="muted">Backtest vs Shadow/Paper vs Live are separated.</small>
+          </div>
+          <div class="inline-form">
+            <button id="performanceRefreshBtn" class="btn secondary">Refresh Performance</button>
+          </div>
+          <pre id="performanceOutput" class="code-block">No performance snapshot loaded yet.</pre>
+        </article>
+        <article id="quickCheckSection" class="card">
+          <div class="section-title">
+            <h2>Quick Check</h2>
+            <small class="muted">Ticker health summary</small>
+          </div>
+          <div class="inline-form">
+            <label class="field-label" for="tickerInput">Ticker</label>
+            <input id="tickerInput" placeholder="AAPL" />
+            <button id="checkBtn" class="btn secondary">Check</button>
+          </div>
+          <pre id="checkOutput" class="code-block">No check run yet.</pre>
+        </article>
+
+        <article id="reportSectionCard" class="card">
+          <div class="section-title">
+            <h2>Full Report</h2>
+            <small class="muted">/report equivalent for web</small>
+          </div>
+          <div class="inline-form">
+            <label class="field-label" for="reportTickerInput">Ticker</label>
+            <input id="reportTickerInput" placeholder="AAPL" />
+            <label class="field-label" for="reportSection">Section</label>
+            <select id="reportSection">
+              <option value="">All sections</option>
+              <option value="tech">tech</option>
+              <option value="dcf">dcf</option>
+              <option value="comps">comps</option>
+              <option value="health">health</option>
+              <option value="edgar">edgar</option>
+              <option value="mirofish">mirofish</option>
+            </select>
+            <label class="muted"><input id="skipMirofish" type="checkbox" /> skip_mirofish</label>
+            <label class="muted"><input id="skipEdgar" type="checkbox" /> skip_edgar</label>
+            <button id="reportBtn" class="btn secondary">Run Report</button>
+            <button id="toggleReportViewBtn" class="btn small primary" type="button">Show Raw JSON</button>
+          </div>
+          <div id="reportTabs" class="report-tabs"></div>
+          <div id="reportVisual" class="report-visual">
+            <div class="report-empty">No report run yet.</div>
+          </div>
+          <pre id="reportOutput" class="code-block">No report run yet.</pre>
+        </article>
+      </section>
+
+      <section class="layout-2">
+        <article id="secCompareSection" class="card">
+          <div class="section-title">
+            <h3>SEC Filing Compare</h3>
+            <small class="muted">High-level compare and contrast from filings</small>
+          </div>
+          <div class="inline-form">
+            <label class="field-label" for="secCompareMode">Mode</label>
+            <select id="secCompareMode">
+              <option value="ticker_vs_ticker">ticker_vs_ticker</option>
+              <option value="ticker_over_time">ticker_over_time</option>
+            </select>
+            <label class="field-label" for="secCompareTickerA">Ticker A</label>
+            <input id="secCompareTickerA" placeholder="Ticker A (AAPL)" />
+            <label class="field-label" for="secCompareTickerB">Ticker B</label>
+            <input id="secCompareTickerB" placeholder="Ticker B (MSFT)" />
+            <label class="field-label" for="secCompareFormType">Form</label>
+            <select id="secCompareFormType">
+              <option value="10-K">10-K</option>
+              <option value="10-Q">10-Q</option>
+              <option value="8-K">8-K</option>
+            </select>
+            <label class="muted">
+              <input id="secCompareChangesOnly" type="checkbox" />
+              Highlight Changes Only
+            </label>
+            <button id="secCompareBtn" class="btn secondary" type="button">Run SEC Compare</button>
+          </div>
+          <div id="secComparePresetButtons" class="compare-presets" aria-label="Common rivalries">
+            <button class="btn small secondary" type="button" data-mode="ticker_vs_ticker" data-a="NVDA" data-b="AMD">NVDA vs AMD</button>
+            <button class="btn small secondary" type="button" data-mode="ticker_vs_ticker" data-a="AAPL" data-b="MSFT">AAPL vs MSFT</button>
+            <button class="btn small secondary" type="button" data-mode="ticker_vs_ticker" data-a="AMZN" data-b="WMT">AMZN vs WMT</button>
+            <button class="btn small secondary" type="button" data-mode="ticker_over_time" data-a="NVDA" data-b="">NVDA over time</button>
+          </div>
+          <div id="secCompareMeta" class="muted compare-meta">No SEC compare run yet.</div>
+          <div id="secCompareHeadline" class="compare-headline">
+            <div class="report-empty">Run SEC compare to generate a headline verdict.</div>
+          </div>
+          <div id="secCompareNarrative" class="compare-narrative">
+            <div class="report-empty">Narrative summary will appear here.</div>
+          </div>
+          <div id="secCompareChanges" class="compare-changes">
+            <div class="report-empty">Material changes and shared signals will appear here.</div>
+          </div>
+          <div id="secCompareVisual" class="report-visual">
+            <div class="report-empty">Side-by-side evidence cards will appear here.</div>
+          </div>
+        </article>
+        <article id="activitySection" class="card">
+          <div class="section-title">
+            <h2>Execution Notes</h2>
+            <small class="muted">Use the bottom drawer for real-time activity.</small>
+          </div>
+          <div class="report-empty">Activity has moved to the collapsible drawer at bottom.</div>
+        </article>
+      </section>
+    </main>
+
+    <aside id="quickViewPanel" class="quick-view-panel" aria-label="Quick decision panel">
+      <div class="quick-view-header">
+        <h3>Decision Quick View</h3>
+        <button id="closeQuickViewBtn" class="btn small secondary" type="button">Close</button>
+      </div>
+      <pre id="quickViewOutput" class="code-block">Select Quick View on a task card to preview decision details.</pre>
+    </aside>
+
+    <section id="activityDrawer" class="activity-drawer">
+      <button id="activityDrawerToggle" class="activity-drawer-toggle" type="button" aria-expanded="false">
+        Activity Drawer
+      </button>
+      <div id="activityDrawerBody" class="activity-drawer-body">
+        <ul id="logList" class="log-list"></ul>
+      </div>
+    </section>
+
+    <dialog id="approveDialog" class="modal">
+      <form method="dialog">
+        <h3>Confirm Live Trade</h3>
+        <p id="approveSummary" class="muted"></p>
+        <p class="warn-text">
+          This sends a live market order through Schwab.
+        </p>
+        <div class="modal-actions">
+          <button id="cancelApproveBtn" class="btn secondary" value="cancel">Cancel</button>
+          <button id="confirmApproveBtn" class="btn good" value="default">Confirm Approve</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
+

@@ -1,0 +1,59 @@
+# Secrets and credentials
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+tokens_*.enc
+*.enc
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+.venv/
+venv/
+
+# Runtime logs and artifacts
+*.log
+trading_bot.log*
+*.sqlite
+*.db
+*.db-journal
+
+# Local state and caches
+.backtest_results.json
+.forensic_cache.json
+.mirofish_cache.json
+.positions_tracker.json
+.sector_map_cache.json
+.sec_cache.json
+.sec_filing_cache.json
+.self_study.json
+.signal_alert_history.json
+.signal_quality_metrics.json
+.trade_outcomes.json
+.watchlist_cache.json
+guardrail_trades.json
+execution_safety_metrics.json
+
+# Generated/model artifacts
+artifacts/
+validation_artifacts/
+mirofish_sims/
+
+# Editor/OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

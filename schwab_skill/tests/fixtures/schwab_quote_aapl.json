@@ -1,0 +1,12 @@
+{
+  "assetMainType": "EQUITY",
+  "symbol": "AAPL",
+  "quoteType": "NBBO",
+  "lastPrice": 198.5,
+  "bidPrice": 198.45,
+  "askPrice": 198.55,
+  "quoteTimeInLong": 1712505600000,
+  "bidSize": 200,
+  "askSize": 200,
+  "tradeTimeInLong": 1712505600000
+}

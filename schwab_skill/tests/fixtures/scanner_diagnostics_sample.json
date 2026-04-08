@@ -1,0 +1,9 @@
+{
+  "watchlist_size": 120,
+  "data_quality": "ok",
+  "data_quality_reasons": [],
+  "stage2_fail": 40,
+  "vcp_fail": 12,
+  "exceptions": 0,
+  "quality_gates_mode": "shadow"
+}

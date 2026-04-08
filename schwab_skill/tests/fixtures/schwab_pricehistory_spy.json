@@ -1,0 +1,22 @@
+{
+  "symbol": "SPY",
+  "empty": false,
+  "candles": [
+    {
+      "open": 500.0,
+      "high": 502.0,
+      "low": 499.0,
+      "close": 501.0,
+      "volume": 1000000,
+      "datetime": 1712275200000
+    },
+    {
+      "open": 501.0,
+      "high": 503.0,
+      "low": 500.5,
+      "close": 502.5,
+      "volume": 1100000,
+      "datetime": 1712361600000
+    }
+  ]
+}

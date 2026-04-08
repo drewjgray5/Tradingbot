@@ -1,0 +1,36 @@
+# Secrets
+.env
+*.enc
+tokens_*.enc
+localhost.pem
+localhost-key.pem
+
+# Logs
+*.log
+trading_bot.log*
+
+# Trade log (contains order IDs)
+guardrail_trades.json
+.backtest_results.json
+.watchlist_cache.json
+.mirofish_cache.json
+.trade_outcomes.json
+.self_study.json
+.signal_alert_history.json
+.positions_tracker.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env.local
+
+# MiroFish / Agent simulation
+mirofish_sims/
+*.engine
+
+# Neo4j / Ollama (MiroFish offline)
+.neo4j/
+neo4j_data/
+ollama/

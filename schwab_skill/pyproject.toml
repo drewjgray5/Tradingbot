@@ -1,0 +1,25 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+exclude = ["artifacts", "validation_artifacts", "mirofish_sims", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+# Imports after sys.path bootstrap in these entrypoints are intentional.
+extend-per-file-ignores = { "full_report.py" = ["E402"], "run_auth.py" = ["E402"], "run_dual_auth.py" = ["E402"], "scripts/**" = ["E402"] }
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+exclude = "(artifacts|validation_artifacts|mirofish_sims|__pycache__)"
+explicit_package_bases = true
+namespace_packages = true
+files = ["tests"]
+follow_imports = "skip"
+disable_error_code = ["import-untyped"]

@@ -1,0 +1,44 @@
+1
+00:00:00,000 --> 00:00:03,000
+Most traders don't lose because of bad ideas.
+They lose in bad execution.
+
+2
+00:00:03,000 --> 00:00:10,000
+You scan charts, second-guess entries,
+and by the time you act, the move is gone.
+
+3
+00:00:10,000 --> 00:00:18,000
+This bot scans for high-quality breakouts,
+scores them, and prioritizes what matters.
+
+4
+00:00:18,000 --> 00:00:25,000
+It checks trend, sector strength, and conviction,
+then sends alerts directly to Discord.
+
+5
+00:00:25,000 --> 00:00:32,000
+Before execution, it applies guardrails:
+position limits and daily trade limits.
+
+6
+00:00:32,000 --> 00:00:38,000
+You confirm first.
+Then it executes with control.
+
+7
+00:00:38,000 --> 00:00:48,000
+It logs outcomes, tracks performance,
+and improves filtering over time.
+
+8
+00:00:48,000 --> 00:00:56,000
+If you want disciplined execution
+without the chaos, follow and join the demo waitlist.
+
+9
+00:00:56,000 --> 00:01:00,000
+Educational only.
+Not financial advice.

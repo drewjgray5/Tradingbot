@@ -1,0 +1,37 @@
+name: Strategy Scheduled Validation
+
+on:
+  schedule:
+    - cron: "15 11 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  scheduled_strategy_validation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run fast CI validation profile
+        run: |
+          python scripts/validate_all.py --profile ci --skip-backtest --strict
+
+      - name: Upload validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-scheduled-validation-artifacts
+          path: |
+            validation_artifacts/**
+            .backtest_results.json
+          if-no-files-found: ignore
