@@ -42,34 +42,32 @@ Frozen Schwab-shaped samples and scanner diagnostics live under `tests/fixtures/
 
 ## Cursor Cloud specific instructions
 
-All work lives under `schwab_skill/` — run every command from that directory.
+All work runs from `schwab_skill/` (in Cursor Cloud that is often `/workspace/schwab_skill`). Use `python3` — there is typically no `python` symlink.
+
+### Services
+
+| Service | How to run | Notes |
+|---------|-----------|-------|
+| **FastAPI dashboard** | `python3 -m uvicorn webapp.main:app --reload --port 8000` | Local single-user dashboard; SQLite by default. |
+| **SaaS API** | `python3 -m uvicorn webapp.main_saas:app --host 0.0.0.0 --port 8000` | Multi-tenant mode; Postgres + Redis + Celery (see `docker-compose.saas.yml`). |
+
+### Quality checks
+
+See **Quality Commands** above. Ruff may report a pre-existing import-sort warning in `webapp/main_saas.py` (`--fix`). Mypy reports ~90 pre-existing type errors (e.g. `None`-safety in `forensic_accounting.py` and `signal_scanner.py`); known and not treated as blocking for routine work.
 
 ### SQLite + Alembic circular-dependency gotcha
 
-`webapp/main.py` calls `Base.metadata.create_all()` then `alembic upgrade head` on import. When the SQLite file doesn't exist yet, the migrations' `batch_alter_table` hits a `CircularDependencyError` (columns `created_at`, `updated_at`, `live_execution_enabled` form a topo-sort cycle). **Workaround before running tests or the dev server for the first time:**
+When `webapp.main` is first imported, it runs `Base.metadata.create_all()` then `alembic upgrade head`. On a **fresh** SQLite file, batch migrations can hit a `CircularDependencyError`. **Before first dev server or full pytest run:**
 
 ```bash
-cd /workspace/schwab_skill
+cd /workspace/schwab_skill   # or your local path to schwab_skill
 rm -f webapp/webapp.db
-python3 -c "from webapp.db import engine, Base; Base.metadata.create_all(bind=engine)"
-python3 -c "from alembic.config import Config; from alembic import command; command.stamp(Config('alembic.ini'), 'head')"
+python3 -c "from webapp.db import Base, engine; Base.metadata.create_all(bind=engine)"
+python3 -m alembic stamp head
 ```
 
-This creates the schema from the ORM models (which already include all columns) then stamps Alembic to `head` so the migration is never re-run.
+This builds schema from the ORM and stamps Alembic to `head` so the problematic migration is skipped. After this, `python3 -m pytest -q` is the usual full suite; `python3 -m pytest -q --ignore=tests/test_smoke.py` skips smoke tests if you want to avoid DB setup.
 
-### Quick reference (also documented in README and AGENTS.md Quality Commands)
+### External credentials
 
-| Action | Command |
-|--------|---------|
-| Install deps | `pip install -r requirements-dev.txt` |
-| Lint | `python3 -m ruff check .` |
-| Format | `python3 -m ruff format .` |
-| Test | `python3 -m pytest -q` |
-| Typecheck | `python3 -m mypy .` |
-| Dev server | `python3 -m uvicorn webapp.main:app --reload --port 8000` |
-
-### Notes
-
-- The system has `python3` but no `python` symlink; always use `python3`.
-- `mypy` reports ~90 pre-existing type errors (mainly `None`-safety in `forensic_accounting.py` and `signal_scanner.py`); these are known and not blocking.
-- External API credentials (Schwab, Discord, OpenAI) are not required for local dev/test; the app and tests run with SQLite and no broker auth.
+Schwab, Discord, Stripe, and similar keys are **not** required for lint, tests, or dashboard UI exploration; broker integrations show as disconnected without them.
