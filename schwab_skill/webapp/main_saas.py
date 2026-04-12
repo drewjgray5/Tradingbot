@@ -47,6 +47,8 @@ from .schemas import (
     UpdateTradingHaltRequest,
 )
 from .security import (
+    auth_session_cookie_name,
+    decode_supabase_jwt,
     encrypt_secret,
     get_current_user,
     parse_json,
@@ -169,6 +171,36 @@ def _db() -> Session:
         yield db
     finally:
         db.close()
+
+
+def _auth_cookie_secure() -> bool:
+    """Default to secure cookies outside local dev."""
+    raw = (os.getenv("AUTH_SESSION_COOKIE_SECURE") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    env = (os.getenv("ENV") or os.getenv("APP_ENV") or "").strip().lower()
+    return env not in ("", "dev", "development", "local")
+
+
+def _set_auth_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=auth_session_cookie_name(),
+        value=token,
+        httponly=True,
+        secure=_auth_cookie_secure(),
+        samesite="lax",
+        max_age=60 * 60 * 24 * 7,  # 7 days; token exp still governs auth validity
+        path="/",
+    )
+
+
+def _clear_auth_session_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=auth_session_cookie_name(),
+        path="/",
+    )
 
 
 def _json_default(value: Any) -> Any:
@@ -336,6 +368,40 @@ def health() -> ApiResponse:
             "queue_backend": celery_app.conf.result_backend,
         }
     )
+
+
+@app.post("/api/auth/session", response_model=ApiResponse)
+def auth_create_session(
+    response: Response,
+    payload: dict[str, Any] | None = Body(default=None),
+) -> ApiResponse:
+    """Exchange client JWT for HttpOnly cookie session (JWT remains validation source)."""
+    body = payload or {}
+    token = str(body.get("access_token") or body.get("token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="access_token is required.")
+    claims = decode_supabase_jwt(token)
+    if not str(claims.get("sub") or "").strip():
+        raise HTTPException(status_code=401, detail="JWT missing subject claim.")
+    _set_auth_session_cookie(response, token)
+    return _ok({"session_cookie_set": True})
+
+
+@app.delete("/api/auth/session", response_model=ApiResponse)
+def auth_destroy_session(response: Response) -> ApiResponse:
+    _clear_auth_session_cookie(response)
+    return _ok({"session_cookie_cleared": True})
+
+
+@app.get("/api/auth/session", response_model=ApiResponse)
+def auth_session_status(
+    request: Request,
+) -> ApiResponse:
+    token = (request.cookies.get(auth_session_cookie_name()) or "").strip()
+    if not token:
+        return _ok({"authenticated": False})
+    claims = decode_supabase_jwt(token)
+    return _ok({"authenticated": True, "sub": claims.get("sub"), "email": claims.get("email")})
 
 
 @app.get("/api/health/live", response_model=ApiResponse)

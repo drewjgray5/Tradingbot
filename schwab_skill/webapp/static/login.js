@@ -2,6 +2,7 @@
  * Focused sign-in page: shares JWT localStorage key with the main dashboard (`tradingbot.jwt`).
  */
 const AUTH_TOKEN_KEY = "tradingbot.jwt";
+const LEGACY_AUTH_TOKEN_KEYS = ["supabasetoken", "supabaseToken", "supabase_token"];
 const SUPABASE_ESM = "https://esm.sh/@supabase/supabase-js@2.49.1";
 
 let supabaseClient = null;
@@ -11,9 +12,58 @@ function setMessage(text) {
   if (el) el.textContent = text || "";
 }
 
+function clearLegacyApiJwtKeys() {
+  LEGACY_AUTH_TOKEN_KEYS.forEach((key) => localStorage.removeItem(key));
+}
+
+function readStoredApiJwt() {
+  const current = (localStorage.getItem(AUTH_TOKEN_KEY) || "").trim();
+  if (current) return current;
+  for (const key of LEGACY_AUTH_TOKEN_KEYS) {
+    const legacy = (localStorage.getItem(key) || "").trim();
+    if (!legacy) continue;
+    localStorage.setItem(AUTH_TOKEN_KEY, legacy);
+    clearLegacyApiJwtKeys();
+    return legacy;
+  }
+  return "";
+}
+
+function clearStoredApiJwt() {
+  localStorage.removeItem(AUTH_TOKEN_KEY);
+  clearLegacyApiJwtKeys();
+}
+
+async function createCookieSession(token) {
+  if (!token) return;
+  try {
+    await fetch("/api/auth/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ access_token: token }),
+    });
+  } catch (e) {
+    console.warn("auth cookie set failed", e);
+  }
+}
+
+async function clearCookieSession() {
+  try {
+    await fetch("/api/auth/session", {
+      method: "DELETE",
+      credentials: "include",
+    });
+  } catch (e) {
+    console.warn("auth cookie clear failed", e);
+  }
+}
+
 function persistJwt(session) {
   if (session?.access_token) {
     localStorage.setItem(AUTH_TOKEN_KEY, session.access_token);
+    clearLegacyApiJwtKeys();
+    void createCookieSession(session.access_token);
     const inp = document.getElementById("loginJwt");
     if (inp) inp.value = "";
   }
@@ -83,7 +133,8 @@ async function initSupabase(url, anonKey) {
   });
   document.getElementById("loginSbSignOut")?.addEventListener("click", async () => {
     await supabaseClient.auth.signOut();
-    localStorage.removeItem(AUTH_TOKEN_KEY);
+    await clearCookieSession();
+    clearStoredApiJwt();
     const inp = document.getElementById("loginJwt");
     if (inp) inp.value = "";
     setMessage("Signed out.");
@@ -93,15 +144,18 @@ async function initSupabase(url, anonKey) {
 async function main() {
   const jwtInput = document.getElementById("loginJwt");
   const wrap = document.getElementById("loginSupabase");
-  if (jwtInput) jwtInput.value = localStorage.getItem(AUTH_TOKEN_KEY) || "";
+  if (jwtInput) jwtInput.value = readStoredApiJwt();
 
   document.getElementById("loginJwtSave")?.addEventListener("click", () => {
     const val = jwtInput?.value?.trim() || "";
     if (val) {
       localStorage.setItem(AUTH_TOKEN_KEY, val);
+      clearLegacyApiJwtKeys();
+      void createCookieSession(val);
       setMessage("Token saved for this browser.");
     } else {
-      localStorage.removeItem(AUTH_TOKEN_KEY);
+      void clearCookieSession();
+      clearStoredApiJwt();
       setMessage("Token cleared.");
     }
   });

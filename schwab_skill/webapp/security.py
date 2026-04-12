@@ -8,7 +8,7 @@ from typing import Any
 
 import jwt
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from .billing_stripe import user_has_paid_entitlement
@@ -81,6 +81,11 @@ def decode_supabase_jwt(token: str) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail=f"Invalid JWT: {exc}") from exc
 
 
+def auth_session_cookie_name() -> str:
+    name = (os.getenv("AUTH_SESSION_COOKIE_NAME") or "tradingbot_session").strip()
+    return name or "tradingbot_session"
+
+
 def _get_db() -> Session:
     db = SessionLocal()
     try:
@@ -91,12 +96,38 @@ def _get_db() -> Session:
 
 def get_current_user(
     authorization: str | None = Header(default=None),
+    request: Request | None = None,
     db: Session = Depends(_get_db),
 ) -> User:
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing Authorization: Bearer <jwt> header.")
-    token = authorization.split(" ", 1)[1].strip()
-    claims = decode_supabase_jwt(token)
+    tokens: list[str] = []
+    if authorization and authorization.lower().startswith("bearer "):
+        bearer = authorization.split(" ", 1)[1].strip()
+        if bearer:
+            tokens.append(bearer)
+    if request is not None:
+        cookie_token = (request.cookies.get(auth_session_cookie_name()) or "").strip()
+        if cookie_token:
+            tokens.append(cookie_token)
+    if not tokens:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing authentication. Provide Authorization: Bearer <jwt> or a valid auth session cookie.",
+        )
+
+    last_error: HTTPException | None = None
+    claims: dict[str, Any] | None = None
+    for token in tokens:
+        try:
+            claims = decode_supabase_jwt(token)
+            break
+        except HTTPException as exc:
+            last_error = exc
+            continue
+    if claims is None:
+        if last_error is not None:
+            raise last_error
+        raise HTTPException(status_code=401, detail="Invalid JWT.")
+
     user_id = str(claims.get("sub") or "").strip()
     if not user_id:
         raise HTTPException(status_code=401, detail="JWT missing subject claim.")
