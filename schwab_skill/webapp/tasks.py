@@ -13,6 +13,7 @@ from execution import place_order
 from signal_scanner import scan_for_signals_detailed
 
 from .billing_stripe import user_has_paid_entitlement
+from .calibration_snapshot import build_calibration_snapshot
 from .db import SessionLocal
 from .models import AppState, BacktestRun, Order, ScanResult, User
 from .scan_payload import scan_runtime_kwargs
@@ -64,6 +65,27 @@ def _strategy_summary_from_signals(signals: list[dict[str, Any]]) -> dict[str, A
         "total_ranked": len(rows),
         "counts": {k: v for k, v in ranked},
     }
+
+
+def _persist_calibration_snapshot(db: Any, user_id: str, skill_dir: Any) -> None:
+    try:
+        snap = build_calibration_snapshot(skill_dir)
+        if not snap.get("self_study") and not snap.get("hypothesis_ledger"):
+            return
+        row = (
+            db.query(AppState)
+            .filter(AppState.user_id == user_id, AppState.key == "calibration_snapshot")
+            .first()
+        )
+        blob = json.dumps(snap, default=_json_default)
+        if not row:
+            db.add(AppState(user_id=user_id, key="calibration_snapshot", value_json=blob))
+        else:
+            row.value_json = blob
+        db.commit()
+    except Exception as exc:
+        LOG.debug("calibration snapshot persist skipped: %s", exc)
+        db.rollback()
 
 
 def _persist_user_last_scan(
@@ -142,6 +164,10 @@ def scan_for_user(user_id: str, scan_options: dict[str, Any] | None = None) -> d
                     job_id,
                     persist_exc,
                 )
+            try:
+                _persist_calibration_snapshot(db, user_id, skill_dir)
+            except Exception as cal_exc:
+                LOG.debug("calibration snapshot after scan: %s", cal_exc)
             # Celery JSON backend requires a JSON-serializable payload (no numpy, etc.).
             out = {
                 "ok": True,

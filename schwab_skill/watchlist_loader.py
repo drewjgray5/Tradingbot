@@ -7,12 +7,17 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 LOG = logging.getLogger(__name__)
 SKILL_DIR = Path(__file__).resolve().parent
 CACHE_FILE = SKILL_DIR / ".watchlist_cache.json"
 CACHE_HOURS = 24
+
+
+def _utc_calendar_date() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 LIQUID_ETF_HINTS = {"SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU", "XLC", "XLRE"}
 
 
@@ -86,8 +91,8 @@ def _fetch_russell2000() -> list[str]:
     return tickers
 
 
-def _load_cached() -> tuple[list[str], float] | None:
-    """Load cached watchlist. Returns (tickers, timestamp) or None."""
+def _load_cached() -> tuple[list[str], float, str | None] | None:
+    """Load cached watchlist. Returns (tickers, timestamp, as_of_utc_date or None) or None."""
     if not CACHE_FILE.exists():
         return None
     try:
@@ -96,8 +101,11 @@ def _load_cached() -> tuple[list[str], float] | None:
         data = json.loads(CACHE_FILE.read_text())
         tickers = data.get("tickers", [])
         ts = data.get("timestamp", 0)
-        if tickers and ts:
-            return tickers, ts
+        if not tickers or not ts:
+            return None
+        as_of = data.get("as_of_utc_date")
+        as_of_s = as_of.strip() if isinstance(as_of, str) else None
+        return tickers, float(ts), as_of_s or None
     except Exception as e:
         LOG.warning("Watchlist cache read failed: %s", e)
     return None
@@ -107,7 +115,12 @@ def _save_cache(tickers: list[str]) -> None:
     """Save watchlist to cache (MiroFish uses separate .mirofish_cache.json)."""
     try:
         import json
-        data = {"tickers": tickers, "timestamp": time.time()}
+
+        data = {
+            "tickers": tickers,
+            "timestamp": time.time(),
+            "as_of_utc_date": _utc_calendar_date(),
+        }
         CACHE_FILE.write_text(json.dumps(data, indent=0))
     except Exception as e:
         LOG.warning("Watchlist cache write failed: %s", e)
@@ -115,14 +128,19 @@ def _save_cache(tickers: list[str]) -> None:
 
 def load_full_watchlist(force_refresh: bool = False) -> list[str]:
     """
-    Load S&P 500 + S&P 400 + S&P 600 + Russell 2000 watchlist. Uses cache if < 24h old.
+    Load S&P 500 + S&P 400 + S&P 600 + Russell 2000 watchlist.
+    Uses cache for the same UTC calendar day (daily refresh), or if the cache file
+    predates as_of_utc_date, falls back to the prior <24h timestamp rule.
     Returns deduplicated list of tickers, all sectors.
     """
     if not force_refresh:
         cached = _load_cached()
         if cached:
-            tickers, ts = cached
-            if (time.time() - ts) < CACHE_HOURS * 3600:
+            tickers, ts, as_of = cached
+            today = _utc_calendar_date()
+            cache_fresh_for_day = as_of == today
+            legacy_fresh = as_of is None and (time.time() - ts) < CACHE_HOURS * 3600
+            if cache_fresh_for_day or legacy_fresh:
                 LOG.debug("Using cached watchlist (%d tickers)", len(tickers))
                 return tickers
 

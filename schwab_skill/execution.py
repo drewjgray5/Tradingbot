@@ -389,6 +389,53 @@ class GuardrailWrapper:
         if new_val > self._max_pos:
             _record_execution_metric(self.skill_dir, "guardrail_block_max_position")
             return f"GUARDRAIL: Position size for {ticker} would be ${new_val:,.2f}, exceeding maximum ${self._max_pos:,.2f} per ticker. Blocking trade request."
+        sec_err = self._check_sector_concentration(
+            ticker, order_value_usd, total, positions
+        )
+        if sec_err:
+            return sec_err
+        return None
+
+    def _check_sector_concentration(
+        self,
+        ticker: str,
+        order_value_usd: float,
+        total_equity: float,
+        positions: dict[str, float],
+    ) -> str | None:
+        try:
+            from config import get_max_sector_account_fraction
+
+            max_frac = float(get_max_sector_account_fraction(self.skill_dir))
+        except Exception:
+            max_frac = 0.0
+        if max_frac <= 0 or total_equity <= 0:
+            return None
+        try:
+            from sector_strength import get_ticker_sector_etf
+        except ImportError:
+            return None
+        target_etf = get_ticker_sector_etf(ticker, skill_dir=self.skill_dir)
+        if not target_etf:
+            return None
+        sector_totals: dict[str, float] = {}
+        for sym, mv in positions.items():
+            etf = get_ticker_sector_etf(sym, skill_dir=self.skill_dir)
+            key = etf or "UNKNOWN"
+            sector_totals[key] = sector_totals.get(key, 0.0) + float(mv or 0)
+        current = sector_totals.get(target_etf, 0.0)
+        projected = current + float(order_value_usd)
+        frac = projected / total_equity
+        if frac > max_frac:
+            _record_execution_metric(
+                self.skill_dir,
+                "guardrail_block_sector_concentration",
+                reason=target_etf,
+            )
+            return (
+                f"GUARDRAIL: Sector {target_etf} would be {frac:.1%} of account "
+                f"(limit {max_frac:.1%}) after this order. Blocking new risk."
+            )
         return None
 
     def _check_data_quality_guard(self, order: dict, ticker: str) -> str | None:
@@ -1381,6 +1428,29 @@ def place_order(
             px = float(price_hint)
         if px is not None:
             order_value = abs(float(qty)) * px
+
+    try:
+        from config import (
+            get_live_trading_kill_switch,
+            get_live_trading_kill_switch_blocks_exits,
+            get_user_trading_halted,
+        )
+
+        halted = get_live_trading_kill_switch(skill_dir) or get_user_trading_halted(
+            skill_dir
+        )
+        blocks_exits = get_live_trading_kill_switch_blocks_exits(skill_dir)
+    except Exception:
+        halted = False
+        blocks_exits = False
+    if halted and (blocks_exits or wrapper._increases_position(primary)):
+        _record_execution_metric(skill_dir, "guardrail_block_trading_halted")
+        msg = (
+            "GUARDRAIL: Live trading is halted (platform kill switch or account pause). "
+            "No order was sent."
+        )
+        send_alert(msg, kind="guardrail", env_path=skill_dir / ".env")
+        return msg
 
     err = wrapper._check_guardrails(ticker_n, int(qty), primary, order_value)
     if err:

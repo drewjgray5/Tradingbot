@@ -2,10 +2,14 @@
 Logging configuration for the trading bot.
 
 Outputs to console and a rotating trading_bot.log file (5MB limit).
+Optional request_id via contextvars (set from HTTP middleware or jobs).
 """
+
+from __future__ import annotations
 
 import logging
 import sys
+from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -15,6 +19,17 @@ BACKUP_COUNT = 3
 
 # Default log dir: same as this module
 LOG_DIR = Path(__file__).resolve().parent
+
+request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
+
+
+class RequestIdFilter(logging.Filter):
+    """Injects request_id from contextvars into LogRecord for %(request_id)s."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        rid = request_id_var.get()
+        record.request_id = rid if rid else "-"
+        return True
 
 
 def setup_logging(
@@ -33,14 +48,16 @@ def setup_logging(
     root.handlers.clear()
 
     fmt = logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(request_id)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    req_filt = RequestIdFilter()
 
     # Console
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(level)
     ch.setFormatter(fmt)
+    ch.addFilter(req_filt)
     root.addHandler(ch)
 
     # Rotating file (5MB)
@@ -52,6 +69,7 @@ def setup_logging(
     )
     fh.setLevel(level)
     fh.setFormatter(fmt)
+    fh.addFilter(req_filt)
     root.addHandler(fh)
 
     return root

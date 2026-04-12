@@ -16,7 +16,12 @@ from sqlalchemy.pool import StaticPool
 from webapp import main_saas, tenant_dashboard
 from webapp.db import Base
 from webapp.models import PendingTrade, User, UserCredential
-from webapp.security import encrypt_secret, get_current_user
+from webapp.oauth_schwab import (
+    SCHWAB_OAUTH_KIND_ACCOUNT,
+    SCHWAB_OAUTH_KIND_MARKET,
+    sign_schwab_oauth_state,
+)
+from webapp.security import decrypt_secret, encrypt_secret, get_current_user
 
 
 @pytest.fixture
@@ -203,3 +208,160 @@ def test_wrong_typed_ticker_rejected(saas_client: TestClient, test_db: sessionma
     )
     assert r.status_code == 200
     assert r.json().get("ok") is False
+
+
+def test_trading_halted_blocks_approve(saas_client: TestClient, test_db: sessionmaker) -> None:
+    db = test_db()
+    try:
+        _seed_user_with_schwab(db)
+        u = db.query(User).filter(User.id == "user_1").one()
+        u.live_execution_enabled = True
+        u.trading_halted = True
+        db.add(
+            PendingTrade(
+                id="halt001",
+                user_id="user_1",
+                ticker="MSFT",
+                qty=1,
+                price=200.0,
+                status="pending",
+                signal_json="{}",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    r = saas_client.post(
+        "/api/trades/halt001/approve?confirm_live=true",
+        json={"typed_ticker": "MSFT"},
+        headers=_auth_header(),
+    )
+    assert r.status_code == 403
+
+
+def test_patch_trading_halt(saas_client: TestClient, test_db: sessionmaker) -> None:
+    db = test_db()
+    try:
+        _seed_user_with_schwab(db)
+    finally:
+        db.close()
+    r = saas_client.patch(
+        "/api/settings/trading-halt",
+        json={"halted": True},
+        headers=_auth_header(),
+    )
+    assert r.status_code == 200
+    assert (r.json().get("data") or {}).get("trading_halted") is True
+    db = test_db()
+    try:
+        u = db.query(User).filter(User.id == "user_1").one()
+        assert u.trading_halted is True
+    finally:
+        db.close()
+
+
+def test_market_oauth_authorize_requires_callback_url(
+    saas_client: TestClient, test_db: sessionmaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = test_db()
+    try:
+        db.add(User(id="user_1", email="a@b.c", auth_provider="supabase"))
+        db.commit()
+    finally:
+        db.close()
+    monkeypatch.delenv("SCHWAB_MARKET_CALLBACK_URL", raising=False)
+    r = saas_client.get("/api/oauth/schwab/market/authorize-url", headers=_auth_header())
+    assert r.status_code == 503
+
+
+def test_market_oauth_authorize_returns_url(
+    saas_client: TestClient, test_db: sessionmaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "SCHWAB_MARKET_CALLBACK_URL",
+        "https://example.com/api/oauth/schwab/market/callback",
+    )
+    db = test_db()
+    try:
+        db.add(User(id="user_1", email="a@b.c", auth_provider="supabase"))
+        db.commit()
+    finally:
+        db.close()
+    r = saas_client.get("/api/oauth/schwab/market/authorize-url", headers=_auth_header())
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("ok") is True
+    url = (body.get("data") or {}).get("url") or ""
+    assert "client_id=mk" in url.replace("%3D", "=") or "mk" in url
+
+
+def test_market_oauth_callback_stores_payload(
+    saas_client: TestClient, test_db: sessionmaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SCHWAB_MARKET_CALLBACK_URL", "https://cb.example/m")
+    monkeypatch.setenv("SAAS_FRONTEND_URL", "http://front.test")
+    db = test_db()
+    try:
+        db.add(User(id="user_1", email="a@b.c", auth_provider="supabase"))
+        db.commit()
+    finally:
+        db.close()
+    state = sign_schwab_oauth_state("user_1", SCHWAB_OAUTH_KIND_MARKET)
+    with patch(
+        "webapp.tenant_dashboard.exchange_schwab_code_for_tokens",
+        return_value={
+            "access_token": "ma",
+            "refresh_token": "mr",
+            "token_type": "Bearer",
+        },
+    ):
+        r = saas_client.get(
+            "/api/oauth/schwab/market/callback",
+            params={"code": "c1", "state": state},
+            follow_redirects=False,
+        )
+    assert r.status_code == 302
+    loc = r.headers.get("location") or ""
+    assert "schwab_market_oauth=ok" in loc
+
+    db = test_db()
+    try:
+        row = db.query(UserCredential).filter(UserCredential.user_id == "user_1").one()
+        raw = decrypt_secret(row.market_token_payload_enc or "")
+        assert raw
+        blob = json.loads(raw)
+        assert blob.get("access_token") == "ma"
+        assert blob.get("refresh_token") == "mr"
+    finally:
+        db.close()
+
+
+def test_market_oauth_callback_rejects_account_state(
+    saas_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SCHWAB_MARKET_CALLBACK_URL", "https://cb.example/m")
+    monkeypatch.setenv("SAAS_FRONTEND_URL", "http://front.test")
+    state = sign_schwab_oauth_state("user_1", SCHWAB_OAUTH_KIND_ACCOUNT)
+    r = saas_client.get(
+        "/api/oauth/schwab/market/callback",
+        params={"code": "c1", "state": state},
+        follow_redirects=False,
+    )
+    assert r.status_code == 302
+    assert "schwab_market_oauth=error" in (r.headers.get("location") or "")
+
+
+def test_account_oauth_callback_rejects_market_state(
+    saas_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SCHWAB_CALLBACK_URL", "https://cb.example/a")
+    monkeypatch.setenv("SAAS_FRONTEND_URL", "http://front.test")
+    state = sign_schwab_oauth_state("user_1", SCHWAB_OAUTH_KIND_MARKET)
+    r = saas_client.get(
+        "/api/oauth/schwab/callback",
+        params={"code": "c1", "state": state},
+        follow_redirects=False,
+    )
+    assert r.status_code == 302
+    assert "schwab_oauth=error" in (r.headers.get("location") or "")

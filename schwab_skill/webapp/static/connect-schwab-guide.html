@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Connect your Schwab account — setup guide</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#guideMain">Skip to main content</a>
+    <div class="bg-blur bg1"></div>
+    <div class="bg-blur bg2"></div>
+
+    <main id="guideMain" class="container legal-page">
+      <header class="card legal-page-header">
+        <p class="eyebrow">Setup</p>
+        <h1>Connect your Schwab account</h1>
+        <p class="muted">
+          Short steps to link this app to Charles Schwab. You do <strong>not</strong> need a Schwab developer account—your
+          host already registered the app. <a href="/">Back to dashboard</a>
+          ·
+          <a href="/static/legal.html">Legal &amp; risk disclosures</a>
+        </p>
+      </header>
+
+      <article class="card legal-body">
+        <h2>Before you start</h2>
+        <ul class="legal-list">
+          <li>Sign in to <strong>this</strong> site first (email/password or the sign-in method your host uses).</li>
+          <li>Use the same Schwab login you use for brokerage (or paper trading, if that is what you use with this app).</li>
+          <li>Allow pop-ups or redirects for this site if your browser blocks them—you will briefly leave this page to approve access on Schwab.</li>
+        </ul>
+
+        <h2>Why are there two &ldquo;Connect&rdquo; buttons?</h2>
+        <p>
+          Schwab splits API access: one approval is for <strong>market data</strong> (quotes, history) and another is for your
+          <strong>brokerage account</strong> (balances, positions, orders). This app needs both so scans and trading features work.
+        </p>
+
+        <h2>What to do (about two minutes)</h2>
+        <ol class="legal-list">
+          <li>
+            Open the dashboard <strong>Setup</strong> section (<a href="/#onboardingSection">direct link</a>).
+          </li>
+          <li>
+            Click <strong>Connect Schwab (account)</strong>. Sign in at Schwab and approve. You should land back on this site with a
+            success message.
+          </li>
+          <li>
+            Click <strong>Connect Schwab (market)</strong> and complete the second approval the same way.
+          </li>
+          <li>
+            Optional: click <strong>Start Wizard</strong>, then run steps 1–4 to confirm tokens, try a scan, and a paper test (if your
+            plan includes those checks).
+          </li>
+        </ol>
+
+        <h2>Live trading</h2>
+        <p>
+          Connecting Schwab does not automatically place trades. If your host uses a live-trading gate, you will need to complete a
+          separate in-app step to enable real orders—read the confirmation carefully before you opt in.
+        </p>
+
+        <h2>If something fails</h2>
+        <ul class="legal-list">
+          <li>Try each connect button again after a full page refresh.</li>
+          <li>Confirm you finished <strong>both</strong> flows (account and market).</li>
+          <li>Check for an error banner after returning from Schwab; copy the message if you contact support.</li>
+        </ul>
+
+        <p class="muted">
+          <strong>Charles Schwab</strong> and related marks are trademarks of their respective owners. This software is not
+          affiliated with or endorsed by Charles Schwab Corporation.
+        </p>
+      </article>
+    </main>
+  </body>
+</html>

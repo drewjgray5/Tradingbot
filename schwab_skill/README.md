@@ -129,7 +129,8 @@ Empty Postgres: run once `python scripts/saas_bootstrap.py` or set `SAAS_BOOTSTR
 **Schwab + SaaS:**
 
 - Platform registers **market** and **account** developer apps; set `SCHWAB_MARKET_*` and `SCHWAB_ACCOUNT_*` on API and workers.
-- Each user stores OAuth token JSON via `/api/credentials/schwab`: `account_oauth_json` and `market_oauth_json` (encrypted), or legacy `access_token` / `refresh_token` (account app only) plus **`SAAS_PLATFORM_MARKET_SKILL_DIR`** pointing at a server-local skill directory that contains `tokens_market.enc` for a shared market session.
+- **Browser OAuth:** Set `SCHWAB_CALLBACK_URL` (account app) and `SCHWAB_MARKET_CALLBACK_URL` (market app, e.g. `…/api/oauth/schwab/market/callback`). The hosted dashboard shows **Connect Schwab (account)** and **Connect Schwab (market)** in **Connect Schwab & setup**, with plain-language copy and a default **Schwab setup guide** at `/static/connect-schwab-guide.html` unless `WEB_IMPLEMENTATION_GUIDE_URL` is set (`docs/CONNECT_SCHWAB_END_USERS.md`).
+- **API upload:** Each user can POST `/api/credentials/schwab` with `account_oauth_json` and `market_oauth_json` (encrypted at rest), or legacy `access_token` / `refresh_token` (account only) plus **`SAAS_PLATFORM_MARKET_SKILL_DIR`** for a shared platform `tokens_market.enc` if you skip per-user market OAuth.
 
 **Health:** `GET /api/health/live`, `GET /api/health/ready` (DB + Redis; set `SAAS_HEALTH_REQUIRE_REDIS=0` to skip Redis in dev).
 

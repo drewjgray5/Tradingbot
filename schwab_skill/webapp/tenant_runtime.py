@@ -19,13 +19,23 @@ from sqlalchemy.orm import Session
 
 from schwab_auth import write_encrypted_token_file
 
-from .models import UserCredential
+from .models import User, UserCredential
 from .security import decrypt_secret
+
+# Optional platform overrides forwarded into each tenant .env when set in process env.
+_ENV_OPTIONAL_FOR_TENANT = (
+    "PAPER_TRADING_ENABLED",
+    "EXECUTION_SHADOW_MODE",
+    "MAX_SECTOR_ACCOUNT_FRACTION",
+    "HYPOTHESIS_LEDGER_ENABLED",
+    "HYPOTHESIS_SELF_STUDY_MERGE",
+)
 
 # Env keys written into tenant .env (platform must supply Schwab app registration).
 _ENV_KEYS_FOR_TENANT = (
     "SCHWAB_MARKET_APP_KEY",
     "SCHWAB_MARKET_APP_SECRET",
+    "SCHWAB_MARKET_CALLBACK_URL",
     "SCHWAB_ACCOUNT_APP_KEY",
     "SCHWAB_ACCOUNT_APP_SECRET",
     "SCHWAB_CALLBACK_URL",
@@ -110,9 +120,31 @@ def _write_tenant_env(skill_dir: Path) -> None:
         val = os.environ.get(key)
         if val is not None and str(val).strip() != "":
             lines.append(f"{key}={val}")
+    for key in _ENV_OPTIONAL_FOR_TENANT:
+        val = os.environ.get(key)
+        if val is not None and str(val).strip() != "":
+            lines.append(f"{key}={val}")
     if not any(line.startswith("SCHWAB_CALLBACK_URL=") for line in lines):
         lines.append("SCHWAB_CALLBACK_URL=https://127.0.0.1:8182")
     (skill_dir / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _append_tenant_execution_overrides(skill_dir: Path, db: Session, user_id: str) -> None:
+    extra: list[str] = []
+    plat = (os.getenv("LIVE_TRADING_KILL_SWITCH") or "").strip().lower()
+    if plat in ("1", "true", "yes", "on"):
+        extra.append("LIVE_TRADING_KILL_SWITCH=1")
+    be = (os.getenv("LIVE_TRADING_KILL_SWITCH_BLOCKS_EXITS") or "").strip().lower()
+    if be in ("1", "true", "yes", "on"):
+        extra.append("LIVE_TRADING_KILL_SWITCH_BLOCKS_EXITS=1")
+    row = db.query(User).filter(User.id == user_id).first()
+    if row and getattr(row, "trading_halted", False):
+        extra.append("USER_TRADING_HALTED=1")
+    if not extra:
+        return
+    path = skill_dir / ".env"
+    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    path.write_text(existing.rstrip() + "\n" + "\n".join(extra) + "\n", encoding="utf-8")
 
 
 def materialize_tenant_skill_dir(db: Session, user_id: str, skill_dir: Path) -> None:
@@ -133,6 +165,7 @@ def materialize_tenant_skill_dir(db: Session, user_id: str, skill_dir: Path) -> 
 
     skill_dir.mkdir(parents=True, exist_ok=True)
     _write_tenant_env(skill_dir)
+    _append_tenant_execution_overrides(skill_dir, db, user_id)
 
     account = _account_token_dict(row)
     if not account:

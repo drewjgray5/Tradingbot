@@ -51,6 +51,12 @@ class EnableLiveTradingRequest(BaseModel):
     typed_phrase: str = Field(min_length=1, max_length=32)
 
 
+class UpdateTradingHaltRequest(BaseModel):
+    """Pause all live orders for this account (exits still allowed unless platform blocks exits)."""
+
+    halted: bool = False
+
+
 class ExecuteOrderRequest(BaseModel):
     ticker: str = Field(min_length=1, max_length=16)
     qty: int = Field(gt=0)

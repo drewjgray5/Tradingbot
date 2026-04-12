@@ -114,7 +114,8 @@ def get_scan_stage_a_max_workers(skill_dir: Path | None = None) -> int:
 
 # Scanner: bounded workers for heavy enrichment stage
 def get_scan_stage_b_max_workers(skill_dir: Path | None = None) -> int:
-    return _get_int("SCAN_STAGE_B_MAX_WORKERS", 2, skill_dir)
+    # Default 4: Stage B is shortlist-only; moderate parallelism improves latency vs Schwab 429 tradeoffs.
+    return _get_int("SCAN_STAGE_B_MAX_WORKERS", 4, skill_dir)
 
 
 # Scanner: shortlist width relative to top-N final output size
@@ -227,8 +228,38 @@ def get_adaptive_stop_trend_lookback(skill_dir: Path | None = None) -> int:
 def get_execution_shadow_mode(skill_dir: Path | None = None) -> bool:
     """
     If true, execution computes decisions but does not submit live broker orders.
+    PAPER_TRADING_ENABLED=1 is an alias for operators who prefer that name.
     """
+    if _get_bool("PAPER_TRADING_ENABLED", False, skill_dir):
+        return True
     return _get_bool("EXECUTION_SHADOW_MODE", False, skill_dir)
+
+
+def get_live_trading_kill_switch(skill_dir: Path | None = None) -> bool:
+    """Platform-wide halt when LIVE_TRADING_KILL_SWITCH=1 (injected into tenant .env on SaaS)."""
+    return _get_bool("LIVE_TRADING_KILL_SWITCH", False, skill_dir)
+
+
+def get_user_trading_halted(skill_dir: Path | None = None) -> bool:
+    """Per-user pause when USER_TRADING_HALTED=1 (SaaS materializes from DB)."""
+    return _get_bool("USER_TRADING_HALTED", False, skill_dir)
+
+
+def get_live_trading_kill_switch_blocks_exits(skill_dir: Path | None = None) -> bool:
+    """
+    When true with kill switch / user halt, SELL and reducing orders are blocked too.
+    Default false: exits still allowed.
+    """
+    return _get_bool("LIVE_TRADING_KILL_SWITCH_BLOCKS_EXITS", False, skill_dir)
+
+
+def get_max_sector_account_fraction(skill_dir: Path | None = None) -> float:
+    """
+    Max fraction of total account equity allowed in one sector ETF bucket (0..1).
+    0 disables the check. Uses yfinance-backed sector mapping (cached).
+    """
+    v = _get_float("MAX_SECTOR_ACCOUNT_FRACTION", 0.0, skill_dir)
+    return max(0.0, min(1.0, v))
 
 
 def get_exec_quality_mode(skill_dir: Path | None = None) -> str:
@@ -569,6 +600,15 @@ def get_signal_universe_mode(skill_dir: Path | None = None) -> str:
 def get_signal_universe_target_size(skill_dir: Path | None = None) -> int:
     """Target size for focused universe mode."""
     return _get_int("SIGNAL_UNIVERSE_TARGET_SIZE", 250, skill_dir)
+
+
+def get_signal_scan_full_universe(skill_dir: Path | None = None) -> bool:
+    """
+    When True (default), the dynamic index watchlist path (S&P 500 + 400 + 600 + R2000)
+    is not shortened by QUALITY_WATCHLIST_PREFILTER_* or SIGNAL_UNIVERSE_MODE=focused.
+    Set SIGNAL_SCAN_FULL_UNIVERSE=0 to allow those filters on the full index list.
+    """
+    return _get_bool("SIGNAL_SCAN_FULL_UNIVERSE", True, skill_dir)
 
 
 def get_sec_enrichment_enabled(skill_dir: Path | None = None) -> bool:

@@ -120,3 +120,27 @@ def test_materialize_shared_platform_market(
     materialize_tenant_skill_dir(db, "u3", skill_dir)
     assert (skill_dir / "tokens_market.enc").is_file()
     assert (skill_dir / "tokens_account.enc").is_file()
+
+
+def test_materialize_appends_user_trading_halted(
+    tmp_path: Path,
+    db_session: Session,
+    cred_key: None,
+    schwab_platform_env: None,
+) -> None:
+    db = db_session
+    db.add(User(id="u4", email="halt@example.com", auth_provider="supabase", trading_halted=True))
+    market_json = json.dumps({"access_token": "m1", "refresh_token": "mr1"})
+    account_json = json.dumps({"access_token": "a1", "refresh_token": "ar1"})
+    db.add(
+        UserCredential(
+            user_id="u4",
+            market_token_payload_enc=encrypt_secret(market_json),
+            account_token_payload_enc=encrypt_secret(account_json),
+        )
+    )
+    db.commit()
+    skill_dir = tmp_path / "halt"
+    materialize_tenant_skill_dir(db, "u4", skill_dir)
+    env_text = (skill_dir / ".env").read_text(encoding="utf-8")
+    assert "USER_TRADING_HALTED=1" in env_text

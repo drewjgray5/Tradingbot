@@ -16,7 +16,8 @@
 | `SUPABASE_JWT_SECRET` | Validates `Authorization: Bearer` tokens |
 | `SCHWAB_MARKET_APP_KEY` / `SCHWAB_MARKET_APP_SECRET` | Market API app |
 | `SCHWAB_ACCOUNT_APP_KEY` / `SCHWAB_ACCOUNT_APP_SECRET` | Account/trading app |
-| `SCHWAB_CALLBACK_URL` | Must match Schwab app registration |
+| `SCHWAB_CALLBACK_URL` | Redirect URI for the **account** Schwab app (browser OAuth callback) |
+| `SCHWAB_MARKET_CALLBACK_URL` | Redirect URI for the **market** Schwab app — register `https://<api-host>/api/oauth/schwab/market/callback` on the market app |
 | `DATABASE_URL` | SQLAlchemy URL |
 | `REDIS_URL` | Celery + rate limits + scan cooldown |
 
@@ -26,7 +27,7 @@
 |----------|---------|
 | `SUPABASE_URL` | Project URL (e.g. `https://xyzcompany.supabase.co`) — returned by `GET /api/public-config` for the dashboard |
 | `SUPABASE_ANON_KEY` | **anon** key from Supabase → Settings → API (public; not the service_role key) |
-| `WEB_IMPLEMENTATION_GUIDE_URL` | Optional `http://` or `https://` URL — when set, the dashboard Onboarding Wizard shows an **Implementation guide** link that opens this URL in a new tab |
+| `WEB_IMPLEMENTATION_GUIDE_URL` | Optional `http://` or `https://` URL — when set, the dashboard **Schwab setup guide** link opens this URL in a new tab. If unset and Schwab OAuth is configured, the UI links to the built-in **`/static/connect-schwab-guide.html`** (see `docs/CONNECT_SCHWAB_END_USERS.md`). |
 
 If either is unset, the dashboard still works by pasting a JWT under **Advanced**. Workers do **not** need these.
 
@@ -52,7 +53,9 @@ Workers need the same `SAAS_BILLING_ENFORCE` and database visibility as the API 
 
 ## Per-user OAuth
 
-Users POST `/api/credentials/schwab` with:
+**Browser (dashboard):** With account + market callback URLs configured, users can use **Connect Schwab (account)** and **Connect Schwab (market)** in the onboarding wizard. Each flow uses the matching Schwab developer app registration and redirect URI.
+
+Users can also POST `/api/credentials/schwab` with:
 
 - `account_oauth_json` — JSON string from the **account** app token response (access + refresh).
 - `market_oauth_json` — JSON string from the **market** app token response.
@@ -127,7 +130,7 @@ Set secrets via environment file or your host’s secret manager — **never** c
 3. When prompted, set the `sync: false` variables (Schwab, Supabase JWT, optional `SUPABASE_URL` + `SUPABASE_ANON_KEY` for dashboard sign-in, encryption key, callback URL, CORS).
 4. Set **`WEB_ALLOWED_ORIGINS`** to your public site origin (comma-separated if needed), e.g. `https://<your-web-service>.onrender.com`.
 5. **First deploy on an empty database:** either set **`SAAS_BOOTSTRAP_SCHEMA=1`** on the web service for one deploy, then remove it; or run `python scripts/saas_bootstrap.py` against `DATABASE_URL` once. After that, keep **`SAAS_RUN_ALEMBIC=1`** on the web service (already in the Blueprint) so migrations apply on boot, or run `alembic upgrade head` in CI.
-6. Register the same **`SCHWAB_CALLBACK_URL`** in the Schwab developer portal as in your environment.
+6. Register **`SCHWAB_CALLBACK_URL`** on the **account** app and **`SCHWAB_MARKET_CALLBACK_URL`** on the **market** app (typically `…/api/oauth/schwab/callback` vs `…/api/oauth/schwab/market/callback`).
 7. Optional Stripe: add the billing env vars from the table above and point Stripe’s webhook to `POST /api/billing/webhook/stripe` on your public API URL.
 
 The API serves the UI at `/` and static assets under `/static`; your live URL is the web service’s HTTPS URL on Render.

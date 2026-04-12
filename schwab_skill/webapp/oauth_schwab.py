@@ -15,6 +15,10 @@ from auth import AUTH_URL, exchange_code_for_tokens
 
 _STATE_TTL_SEC = 600
 
+# OAuth browser flow kind (signed into state; prevents cross-app callback confusion).
+SCHWAB_OAUTH_KIND_ACCOUNT = "account"
+SCHWAB_OAUTH_KIND_MARKET = "market"
+
 
 def _state_secret() -> bytes:
     raw = (
@@ -29,16 +33,23 @@ def _state_secret() -> bytes:
     return hashlib.sha256(raw.encode("utf-8")).digest()
 
 
-def sign_schwab_oauth_state(user_id: str) -> str:
+def sign_schwab_oauth_state(user_id: str, kind: str = SCHWAB_OAUTH_KIND_ACCOUNT) -> str:
     exp = int(time.time()) + _STATE_TTL_SEC
-    payload = {"uid": user_id, "exp": exp}
+    k = (kind or SCHWAB_OAUTH_KIND_ACCOUNT).strip()
+    if k not in (SCHWAB_OAUTH_KIND_ACCOUNT, SCHWAB_OAUTH_KIND_MARKET):
+        raise ValueError("kind must be 'account' or 'market'")
+    payload = {"uid": user_id, "exp": exp, "k": k}
     body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     sig = hmac.new(_state_secret(), body, hashlib.sha256).hexdigest()
     token = base64.urlsafe_b64encode(body).decode("utf-8").rstrip("=") + "." + sig
     return token
 
 
-def verify_schwab_oauth_state(token: str) -> str | None:
+def verify_schwab_oauth_state(token: str) -> tuple[str, str] | None:
+    """Return (user_id, kind) where kind is account or market; None if invalid or expired.
+
+    States issued before ``k`` was added verify as ``account``.
+    """
     if not token or "." not in token:
         return None
     enc, sig = token.rsplit(".", 1)
@@ -55,7 +66,15 @@ def verify_schwab_oauth_state(token: str) -> str | None:
         exp = int(data.get("exp") or 0)
         if not uid or exp < int(time.time()):
             return None
-        return uid
+        raw_kind = data.get("k")
+        kind = (
+            str(raw_kind).strip()
+            if raw_kind is not None and str(raw_kind).strip()
+            else SCHWAB_OAUTH_KIND_ACCOUNT
+        )
+        if kind not in (SCHWAB_OAUTH_KIND_ACCOUNT, SCHWAB_OAUTH_KIND_MARKET):
+            return None
+        return uid, kind
     except Exception:
         return None
 

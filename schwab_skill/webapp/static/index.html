@@ -4,6 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>TradingBot Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
@@ -11,10 +17,11 @@
     <div class="bg-blur bg1"></div>
     <div class="bg-blur bg2"></div>
     <div class="bg-blur bg3"></div>
+    <div class="bg-grid" aria-hidden="true"></div>
 
     <main id="mainContent" class="container">
-      <header class="hero card">
-        <div>
+      <header class="hero card hero-shell">
+        <div class="hero-main">
           <p class="eyebrow">Schwab + Strategy Control Center</p>
           <h1>TradingBot Web Dashboard</h1>
           <p class="muted hero-lead">
@@ -26,9 +33,14 @@
             Jump to:
             <a href="#workflowPrimary">Scan</a> ·
             <a href="#pendingSection">Pending trades</a> ·
+            <a href="#onboardingSection">Setup</a> ·
             <a href="#backtestSection">Backtest</a> ·
             <a href="/login">Sign in</a>
           </p>
+          <div class="hero-actions">
+            <button id="refreshBtn" class="btn secondary">Refresh All</button>
+            <button id="scanBtn" class="btn primary">Run Scan</button>
+          </div>
           <div class="hero-toolbar" role="group" aria-label="Dashboard layout">
             <label class="field-label" for="displayModeSelect">View</label>
             <select id="displayModeSelect" title="Simple shows only today’s workflow; Standard balances depth; Pro surfaces diagnostics faster.">
@@ -51,7 +63,7 @@
               <button id="supabaseSignOutBtn" class="btn small secondary" type="button">Sign out</button>
             </div>
           </div>
-          <details id="manualJwtDetails" class="auth-manual-jwt" open>
+          <details id="manualJwtDetails" class="auth-manual-jwt">
             <summary id="manualJwtSummary" class="muted manual-jwt-summary">Session token</summary>
             <div class="inline-form compact">
               <label class="field-label" for="jwtInput">JWT</label>
@@ -60,35 +72,100 @@
             </div>
           </details>
         </div>
-        <div class="hero-actions">
-          <button id="refreshBtn" class="btn secondary">Refresh All</button>
-          <button id="scanBtn" class="btn primary">Run Scan</button>
-        </div>
+        <aside class="hero-aside" aria-label="Session snapshot">
+          <div class="hero-chart" aria-hidden="true">
+            <svg viewBox="0 0 320 120" class="hero-chart-svg" preserveAspectRatio="xMidYMid meet">
+              <defs>
+                <linearGradient id="heroLineGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stop-color="#38bdf8" />
+                  <stop offset="50%" stop-color="#818cf8" />
+                  <stop offset="100%" stop-color="#c084fc" />
+                </linearGradient>
+                <linearGradient id="heroAreaGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                  <stop offset="0%" stop-color="rgba(56, 189, 248, 0.35)" />
+                  <stop offset="100%" stop-color="rgba(56, 189, 248, 0)" />
+                </linearGradient>
+              </defs>
+              <path
+                class="hero-chart-area"
+                d="M0,95 L40,88 L80,72 L120,78 L160,52 L200,58 L240,38 L280,48 L320,32 L320,120 L0,120 Z"
+                fill="url(#heroAreaGrad)"
+              />
+              <path
+                class="hero-chart-line"
+                d="M0,95 L40,88 L80,72 L120,78 L160,52 L200,58 L240,38 L280,48 L320,32"
+                fill="none"
+                stroke="url(#heroLineGrad)"
+                stroke-width="2.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+              <circle class="hero-chart-dot" cx="320" cy="32" r="4" fill="#e0e7ff" />
+            </svg>
+            <span class="hero-chart-caption">Scan pipeline flow</span>
+          </div>
+          <div class="hero-kpi-strip">
+            <div class="hero-kpi" data-kpi="signals">
+              <span class="hero-kpi-label">Open signals</span>
+              <strong id="heroKpiSignals" class="hero-kpi-value mono-nums">—</strong>
+              <span class="hero-kpi-hint">from last scan</span>
+            </div>
+            <div class="hero-kpi" data-kpi="pending">
+              <span class="hero-kpi-label">Pending</span>
+              <strong id="heroKpiPending" class="hero-kpi-value mono-nums">—</strong>
+              <span class="hero-kpi-hint">awaiting you</span>
+            </div>
+            <div class="hero-kpi" data-kpi="watchlist">
+              <span class="hero-kpi-label">Universe</span>
+              <strong id="heroKpiWatchlist" class="hero-kpi-value mono-nums">—</strong>
+              <span class="hero-kpi-hint">watchlist size</span>
+            </div>
+          </div>
+        </aside>
       </header>
 
       <div id="dashboardToday" class="dashboard-today-stack">
       <section id="healthRibbon" class="card health-ribbon" aria-label="System health ribbon">
-        <div class="health-item">
-          <span class="health-label">Auth</span>
-          <strong id="ribbonAuth" class="health-badge bg-red-900">Disconnected</strong>
+        <div class="health-tile" id="healthTileAuth" data-state="neutral" style="--gauge: 0">
+          <div class="health-ring" aria-hidden="true"></div>
+          <div class="health-tile-copy">
+            <span class="health-label">Auth</span>
+            <strong id="ribbonAuth" class="health-badge bg-red-900">Disconnected</strong>
+          </div>
         </div>
-        <div class="health-item">
-          <span class="health-label">Quotes</span>
-          <strong id="ribbonQuotes" class="health-badge bg-red-900">Degraded</strong>
+        <div class="health-tile" id="healthTileQuotes" data-state="neutral" style="--gauge: 0">
+          <div class="health-ring" aria-hidden="true"></div>
+          <div class="health-tile-copy">
+            <span class="health-label">Quotes</span>
+            <strong id="ribbonQuotes" class="health-badge bg-red-900">Degraded</strong>
+          </div>
         </div>
-        <div class="health-item">
-          <span class="health-label">API Error Rate</span>
-          <strong id="ribbonApiErrorRate" class="health-badge bg-green-900">0.0%</strong>
+        <div class="health-tile" id="healthTileApi" data-state="neutral" style="--gauge: 0">
+          <div class="health-ring" aria-hidden="true"></div>
+          <div class="health-tile-copy">
+            <span class="health-label">API errors</span>
+            <strong id="ribbonApiErrorRate" class="health-badge bg-green-900">0.0%</strong>
+          </div>
         </div>
-        <div class="health-item">
-          <span class="health-label">Validation</span>
-          <strong id="ribbonValidation" class="health-badge bg-red-900">Unknown</strong>
+        <div class="health-tile" id="healthTileValidation" data-state="neutral" style="--gauge: 0">
+          <div class="health-ring" aria-hidden="true"></div>
+          <div class="health-tile-copy">
+            <span class="health-label">Validation</span>
+            <strong id="ribbonValidation" class="health-badge bg-red-900">Unknown</strong>
+          </div>
         </div>
       </section>
 
       <section id="blockersAlertSection" class="card blockers-alert hidden" aria-live="polite">
         <strong>Top Blockers</strong>
         <ul id="blockersAlertList" class="report-bullets"></ul>
+      </section>
+
+      <section id="platformKillSwitchBanner" class="card blockers-alert hidden" aria-live="polite" style="border-color: rgba(180, 83, 9, 0.65)">
+        <strong>Operator trading halt</strong>
+        <p id="platformKillSwitchBannerText" class="muted" style="margin: 0.35rem 0 0">
+          The host has enabled a global kill switch. New risk-increasing orders are blocked until it is cleared.
+        </p>
       </section>
 
       <div id="pendingSummaryStrip" class="card pending-summary-strip hidden" aria-live="polite">
@@ -99,8 +176,11 @@
       </div>
 
       <section id="actionCenter" class="card action-center" aria-live="polite">
-        <strong id="actionCenterTitle">System Messages</strong>
-        <p id="actionCenterText" class="muted">Ready. Use Run Scan or Refresh All to begin.</p>
+        <div class="action-center-icon" aria-hidden="true"></div>
+        <div class="action-center-body">
+          <strong id="actionCenterTitle">System Messages</strong>
+          <p id="actionCenterText" class="muted">Ready. Use Run Scan or Refresh All to begin.</p>
+        </div>
       </section>
       </div>
 
@@ -108,13 +188,14 @@
         <a href="#dashboardToday">Today</a>
         <a href="#workflowPrimary">Scan &amp; queue</a>
         <a href="#quickCheckSection">Ticker check</a>
+        <a href="#onboardingSection">Setup</a>
         <a href="#toolsSection" class="nav-advanced">Tools</a>
         <a href="#statusDetailsPanel" class="nav-advanced">Detailed status</a>
-        <a href="#onboardingSection" class="nav-advanced">Setup</a>
         <a href="#settingsSection" class="nav-advanced">Presets</a>
         <a href="#decisionSection" class="nav-advanced">Decision card</a>
         <a href="#portfolioSection" class="nav-advanced">Portfolio</a>
         <a href="#performanceSection" class="nav-advanced">Performance</a>
+        <a href="#calibrationSection" class="nav-advanced">Calibration</a>
         <a href="#backtestSection" class="nav-advanced">Backtests</a>
         <a href="#recoverySection" class="nav-advanced">Recovery</a>
         <a href="#reportSectionCard" class="nav-advanced">Report</a>
@@ -203,9 +284,21 @@
         </article>
 
         <article id="pendingSection" class="card card--primary-task">
-          <div class="section-title">
-            <h2>Pending approvals</h2>
-            <small class="muted">Approve, reject, or quick-view before sending live orders.</small>
+          <div class="section-title section-title--with-action">
+            <div>
+              <h2>Pending approvals</h2>
+              <small class="muted">Approve, reject, or quick-view before sending live orders.</small>
+            </div>
+            <button
+              type="button"
+              id="clearPendingBtn"
+              class="btn-clear-pending"
+              disabled
+              title="Reject all pending trades (clears the queue)"
+              aria-label="Clear all pending trades"
+            >
+              ×
+            </button>
           </div>
           <div class="inline-form compact">
             <label class="muted">Status
@@ -276,6 +369,11 @@
               <p class="tool-card-desc muted">Approve or reject staged orders.</p>
               <span class="tool-card-cta">Go</span>
             </a>
+            <a class="tool-card" role="listitem" href="#onboardingSection">
+              <h3 class="tool-card-title">Schwab setup</h3>
+              <p class="tool-card-desc muted">Two Schwab logins (account + market), then optional checks.</p>
+              <span class="tool-card-cta">Go</span>
+            </a>
             <a class="tool-card" role="listitem" href="#decisionSection">
               <h3 class="tool-card-title">Decision card</h3>
               <p class="tool-card-desc muted">Structured take/pass for one symbol.</p>
@@ -301,39 +399,43 @@
               <p class="tool-card-desc muted">Turn errors into next steps.</p>
               <span class="tool-card-cta">Go</span>
             </a>
-            <a class="tool-card" role="listitem" href="#onboardingSection">
-              <h3 class="tool-card-title">Setup wizard</h3>
-              <p class="tool-card-desc muted">Connect Schwab and validate the stack.</p>
-              <span class="tool-card-cta">Go</span>
-            </a>
           </div>
         </section>
       </div>
 
-      <section class="layout-2 section-advanced">
+      <section class="layout-2 layout-onboarding-presets">
         <article id="onboardingSection" class="card" data-lazy-api="onboarding">
           <div class="section-title">
-            <h2>Onboarding Wizard</h2>
+            <h2>Connect Schwab &amp; setup</h2>
             <small id="onboardingMeta" class="muted">Target completion: under 20 minutes</small>
           </div>
-          <div class="inline-form">
-            <button id="onboardingStartBtn" class="btn secondary">Start Wizard</button>
-            <button id="onboardingSchwabBtn" class="btn primary small" type="button">Connect Schwab</button>
-            <button id="onboardingConnectBtn" class="btn small secondary">1) Connect</button>
-            <button id="onboardingVerifyBtn" class="btn small secondary">2) Verify Token Health</button>
-            <button id="onboardingScanBtn" class="btn small secondary">3) Test Scan</button>
-            <button id="onboardingPaperBtn" class="btn small secondary">4) Test Paper Order</button>
+          <div class="onboarding-user-hint muted">
+            <p>
+              <strong>Link your brokerage in two steps.</strong> Schwab asks you to approve separately for
+              <em>trading</em> (account) and for <em>market data</em> (quotes). Use both buttons below, then optional checks.
+            </p>
+          </div>
+          <div class="inline-form onboarding-connect-row">
+            <button id="onboardingSchwabBtn" class="btn primary small" type="button">Connect Schwab (account)</button>
+            <button id="onboardingSchwabMarketBtn" class="btn primary small" type="button">Connect Schwab (market)</button>
             <a
               id="implementationGuideLink"
               class="btn secondary small hidden"
               href="#"
               target="_blank"
               rel="noopener noreferrer"
-              >Implementation guide</a>
+              >Schwab setup guide</a>
+            <button id="onboardingStartBtn" class="btn secondary">Start Wizard</button>
+            <button id="onboardingConnectBtn" class="btn small secondary" title="Records that your Schwab account session is linked">
+              1) Confirm link
+            </button>
+            <button id="onboardingVerifyBtn" class="btn small secondary">2) Verify token health</button>
+            <button id="onboardingScanBtn" class="btn small secondary">3) Test scan</button>
+            <button id="onboardingPaperBtn" class="btn small secondary">4) Test paper order</button>
           </div>
           <pre id="onboardingOutput" class="code-block">Wizard not started.</pre>
         </article>
-        <article id="settingsSection" class="card" data-lazy-api="profiles">
+        <article id="settingsSection" class="card settings-advanced-only section-advanced" data-lazy-api="profiles">
           <div class="section-title">
             <h2>Strategy Presets</h2>
             <small class="muted">Standard shows plain English. Expert adds raw env values under each row.</small>
@@ -368,6 +470,13 @@
               <label class="field-label" for="enableLiveTypedPhrase">Type ENABLE to confirm</label>
               <input id="enableLiveTypedPhrase" type="text" autocomplete="off" placeholder="ENABLE" />
               <button id="enableLiveTradingBtn" type="button" class="btn secondary small">Enable live trading</button>
+            </div>
+            <div class="inline-form compact" style="margin-top: 0.75rem">
+              <label class="muted">
+                <input id="tradingHaltedCheckbox" type="checkbox" />
+                Pause new live orders for this account (approvals blocked until you uncheck and save)
+              </label>
+              <button id="saveTradingHaltBtn" type="button" class="btn secondary small">Save pause setting</button>
             </div>
           </div>
           <div id="profilePanel" class="preset-panel" aria-live="polite">
@@ -688,6 +797,21 @@
               />
               <button id="scSendBtn" class="btn secondary" type="button">Send</button>
             </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="section-advanced">
+        <article id="calibrationSection" class="card" data-lazy-api="calibration">
+          <div class="section-title">
+            <h2>Calibration and learning</h2>
+            <small class="muted">Self-study and hypothesis ledger summaries (when available)</small>
+          </div>
+          <div class="inline-form">
+            <button id="calibrationRefreshBtn" type="button" class="btn secondary">Refresh calibration</button>
+          </div>
+          <div id="calibrationPanel" class="performance-panel" aria-live="polite">
+            <div class="report-empty">Scroll here or refresh to load calibration data.</div>
           </div>
         </article>
       </section>

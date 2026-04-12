@@ -1,11 +1,19 @@
 const state = {
   latestSignals: [],
+  /** Last watchlist size from scan diagnostics (for hero KPI). */
+  lastWatchlistSize: null,
   approvingTradeId: null,
   approvingChecklist: null,
   pendingFilter: "all",
   pendingSort: "newest",
   config: { auth_mode: "jwt" },
-  publicConfig: { supabase: null, saas_mode: false, schwab_oauth: false },
+  publicConfig: {
+    supabase: null,
+    saas_mode: false,
+    schwab_oauth: false,
+    schwab_market_oauth: false,
+    platform_live_trading_kill_switch: false,
+  },
   accountMe: null,
   reportRawView: false,
   lastReportData: null,
@@ -16,6 +24,7 @@ const state = {
   presetCatalog: null,
   savedUiSettings: null,
   performance: null,
+  calibration: null,
   strategyChatMessages: [],
   strategyChatBusy: false,
   backtestQueueBusy: false,
@@ -34,6 +43,7 @@ const lazyLoaded = {
   backtest: false,
   onboarding: false,
   profiles: false,
+  calibration: false,
 };
 
 function resetLazyLoaded() {
@@ -76,6 +86,8 @@ async function runLazyApi(key) {
     else if (key === "onboarding") await refreshOnboarding();
     else if (key === "profiles") {
       await loadProfiles();
+    } else if (key === "calibration") {
+      await refreshCalibration();
     }
   } catch (err) {
     console.warn("lazy load failed", key, err);
@@ -152,6 +164,14 @@ function markDeferredDataPlaceholders() {
 
 function renderLiveTradingSaasPanel() {
   const block = document.getElementById("liveTradingSaasBlock");
+  const killBanner = document.getElementById("platformKillSwitchBanner");
+  if (killBanner) {
+    if (state.publicConfig.platform_live_trading_kill_switch) {
+      killBanner.classList.remove("hidden");
+    } else {
+      killBanner.classList.add("hidden");
+    }
+  }
   if (!block) return;
   if (!state.publicConfig.saas_mode) {
     block.classList.add("hidden");
@@ -161,7 +181,16 @@ function renderLiveTradingSaasPanel() {
   const statusEl = document.getElementById("liveTradingStatus");
   if (statusEl) {
     const on = Boolean(state.accountMe?.live_execution_enabled);
-    statusEl.textContent = on ? "Account status: live orders from this app are on." : "Account status: live orders from this app are still off.";
+    const halted = Boolean(state.accountMe?.trading_halted);
+    let line = on
+      ? "Account status: live orders from this app are on."
+      : "Account status: live orders from this app are still off.";
+    if (halted) line += " Trading pause is on (new approvals blocked).";
+    statusEl.textContent = line;
+  }
+  const haltCb = document.getElementById("tradingHaltedCheckbox");
+  if (haltCb && state.accountMe) {
+    haltCb.checked = Boolean(state.accountMe.trading_halted);
   }
 }
 
@@ -435,6 +464,10 @@ const api = {
 
   post(path, body = {}, options = {}) {
     return this.request(path, { method: "POST", body: JSON.stringify(body), ...options });
+  },
+
+  patch(path, body = {}, options = {}) {
+    return this.request(path, { method: "PATCH", body: JSON.stringify(body), ...options });
   },
 };
 
@@ -864,6 +897,56 @@ function healthBadgeClass(ok) {
   return ok ? "health-badge bg-green-900" : "health-badge bg-red-900";
 }
 
+function setHealthRibbonTiles(authOk, quoteOk, errRate, validation) {
+  const setTile = (id, stateName, gauge) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.dataset.state = stateName;
+    el.style.setProperty("--gauge", String(gauge));
+  };
+  setTile("healthTileAuth", authOk ? "good" : "bad", authOk ? 1 : 0);
+  setTile("healthTileQuotes", quoteOk ? "good" : "bad", quoteOk ? 1 : 0);
+  const er = safeNum(errRate, 0);
+  const apiGaugeHealth = Math.max(0, Math.min(1, 1 - er / 18));
+  const apiState = er < 2 ? "good" : er < 8 ? "warn" : "bad";
+  setTile("healthTileApi", apiState, apiGaugeHealth);
+
+  const v = validation || {};
+  const runStatus = safeText(v.run_status || "").toLowerCase();
+  let vState = "neutral";
+  let vGauge = 0.35;
+  if (v.exists && v.passed === true) {
+    vState = "good";
+    vGauge = 1;
+  } else if (v.exists && v.passed === false) {
+    vState = "bad";
+    vGauge = 0.12;
+  } else if (runStatus === "running") {
+    vState = "warn";
+    const pct = safeNum(v.progress_pct, 0);
+    vGauge = Math.max(0.25, Math.min(0.92, pct > 0 ? pct / 100 : 0.55));
+  } else if (v.exists) {
+    vState = "warn";
+    vGauge = 0.55;
+  }
+  setTile("healthTileValidation", vState, vGauge);
+}
+
+function updateHeroInfographic() {
+  const sigEl = document.getElementById("heroKpiSignals");
+  const pendEl = document.getElementById("heroKpiPending");
+  const wlEl = document.getElementById("heroKpiWatchlist");
+  if (sigEl) sigEl.textContent = String(Array.isArray(state.latestSignals) ? state.latestSignals.length : 0);
+  if (pendEl) {
+    const pc = document.getElementById("pendingCount");
+    pendEl.textContent = pc && pc.textContent.trim() !== "" ? pc.textContent.trim() : "0";
+  }
+  if (wlEl) {
+    const n = state.lastWatchlistSize;
+    wlEl.textContent = n !== null && n !== undefined && n >= 0 ? String(n) : "—";
+  }
+}
+
 function verdictFromScore(score, high = 70, low = 45) {
   const n = safeNum(score, 0);
   if (n >= high) return "bullish";
@@ -978,10 +1061,25 @@ function renderDiagnostics(diag = {}) {
     ["VCP Pass", summary.funnel.vcp_pass],
     ["Final", summary.funnel.final],
   ];
-  funnelPairs.forEach(([label, value]) => {
+  const funnelVals = funnelPairs.map(([, v]) => safeNum(v, 0));
+  const funnelMax = Math.max(1, ...funnelVals);
+
+  funnelPairs.forEach(([label, value], i) => {
+    const n = safeNum(value, 0);
+    const pct = Math.round((n / funnelMax) * 100);
+    const hue = 200 - i * 22;
     const node = document.createElement("div");
     node.className = "funnel-node";
-    node.innerHTML = `<div class="label">${label}</div><div class="value">${value}</div>`;
+    node.innerHTML = `
+      <div class="funnel-node-head">
+        <span class="label">${label}</span>
+        <span class="funnel-node-pct mono-nums">${pct}%</span>
+      </div>
+      <div class="funnel-bar-track" aria-hidden="true">
+        <div class="funnel-bar-fill" style="width:${pct}%;--funnel-hue:${hue}"></div>
+      </div>
+      <div class="value mono-nums">${n}</div>
+    `;
     funnelEl.appendChild(node);
   });
 
@@ -991,6 +1089,8 @@ function renderDiagnostics(diag = {}) {
     chip.textContent = `${DIAG_LABELS[key] || key}: ${value}`;
     chipWrap.appendChild(chip);
   });
+  state.lastWatchlistSize = summary.funnel.watchlist;
+  updateHeroInfographic();
   const diagPanel = document.getElementById("scanDiagnosticsPanel");
   if (diagPanel && getDisplayMode() === "pro") diagPanel.open = true;
 }
@@ -1015,6 +1115,7 @@ function renderScanRows(signals = []) {
     `;
     const cta = document.getElementById("scanEmptyCtaBtn");
     if (cta) cta.addEventListener("click", runScan);
+    updateHeroInfographic();
     return;
   }
 
@@ -1048,6 +1149,7 @@ function renderScanRows(signals = []) {
       openQueueScanDialog(sig);
     });
   });
+  updateHeroInfographic();
 }
 
 function getSectorKeyFromTrade(row) {
@@ -1601,6 +1703,12 @@ async function openApproveDialog(row) {
   dialog.showModal();
 }
 
+function applySchwabConnectButtonVisibility() {
+  const pc = state.publicConfig || {};
+  document.getElementById("onboardingSchwabBtn")?.classList.toggle("hidden", !pc.schwab_oauth);
+  document.getElementById("onboardingSchwabMarketBtn")?.classList.toggle("hidden", !pc.schwab_market_oauth);
+}
+
 async function loadConfig() {
   const tokenInput = document.getElementById("jwtInput");
   const saveBtn = document.getElementById("saveJwtBtn");
@@ -1608,7 +1716,7 @@ async function loadConfig() {
   const manualSummary = document.getElementById("manualJwtSummary");
   const supabaseBlock = document.getElementById("supabaseAuthBlock");
 
-  let publicCfg = { supabase: null, saas_mode: false, schwab_oauth: false };
+  let publicCfg = { supabase: null, saas_mode: false, schwab_oauth: false, schwab_market_oauth: false };
   try {
     const res = await fetch("/api/public-config", { headers: { Accept: "application/json" } });
     const body = res.ok ? await res.json() : {};
@@ -1617,6 +1725,7 @@ async function loadConfig() {
     /* offline or boot — fall back to manual JWT only */
   }
   state.publicConfig = publicCfg;
+  applySchwabConnectButtonVisibility();
   renderLiveTradingSaasPanel();
 
   const implLink = document.getElementById("implementationGuideLink");
@@ -1643,7 +1752,7 @@ async function loadConfig() {
     if (supabaseBlock) supabaseBlock.classList.add("hidden");
     if (manualDetails) {
       manualDetails.classList.remove("hidden");
-      manualDetails.open = true;
+      manualDetails.open = false;
     }
     if (manualSummary) {
       manualSummary.textContent = "Session token";
@@ -1678,20 +1787,45 @@ async function loadConfig() {
 
   const params = new URLSearchParams(window.location.search);
   const oauthSt = params.get("schwab_oauth");
-  if (oauthSt) {
+  const marketOauthSt = params.get("schwab_market_oauth");
+  if (oauthSt || marketOauthSt) {
     const msg = params.get("message") || "";
     const u = new URL(window.location.href);
     u.searchParams.delete("schwab_oauth");
+    u.searchParams.delete("schwab_market_oauth");
     u.searchParams.delete("message");
     window.history.replaceState({}, "", u.pathname + (u.search ? u.search : ""));
-    document.getElementById("onboardingSchwabBtn")?.classList.toggle("hidden", !state.publicConfig?.schwab_oauth);
+    applySchwabConnectButtonVisibility();
 
-  if (oauthSt === "ok") {
-      logEvent({ kind: "system", severity: "info", message: "Schwab account linked successfully." });
-      updateActionCenter({ title: "Schwab", message: "Broker account connected.", severity: "success" });
-    } else {
-      logEvent({ kind: "system", severity: "error", message: `Schwab OAuth: ${msg || "failed"}` });
-      updateActionCenter({ title: "Schwab OAuth", message: msg || "Connection failed.", severity: "error" });
+    if (oauthSt) {
+      if (oauthSt === "ok") {
+        logEvent({ kind: "system", severity: "info", message: "Schwab account linked successfully." });
+        updateActionCenter({
+          title: "Schwab",
+          message: "Brokerage side linked (balances, positions, orders). If you have not yet, also connect market data.",
+          severity: "success",
+        });
+      } else {
+        logEvent({ kind: "system", severity: "error", message: `Schwab OAuth: ${msg || "failed"}` });
+        updateActionCenter({ title: "Schwab OAuth", message: msg || "Connection failed.", severity: "error" });
+      }
+    }
+    if (marketOauthSt) {
+      if (marketOauthSt === "ok") {
+        logEvent({ kind: "system", severity: "info", message: "Schwab market data linked successfully." });
+        updateActionCenter({
+          title: "Schwab market",
+          message: "Market data linked (quotes and history for scans).",
+          severity: "success",
+        });
+      } else {
+        logEvent({ kind: "system", severity: "error", message: `Schwab market OAuth: ${msg || "failed"}` });
+        updateActionCenter({
+          title: "Schwab market OAuth",
+          message: msg || "Connection failed.",
+          severity: "error",
+        });
+      }
     }
   }
 }
@@ -1884,6 +2018,8 @@ async function refreshStatus() {
     ribbonValidation.className = healthBadgeClass(validOk);
     ribbonValidation.textContent = validOk ? "Pass" : safeText(validation.run_status || "Unknown");
   }
+  setHealthRibbonTiles(authOk, quoteOk, errRate, validation);
+  updateHeroInfographic();
 }
 
 const SCAN_START_META = "Scanning market candidates...";
@@ -2131,10 +2267,18 @@ async function runScan() {
     }
     const d = out.data || {};
     if (d.task_id) {
+      const wq = d.worker_queue || {};
+      const qBusy =
+        wq.inspect_available && (wq.reserved_total != null || wq.active_total != null)
+          ? safeNum(wq.reserved_total, 0) + safeNum(wq.active_total, 0)
+          : null;
+      const qPart = qBusy !== null ? ` · worker backlog ~${qBusy}` : "";
+      const limPart =
+        d.daily_scan_limit != null ? ` · daily scan quota ${safeNum(d.daily_scan_limit, 0)}/24h` : "";
       logEvent({
         kind: "scan",
         severity: "info",
-        message: `Scan queued (task ${safeText(d.task_id).slice(0, 12)}…).`,
+        message: `Scan queued (task ${safeText(d.task_id).slice(0, 12)}…)${qPart}${limPart}.`,
       });
       await waitForSaaScanCompletion(d.task_id);
       await refreshStatus();
@@ -2271,13 +2415,24 @@ async function refreshPending() {
   state.pendingFilter = filter;
   state.pendingSort = sort;
   const query = new URLSearchParams({ status: filter, sort });
-  const out = await api.get(`/api/pending-trades?${query.toString()}`);
+  const pendingOnlyQuery = new URLSearchParams({ status: "pending", sort });
+  const [out, pendingOnlyOut] = await Promise.all([
+    api.get(`/api/pending-trades?${query.toString()}`),
+    api.get(`/api/pending-trades?${pendingOnlyQuery.toString()}`),
+  ]);
   if (!out.ok) {
     logEvent({ kind: "trade", severity: "error", message: `Pending trades load failed: ${out.error}` });
     return;
   }
   const rows = out.data || [];
-  document.getElementById("pendingCount").textContent = String(rows.filter((r) => r.status === "pending").length);
+  let pendingN =
+    pendingOnlyOut.ok && Array.isArray(pendingOnlyOut.data)
+      ? pendingOnlyOut.data.length
+      : rows.filter((r) => r.status === "pending").length;
+  document.getElementById("pendingCount").textContent = String(pendingN);
+  const clearBtn = document.getElementById("clearPendingBtn");
+  if (clearBtn) clearBtn.disabled = pendingN === 0;
+  updateHeroInfographic();
 
   const board = document.getElementById("pendingBoard");
   board.innerHTML = "";
@@ -2372,7 +2527,6 @@ async function refreshPending() {
     });
   });
 
-  const pendingN = rows.filter((r) => r.status === "pending").length;
   const strip = document.getElementById("pendingSummaryStrip");
   const stripText = document.getElementById("pendingSummaryText");
   if (strip && stripText) {
@@ -2418,21 +2572,22 @@ async function refreshOnboarding() {
   }
   state.onboarding = out.data;
   if (section) {
-    section.style.display = out.data?.onboarding_required === false ? "none" : "block";
+    section.style.display = "block";
   }
   const conn = out.data?.connection_status || (out.data?.schwab_linked ? "connected" : "disconnected");
   const ah = out.data?.api_health || {};
   const apiLine = ah.schwab_linked
     ? `API: market ${ah.market_token_ok ? "ok" : "—"} · account ${ah.account_token_ok ? "ok" : "—"} · quotes ${ah.quote_ok ? "ok" : "—"}`
     : "API: connect Schwab to probe tokens and quotes.";
+  const haltLine = state.publicConfig.platform_live_trading_kill_switch ? " · Global operator halt: ON" : "";
   if (!out.data?.onboarding_required) {
-    meta.textContent = `Connection: ${conn} · ${apiLine}`;
+    meta.textContent = `Connection: ${conn} · ${apiLine}${haltLine}`;
     output.textContent = prettyJson(out.data);
     return;
   }
   const elapsed = out.data?.elapsed_minutes;
   const done = out.data?.completed_under_target;
-  meta.textContent = `Connection: ${conn} · ${apiLine} · Elapsed: ${elapsed ?? "n/a"} min | ${done ? "PASS" : "IN PROGRESS"}`;
+  meta.textContent = `Connection: ${conn} · ${apiLine}${haltLine} · Elapsed: ${elapsed ?? "n/a"} min | ${done ? "PASS" : "IN PROGRESS"}`;
   output.textContent = prettyJson(out.data);
 }
 
@@ -2441,9 +2596,12 @@ async function startOnboarding() {
   const out = await api.post("/api/onboarding/start", {});
   if (!out.ok) {
     logEvent({ kind: "system", severity: "error", message: `Onboarding start failed: ${out.error}` });
+    const pre = document.getElementById("onboardingOutput");
+    if (pre) pre.textContent = `Start failed: ${out.error}`;
+    updateActionCenter({ title: "Schwab setup", message: out.error || "Could not start onboarding.", severity: "error" });
     return;
   }
-  logEvent({ kind: "system", severity: "info", message: "Onboarding wizard started." });
+  logEvent({ kind: "system", severity: "info", message: "Setup wizard started." });
   await refreshOnboarding();
 }
 
@@ -2452,6 +2610,9 @@ async function runOnboardingStep(step) {
   const out = await api.post(`/api/onboarding/step/${step}`, {});
   if (!out.ok) {
     logEvent({ kind: "system", severity: "error", message: `Onboarding step failed: ${out.error}` });
+    const pre = document.getElementById("onboardingOutput");
+    if (pre) pre.textContent = `Step failed (${step}): ${out.error}`;
+    updateActionCenter({ title: "Schwab setup", message: out.error || `Step ${step} failed.`, severity: "error" });
     return;
   }
   logEvent({ kind: "system", severity: "info", message: `Onboarding step complete: ${step}.` });
@@ -2618,6 +2779,74 @@ async function refreshPerformance() {
   }
   state.performance = out.data;
   renderPerformancePanel(panel, out.data);
+}
+
+function renderCalibrationPanel(panel, data, error) {
+  if (!panel) return;
+  if (error) {
+    panel.innerHTML = `<div class="report-empty">${escapeHtml(error)}</div>`;
+    return;
+  }
+  if (!data) {
+    panel.innerHTML = `<div class="report-empty">No data.</div>`;
+    return;
+  }
+  if (data.empty) {
+    panel.innerHTML = `<div class="report-empty">${escapeHtml(data.hint || "No calibration snapshot yet.")}</div>`;
+    return;
+  }
+  const parts = [];
+  if (data.self_study) {
+    parts.push(
+      `<h3 class="field-label">Self-study</h3><pre class="code-block code-block--tight">${escapeHtml(
+        prettyJson(data.self_study)
+      )}</pre>`
+    );
+  }
+  if (data.hypothesis_ledger) {
+    parts.push(
+      `<h3 class="field-label">Hypothesis ledger</h3><pre class="code-block code-block--tight">${escapeHtml(
+        prettyJson(data.hypothesis_ledger)
+      )}</pre>`
+    );
+  }
+  panel.innerHTML =
+    parts.length > 0
+      ? parts.join("")
+      : `<div class="muted">Unrecognized snapshot shape.</div><pre class="code-block code-block--tight">${escapeHtml(
+          prettyJson(data)
+        )}</pre>`;
+}
+
+async function refreshCalibration() {
+  const panel = document.getElementById("calibrationPanel");
+  if (!panel) return;
+  const out = await api.get("/api/calibration/summary");
+  if (!out.ok) {
+    renderCalibrationPanel(panel, null, `Calibration load failed: ${out.error}`);
+    return;
+  }
+  state.calibration = out.data;
+  renderCalibrationPanel(panel, out.data, null);
+}
+
+async function submitTradingHaltSave() {
+  if (!state.publicConfig.saas_mode) return;
+  const halted = Boolean(document.getElementById("tradingHaltedCheckbox")?.checked);
+  const out = await api.patch("/api/settings/trading-halt", { halted });
+  if (!out.ok) {
+    const msg = typeof out.error === "string" ? out.error : JSON.stringify(out.error || "Request failed");
+    updateActionCenter({ title: "Trading pause", message: msg, severity: "error" });
+    return;
+  }
+  updateActionCenter({
+    title: halted ? "Trading paused" : "Trading pause cleared",
+    message: halted
+      ? "New live approvals are blocked until you turn this off."
+      : "You may approve live trades again when live trading is enabled.",
+    severity: "success",
+  });
+  await refreshAccountMe();
 }
 
 function setDefaultBacktestDates() {
@@ -3306,12 +3535,18 @@ async function refreshSectors() {
     grid.innerHTML = `<div class="muted">No sector data.</div>`;
     return;
   }
+  const maxAbsVs = Math.max(1, ...rows.map((r) => Math.abs(safeNum(r.vs_spy, 0))));
   rows.forEach((row) => {
     const card = document.createElement("div");
     card.className = `sector-card ${row.winning ? "win" : "loss"}`;
+    const vs = safeNum(row.vs_spy, 0);
+    const barPct = Math.round((Math.abs(vs) / maxAbsVs) * 100);
     card.innerHTML = `
       <div class="${row.winning ? "sector-winning" : "sector-lagging"}"><strong>${safeText(row.etf)}</strong> ${safeText(row.name || "")}</div>
-      <div class="${row.winning ? "sector-winning" : "sector-lagging"}">${safeNum(row.return_pct).toFixed(2)}% vs SPY ${safeNum(row.vs_spy).toFixed(2)}%</div>
+      <div class="${row.winning ? "sector-winning" : "sector-lagging"} mono-nums">${safeNum(row.return_pct).toFixed(2)}% vs SPY ${vs.toFixed(2)}%</div>
+      <div class="sector-bar-track" aria-hidden="true" title="Relative strength vs SPY (within this grid)">
+        <div class="sector-bar-fill ${row.winning ? "sector-bar-fill--win" : "sector-bar-fill--loss"}" style="width:${barPct}%"></div>
+      </div>
       <div class="${row.winning ? "pill good" : "pill bad"}">${row.winning ? "Winning" : "Lagging"}</div>
     `;
     grid.appendChild(card);
@@ -3441,6 +3676,7 @@ async function refreshAll() {
     refreshOnboarding(),
     loadProfiles(),
     refreshPerformance(),
+    refreshCalibration(),
     refreshBacktestRuns(),
   ]);
   Object.keys(lazyLoaded).forEach((k) => {
@@ -3495,11 +3731,11 @@ function wireEvents() {
     state.scanRunOptions = null;
   });
   document.getElementById("refreshBtn").addEventListener("click", refreshAll);
-  document.getElementById("onboardingStartBtn").addEventListener("click", startOnboarding);
-  document.getElementById("onboardingConnectBtn").addEventListener("click", () => runOnboardingStep("connect"));
-  document.getElementById("onboardingVerifyBtn").addEventListener("click", () => runOnboardingStep("verify_token_health"));
-  document.getElementById("onboardingScanBtn").addEventListener("click", () => runOnboardingStep("test_scan"));
-  document.getElementById("onboardingPaperBtn").addEventListener("click", () => runOnboardingStep("test_paper_order"));
+  document.getElementById("onboardingStartBtn")?.addEventListener("click", startOnboarding);
+  document.getElementById("onboardingConnectBtn")?.addEventListener("click", () => runOnboardingStep("connect"));
+  document.getElementById("onboardingVerifyBtn")?.addEventListener("click", () => runOnboardingStep("verify_token_health"));
+  document.getElementById("onboardingScanBtn")?.addEventListener("click", () => runOnboardingStep("test_scan"));
+  document.getElementById("onboardingPaperBtn")?.addEventListener("click", () => runOnboardingStep("test_paper_order"));
   document.getElementById("onboardingSchwabBtn")?.addEventListener("click", async () => {
     if (!state.publicConfig?.schwab_oauth) {
       logEvent({ kind: "system", severity: "warn", message: "Schwab OAuth is not configured on this server." });
@@ -3512,8 +3748,30 @@ function wireEvents() {
     }
     window.location.href = out.data.url;
   });
+  document.getElementById("onboardingSchwabMarketBtn")?.addEventListener("click", async () => {
+    if (!state.publicConfig?.schwab_market_oauth) {
+      logEvent({
+        kind: "system",
+        severity: "warn",
+        message: "Schwab market OAuth is not configured on this server.",
+      });
+      return;
+    }
+    const out = await api.get("/api/oauth/schwab/market/authorize-url");
+    if (!out.ok || !out.data?.url) {
+      logEvent({
+        kind: "system",
+        severity: "error",
+        message: out.error || "Could not start Schwab market OAuth.",
+      });
+      return;
+    }
+    window.location.href = out.data.url;
+  });
   document.getElementById("applyProfileBtn").addEventListener("click", applyProfile);
   document.getElementById("enableLiveTradingBtn")?.addEventListener("click", () => void submitEnableLiveTrading());
+  document.getElementById("saveTradingHaltBtn")?.addEventListener("click", () => void submitTradingHaltSave());
+  document.getElementById("calibrationRefreshBtn")?.addEventListener("click", () => void refreshCalibration());
   document.getElementById("settingsModeSelect").addEventListener("change", loadProfiles);
   document.getElementById("profileSelect")?.addEventListener("change", renderPresetApplyPreview);
   document.getElementById("automationOptIn")?.addEventListener("change", renderPresetApplyPreview);
@@ -3557,6 +3815,33 @@ function wireEvents() {
   });
   document.getElementById("pendingFilter").addEventListener("change", refreshPending);
   document.getElementById("pendingSort").addEventListener("change", refreshPending);
+  document.getElementById("clearPendingBtn")?.addEventListener("click", async () => {
+    const btn = document.getElementById("clearPendingBtn");
+    if (!btn || btn.disabled) return;
+    if (
+      !confirm(
+        "Reject all pending trades? They will move to rejected status and disappear from the pending queue.",
+      )
+    ) {
+      return;
+    }
+    btn.disabled = true;
+    const out = await api.post("/api/pending-trades/clear-pending", {});
+    if (!out.ok) {
+      logEvent({ kind: "trade", severity: "error", message: `Clear pending failed: ${out.error}` });
+      updateActionCenter({ title: "Clear pending failed", message: out.error, severity: "error" });
+      await refreshPending();
+      return;
+    }
+    const n = typeof out.data?.cleared === "number" ? out.data.cleared : 0;
+    logEvent({ kind: "trade", severity: "info", message: `Cleared ${n} pending trade(s).` });
+    updateActionCenter({
+      title: n ? "Pending queue cleared" : "Nothing to clear",
+      message: n ? `Rejected ${n} pending trade(s).` : "There were no pending trades.",
+      severity: n ? "warn" : "info",
+    });
+    await refreshPending();
+  });
 
   const dialog = document.getElementById("approveDialog");
   document.getElementById("confirmApproveBtn").addEventListener("click", async (e) => {

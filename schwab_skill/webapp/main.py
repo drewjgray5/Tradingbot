@@ -28,6 +28,7 @@ from sec_filing_compare import (
 from sector_strength import get_sector_heatmap
 from signal_scanner import scan_for_signals_detailed
 
+from .calibration_snapshot import build_calibration_snapshot
 from .checklist_language import with_plain_language
 from .db import DATABASE_URL, Base, SessionLocal, engine
 from .models import AppState, PendingTrade, User
@@ -750,7 +751,18 @@ def public_config() -> ApiResponse:
     supabase: dict[str, str] | None = None
     if url and anon:
         supabase = {"url": url, "anon_key": anon}
-    data: dict[str, Any] = {"supabase": supabase, "saas_mode": False, "schwab_oauth": False}
+    plat_kill = (os.getenv("LIVE_TRADING_KILL_SWITCH") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    data: dict[str, Any] = {
+        "supabase": supabase,
+        "saas_mode": False,
+        "schwab_oauth": False,
+        "platform_live_trading_kill_switch": plat_kill,
+    }
     impl = (os.getenv("WEB_IMPLEMENTATION_GUIDE_URL") or "").strip()
     if impl.startswith(("http://", "https://")):
         data["implementation_guide_url"] = impl
@@ -1197,6 +1209,30 @@ def create_pending_trade(payload: CreatePendingTrade, db: Session = Depends(get_
         return _err("create_pending_trade", e)
 
 
+@app.post("/api/pending-trades/clear-pending", response_model=ApiResponse)
+def clear_all_pending_trades(
+    auth_ctx: dict[str, str] = Depends(require_trade_api_key),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
+    rows = (
+        db.query(PendingTrade)
+        .filter(PendingTrade.user_id == LOCAL_DASHBOARD_USER_ID, PendingTrade.status == "pending")
+        .all()
+    )
+    cleared_ids = [r.id for r in rows]
+    for row in rows:
+        row.status = "rejected"
+    db.commit()
+    actor = auth_ctx.get("actor", "web-user")
+    if cleared_ids:
+        _audit_event(
+            "pending_trades_cleared",
+            actor,
+            {"cleared": len(cleared_ids), "trade_ids": cleared_ids},
+        )
+    return _ok({"cleared": len(cleared_ids)})
+
+
 @app.post("/api/trades/{trade_id}/approve", response_model=ApiResponse)
 def approve_trade(
     trade_id: str,
@@ -1639,4 +1675,9 @@ def performance() -> ApiResponse:
             },
         }
     )
+
+
+@app.get("/api/calibration/summary", response_model=ApiResponse)
+def api_calibration_summary() -> ApiResponse:
+    return _ok(build_calibration_snapshot(SKILL_DIR))
 

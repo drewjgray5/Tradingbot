@@ -186,9 +186,13 @@ def main() -> int:
         "failed_steps": [r["name"] for r in failed],
         "results": results,
     }
+    blob = json.dumps(summary, indent=2)
     out_path = ARTIFACT_DIR / f"validate_all_{run_id}_{args.profile}.json"
-    out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    out_path.write_text(blob, encoding="utf-8")
     print(f"Summary artifact: {out_path}")
+    latest = ARTIFACT_DIR / "latest_validation_report.json"
+    latest.write_text(blob, encoding="utf-8")
+    print(f"Latest summary (stable path): {latest}")
 
     return 0 if summary["passed"] else 1
 

@@ -23,6 +23,7 @@ class User(Base):
     subscription_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     subscription_current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     live_execution_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    trading_halted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 

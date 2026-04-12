@@ -100,7 +100,9 @@ def _load_watchlist(skill_dir: Path) -> list[str]:
     Load watchlist:
     - If SIGNAL_WATCHLIST is set in .env (non-empty), it overrides everything else (custom list).
     - Else if USE_STATIC_WATCHLIST is true: DEFAULT_WATCHLIST (~sector basket).
-    - Else: watchlist_loader.load_full_watchlist() (S&P 500 + 400 + 600 + Russell 2000 + IWM).
+    - Else: watchlist_loader.load_full_watchlist() (S&P 500 + 400 + 600 + Russell 2000 + IWM),
+      refreshed from source at least once per UTC day. When SIGNAL_SCAN_FULL_UNIVERSE is true
+      (default), that dynamic list is not shortened by quality prefilter or focused universe.
     """
     import os
 
@@ -125,9 +127,17 @@ def _load_watchlist(skill_dir: Path) -> list[str]:
         static_wl = _apply_universe_focus(skill_dir, static_wl)
         LOG.info("Watchlist mode=static (USE_STATIC_WATCHLIST) tickers=%d", len(static_wl))
         return static_wl
+    from config import get_signal_scan_full_universe
     from watchlist_loader import load_full_watchlist
 
     wl = load_full_watchlist()
+    if get_signal_scan_full_universe(skill_dir):
+        LOG.info(
+            "Watchlist mode=full (watchlist_loader: S&P500+400+600+Russell2000+IWM) tickers=%d "
+            "(SIGNAL_SCAN_FULL_UNIVERSE: no prefilter/focus)",
+            len(wl),
+        )
+        return wl
     wl = _maybe_prefilter_watchlist(skill_dir, wl)
     wl = _apply_universe_focus(skill_dir, wl)
     LOG.info(
@@ -1149,6 +1159,10 @@ def scan_for_signals_detailed(
     top_n = get_signal_top_n(skill_dir)
     stage_a_workers = get_scan_stage_a_max_workers(skill_dir)
     stage_b_workers = get_scan_stage_b_max_workers(skill_dir)
+    diagnostics["scan_parallelism"] = {
+        "stage_a_max_workers": int(stage_a_workers),
+        "stage_b_max_workers": int(stage_b_workers),
+    }
     shortlist_multiplier = get_scan_stage_a_shortlist_multiplier(skill_dir)
     shortlist_cap = get_scan_stage_a_shortlist_cap(skill_dir)
     task_timeout_sec = max(5.0, float(get_scan_stage_task_timeout_sec(skill_dir)))

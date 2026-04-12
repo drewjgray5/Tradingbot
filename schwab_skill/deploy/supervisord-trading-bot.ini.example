@@ -1,0 +1,13 @@
+; Example fragment: run the scheduled local bot under supervisord (Linux).
+; Copy into your supervisord.conf or include directory and adjust paths/user.
+;
+; [program:tradingbot]
+; command=/path/to/venv/bin/python -u main.py
+; directory=/path/to/schwab_skill
+; autostart=true
+; autorestart=true
+; startsecs=10
+; stopwaitsecs=30
+; stdout_logfile=/var/log/tradingbot/stdout.log
+; stderr_logfile=/var/log/tradingbot/stderr.log
+; environment=PYTHONUNBUFFERED="1"

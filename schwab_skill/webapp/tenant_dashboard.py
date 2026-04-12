@@ -28,6 +28,8 @@ from .billing_stripe import user_has_paid_entitlement
 from .checklist_language import with_plain_language
 from .models import AppState, PendingTrade, User, UserCredential
 from .oauth_schwab import (
+    SCHWAB_OAUTH_KIND_ACCOUNT,
+    SCHWAB_OAUTH_KIND_MARKET,
     exchange_schwab_code_for_tokens,
     schwab_authorize_url,
     sign_schwab_oauth_state,
@@ -400,8 +402,43 @@ def tenant_create_pending(
         return _err("create_pending_trade", str(exc))
 
 
+@router.post("/api/pending-trades/clear-pending", response_model=ApiResponse)
+def tenant_clear_all_pending(
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(_db),
+) -> ApiResponse:
+    rows = db.query(PendingTrade).filter(PendingTrade.user_id == user.id, PendingTrade.status == "pending").all()
+    for row in rows:
+        row.status = "rejected"
+    db.commit()
+    return _ok({"cleared": len(rows)})
+
+
+@router.get("/api/calibration/summary", response_model=ApiResponse)
+def tenant_calibration_summary(
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(_db),
+) -> ApiResponse:
+    row = (
+        db.query(AppState)
+        .filter(AppState.user_id == user.id, AppState.key == "calibration_snapshot")
+        .first()
+    )
+    if not row:
+        return _ok(
+            {
+                "empty": True,
+                "hint": "Populated when a scan finds .self_study.json or .hypothesis_ledger.json in the worker session. "
+                "Set HYPOTHESIS_LEDGER_ENABLED on API/workers to forward into tenant env.",
+            }
+        )
+    data = parse_json(row.value_json, {})
+    return _ok(data if isinstance(data, dict) else {"raw": data})
+
+
 @router.post("/api/trades/{trade_id}/approve", response_model=ApiResponse)
 def tenant_approve_trade(
+    request: Request,
     trade_id: str,
     payload: ApproveTradeRequest,
     confirm_live: bool = False,
@@ -411,7 +448,14 @@ def tenant_approve_trade(
     if not user_has_account_session(db, user.id):
         return _err("Link Schwab account before approving trades.")
     db_user = db.query(User).filter(User.id == user.id).first()
-    if not db_user or not db_user.live_execution_enabled:
+    if not db_user:
+        return _err("User not found.")
+    if getattr(db_user, "trading_halted", False):
+        raise HTTPException(
+            status_code=403,
+            detail="Trading is paused for this account. Resume under account settings before approving live orders.",
+        )
+    if not db_user.live_execution_enabled:
         raise HTTPException(
             status_code=403,
             detail="Live trading is off. Enable it under Strategy Presets after reviewing risk, then approve again.",
@@ -457,6 +501,17 @@ def tenant_approve_trade(
         row.note = (row.note or "") + f" | {result}" if row.note else result
         db.commit()
         db.refresh(row)
+        log_audit(
+            db,
+            action="trade_approve_failed",
+            user_id=user.id,
+            detail={
+                "trade_id": trade_id,
+                "ticker": row.ticker,
+                "error_excerpt": result[:240],
+            },
+            request_id=_request_id(request),
+        )
         return ApiResponse(
             ok=False,
             error=result,
@@ -469,6 +524,13 @@ def tenant_approve_trade(
     row.status = "executed"
     db.commit()
     db.refresh(row)
+    log_audit(
+        db,
+        action="trade_approved_executed",
+        user_id=user.id,
+        detail={"trade_id": trade_id, "ticker": row.ticker, "qty": row.qty},
+        request_id=_request_id(request),
+    )
     return _ok({"trade": _trade_to_dict(row), "result": result})
 
 
@@ -593,7 +655,7 @@ def tenant_onboarding_step(
             "ok": linked,
             "at": now_iso,
             "details": {"schwab_linked": linked},
-            "fix_path": "Use Connect Schwab (OAuth) or paste tokens via API if enabled.",
+            "fix_path": "Use Connect Schwab (account) and Connect Schwab (market) on the dashboard, or paste tokens via API if your host allows it.",
         }
     elif step_key == "verify_token_health":
         snap = _tenant_api_health_snapshot(db, user.id)
@@ -602,7 +664,7 @@ def tenant_onboarding_step(
             "ok": ok,
             "at": now_iso,
             "details": snap,
-            "fix_path": "Complete Schwab OAuth and ensure market + account tokens are present.",
+            "fix_path": "Finish both Schwab connect buttons (account and market), then refresh this page.",
         }
     elif step_key == "test_scan":
         if not user_has_paid_entitlement(user):
@@ -685,8 +747,25 @@ def schwab_authorize_url_endpoint(user: User = Depends(get_current_user)) -> Api
             detail="Configure SCHWAB_ACCOUNT_APP_KEY and SCHWAB_CALLBACK_URL for OAuth.",
         )
     try:
-        state = sign_schwab_oauth_state(user.id)
-    except RuntimeError as exc:
+        state = sign_schwab_oauth_state(user.id, SCHWAB_OAUTH_KIND_ACCOUNT)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    url = schwab_authorize_url(client_id, redirect_uri, state)
+    return _ok({"url": url, "state": state})
+
+
+@router.get("/api/oauth/schwab/market/authorize-url", response_model=ApiResponse)
+def schwab_market_authorize_url_endpoint(user: User = Depends(get_current_user)) -> ApiResponse:
+    client_id = (os.getenv("SCHWAB_MARKET_APP_KEY") or "").strip()
+    redirect_uri = (os.getenv("SCHWAB_MARKET_CALLBACK_URL") or "").strip()
+    if not client_id or not redirect_uri:
+        raise HTTPException(
+            status_code=503,
+            detail="Configure SCHWAB_MARKET_APP_KEY and SCHWAB_MARKET_CALLBACK_URL for market OAuth.",
+        )
+    try:
+        state = sign_schwab_oauth_state(user.id, SCHWAB_OAUTH_KIND_MARKET)
+    except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     url = schwab_authorize_url(client_id, redirect_uri, state)
     return _ok({"url": url, "state": state})
@@ -707,9 +786,15 @@ def schwab_oauth_callback(
 
     if error:
         return red(f"schwab_oauth=error&message={urllib.parse.quote(error)}")
-    user_id = verify_schwab_oauth_state(state)
-    if not user_id or not code.strip():
+    verified = verify_schwab_oauth_state(state)
+    if not verified or not code.strip():
         return red("schwab_oauth=error&message=" + urllib.parse.quote("invalid_or_expired_state"))
+    user_id, kind = verified
+    if kind != SCHWAB_OAUTH_KIND_ACCOUNT:
+        return red(
+            "schwab_oauth=error&message="
+            + urllib.parse.quote("wrong_oauth_flow_use_account_authorize_link")
+        )
 
     client_id = (os.getenv("SCHWAB_ACCOUNT_APP_KEY") or "").strip()
     client_secret = (os.getenv("SCHWAB_ACCOUNT_APP_SECRET") or "").strip()
@@ -770,3 +855,74 @@ def schwab_oauth_callback(
         request_id=_request_id(request),
     )
     return red("schwab_oauth=ok")
+
+
+@router.get("/api/oauth/schwab/market/callback")
+def schwab_market_oauth_callback(
+    request: Request,
+    code: str = "",
+    state: str = "",
+    error: str = "",
+    db: OrmSession = Depends(_db),
+):
+    front = (os.getenv("SAAS_FRONTEND_URL") or "http://127.0.0.1:8000").rstrip("/")
+
+    def red(qs: str) -> RedirectResponse:
+        return RedirectResponse(f"{front}/?{qs}", status_code=302)
+
+    if error:
+        return red(f"schwab_market_oauth=error&message={urllib.parse.quote(error)}")
+    verified = verify_schwab_oauth_state(state)
+    if not verified or not code.strip():
+        return red(
+            "schwab_market_oauth=error&message=" + urllib.parse.quote("invalid_or_expired_state")
+        )
+    user_id, kind = verified
+    if kind != SCHWAB_OAUTH_KIND_MARKET:
+        return red(
+            "schwab_market_oauth=error&message="
+            + urllib.parse.quote("wrong_oauth_flow_use_market_authorize_link")
+        )
+
+    client_id = (os.getenv("SCHWAB_MARKET_APP_KEY") or "").strip()
+    client_secret = (os.getenv("SCHWAB_MARKET_APP_SECRET") or "").strip()
+    redirect_uri = (os.getenv("SCHWAB_MARKET_CALLBACK_URL") or "").strip()
+    if not client_id or not client_secret or not redirect_uri:
+        return red(
+            "schwab_market_oauth=error&message="
+            + urllib.parse.quote("server_market_oauth_not_configured")
+        )
+
+    try:
+        tok = exchange_schwab_code_for_tokens(client_id, client_secret, code, redirect_uri)
+    except Exception as exc:
+        return red(
+            "schwab_market_oauth=error&message=" + urllib.parse.quote(str(exc)[:180])
+        )
+
+    access = str(tok.get("access_token") or "").strip()
+    refresh = str(tok.get("refresh_token") or "").strip()
+    if not access or not refresh:
+        return red(
+            "schwab_market_oauth=error&message="
+            + urllib.parse.quote("token_response_missing_tokens")
+        )
+
+    row = db.query(UserCredential).filter(UserCredential.user_id == user_id).first()
+    if not row:
+        row = UserCredential(user_id=user_id)
+        db.add(row)
+
+    row.market_token_payload_enc = encrypt_secret(json.dumps(tok, default=_json_default))
+
+    db.commit()
+    db.refresh(row)
+
+    log_audit(
+        db,
+        action="oauth_schwab_market_callback",
+        user_id=user_id,
+        detail={},
+        request_id=_request_id(request),
+    )
+    return red("schwab_market_oauth=ok")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +13,7 @@ import stripe
 from celery.result import AsyncResult
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -34,6 +36,7 @@ from .db import DATABASE_URL, Base, SessionLocal, engine
 from .models import AppState, BacktestRun, Order, Position, ScanResult, User, UserCredential
 from .saas_redis import acquire_scan_cooldown, fixed_window_rate_limit, redis_ping
 from .scan_payload import parse_scan_run_body
+from .prometheus_metrics import render_prometheus_text
 from .schemas import (
     ApiResponse,
     BillingCheckoutRequest,
@@ -41,6 +44,7 @@ from .schemas import (
     QueueUserBacktestRequest,
     SchwabCredentialUpsert,
     StrategyChatRequest,
+    UpdateTradingHaltRequest,
 )
 from .security import (
     encrypt_secret,
@@ -73,7 +77,7 @@ if os.getenv("SAAS_BOOTSTRAP_SCHEMA", "").lower() in ("1", "true", "yes"):
 
         from alembic import command
 
-        command.stamp(Config(str(_ALEMBIC_INI)), "saas005")
+        command.stamp(Config(str(_ALEMBIC_INI)), "saas006")
 elif os.getenv("SAAS_RUN_ALEMBIC", "").lower() in ("1", "true", "yes"):
     if _ALEMBIC_INI.is_file():
         from alembic.config import Config
@@ -118,9 +122,33 @@ app.include_router(tenant_dashboard_router)
 async def request_id_middleware(request: Request, call_next: Any) -> Any:
     rid = request.headers.get("x-request-id") or str(uuid.uuid4())
     request.state.request_id = rid
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = rid
-    return response
+    t0 = time.perf_counter()
+    ctx_token = None
+    try:
+        from logger_setup import request_id_var
+
+        ctx_token = request_id_var.set(rid)
+    except Exception:
+        pass
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = rid
+        try:
+            from .prometheus_metrics import inc, observe
+
+            inc("http_requests_total")
+            observe("http_request_duration", time.perf_counter() - t0)
+        except Exception:
+            pass
+        return response
+    finally:
+        if ctx_token is not None:
+            try:
+                from logger_setup import request_id_var
+
+                request_id_var.reset(ctx_token)
+            except Exception:
+                pass
 
 
 def _request_id(request: Request) -> str | None:
@@ -179,6 +207,44 @@ def _scan_rate_limit(user_id: str) -> None:
         raise HTTPException(status_code=429, detail=f"Scan rate limit exceeded ({n}/{limit} per {window}s).")
 
 
+def _scan_daily_limit_for_user(user: User) -> int:
+    default = int(os.getenv("SAAS_SCAN_DAILY_LIMIT", "200"))
+    trial = int(os.getenv("SAAS_SCAN_DAILY_LIMIT_TRIAL", "30"))
+    status = (user.subscription_status or "").strip().lower()
+    return trial if status == "trialing" else default
+
+
+def _scan_daily_limit_check(user_id: str, user: User) -> tuple[int, int]:
+    limit = _scan_daily_limit_for_user(user)
+    if limit <= 0:
+        return limit, 0
+    ok, n = fixed_window_rate_limit(user_id, "scan_daily", limit, 86400)
+    if not ok:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily scan quota exceeded ({n}/{limit} per rolling 24h window).",
+        )
+    return limit, n
+
+
+def _celery_queue_estimate() -> dict[str, Any]:
+    try:
+        insp = celery_app.control.inspect(timeout=0.75)
+        if not insp:
+            return {"inspect_available": False}
+        reserved = insp.reserved() or {}
+        scheduled = insp.scheduled() or {}
+        active = insp.active() or {}
+        return {
+            "inspect_available": True,
+            "reserved_total": sum(len(v) for v in reserved.values()),
+            "scheduled_total": sum(len(v) for v in scheduled.values()),
+            "active_total": sum(len(v) for v in active.values()),
+        }
+    except Exception:
+        return {"inspect_available": False}
+
+
 def _order_rate_limit(user_id: str) -> None:
     limit = int(os.getenv("SAAS_RATE_ORDER_PER_MIN", "30"))
     window = int(os.getenv("SAAS_RATE_LIMIT_WINDOW_SEC", "60"))
@@ -223,11 +289,38 @@ def public_config() -> ApiResponse:
     schwab_oauth = bool(
         (os.getenv("SCHWAB_ACCOUNT_APP_KEY") or "").strip() and (os.getenv("SCHWAB_CALLBACK_URL") or "").strip()
     )
-    data: dict[str, Any] = {"supabase": supabase, "schwab_oauth": schwab_oauth, "saas_mode": True}
+    schwab_market_oauth = bool(
+        (os.getenv("SCHWAB_MARKET_APP_KEY") or "").strip()
+        and (os.getenv("SCHWAB_MARKET_CALLBACK_URL") or "").strip()
+    )
+    plat_kill = (os.getenv("LIVE_TRADING_KILL_SWITCH") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    data: dict[str, Any] = {
+        "supabase": supabase,
+        "schwab_oauth": schwab_oauth,
+        "schwab_market_oauth": schwab_market_oauth,
+        "saas_mode": True,
+        "platform_live_trading_kill_switch": plat_kill,
+    }
     impl = (os.getenv("WEB_IMPLEMENTATION_GUIDE_URL") or "").strip()
     if impl.startswith(("http://", "https://")):
         data["implementation_guide_url"] = impl
+    elif schwab_oauth or schwab_market_oauth:
+        # Built-in end-user steps when the host does not set WEB_IMPLEMENTATION_GUIDE_URL
+        data["implementation_guide_url"] = "/static/connect-schwab-guide.html"
     return _ok(data)
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def prometheus_metrics() -> PlainTextResponse:
+    return PlainTextResponse(
+        render_prometheus_text(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 @app.get("/api/health", response_model=ApiResponse)
@@ -287,6 +380,7 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(_db)) -> Ap
             "schwab_linked": linked,
             "onboarding_required": not linked,
             "live_execution_enabled": bool(getattr(user, "live_execution_enabled", False)),
+            "trading_halted": bool(getattr(user, "trading_halted", False)),
             "subscription_status": user.subscription_status,
             "subscription_current_period_end": period_end,
             "has_stripe_customer": bool(user.stripe_customer_id),
@@ -329,6 +423,29 @@ def enable_live_trading(
         request_id=_request_id(request),
     )
     return _ok({"live_execution_enabled": True})
+
+
+@app.patch("/api/settings/trading-halt", response_model=ApiResponse)
+def update_trading_halt(
+    request: Request,
+    payload: UpdateTradingHaltRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(_db),
+) -> ApiResponse:
+    row = db.query(User).filter(User.id == user.id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found.")
+    row.trading_halted = bool(payload.halted)
+    db.commit()
+    db.refresh(row)
+    log_audit(
+        db,
+        action="trading_halt_updated",
+        user_id=row.id,
+        detail={"halted": row.trading_halted},
+        request_id=_request_id(request),
+    )
+    return _ok({"trading_halted": row.trading_halted})
 
 
 @app.post("/api/billing/checkout-session", response_model=ApiResponse)
@@ -503,15 +620,24 @@ def credential_status(user: User = Depends(get_current_user), db: Session = Depe
 
 @app.get("/api/onboarding/status", response_model=ApiResponse)
 def onboarding_status(user: User = Depends(get_current_user), db: Session = Depends(_db)) -> ApiResponse:
+    """Match local `main.py` onboarding payload shape: steps/start/elapsed at top level (not only under `wizard`)."""
     linked = _is_schwab_linked(db, user.id)
     api_health = _tenant_api_health_snapshot(db, user.id)
-    wizard = _load_state(
-        db,
-        user.id,
-        "onboarding_wizard",
-        default={},
-    )
-    state = _load_state(
+    target_mins = 20
+    wizard_default: dict[str, Any] = {
+        "started_at": None,
+        "target_minutes": target_mins,
+        "steps": {
+            "connect": {"ok": False},
+            "verify_token_health": {"ok": False},
+            "test_scan": {"ok": False},
+            "test_paper_order": {"ok": False},
+        },
+    }
+    wizard = _load_state(db, user.id, "onboarding_wizard", default=copy.deepcopy(wizard_default))
+    if not isinstance(wizard.get("steps"), dict):
+        wizard["steps"] = dict(wizard_default["steps"])
+    meta = _load_state(
         db,
         user.id,
         "onboarding",
@@ -521,12 +647,38 @@ def onboarding_status(user: User = Depends(get_current_user), db: Session = Depe
             "wizard_required": not linked,
         },
     )
-    state["schwab_linked"] = linked
-    state["onboarding_required"] = not linked
-    state["connection_status"] = "connected" if linked else "disconnected"
-    state["api_health"] = api_health
-    state["wizard"] = wizard
-    return _ok(state)
+    started_at = wizard.get("started_at")
+    elapsed_minutes = None
+    if isinstance(started_at, str) and started_at:
+        try:
+            dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            elapsed_minutes = round((datetime.now(timezone.utc) - dt).total_seconds() / 60.0, 1)
+        except Exception:
+            elapsed_minutes = None
+    _wsteps = wizard.get("steps")
+    steps: dict[str, Any] = _wsteps if isinstance(_wsteps, dict) else {}
+    completion = (
+        bool((steps.get("connect") or {}).get("ok"))
+        and bool((steps.get("verify_token_health") or {}).get("ok"))
+        and bool((steps.get("test_scan") or {}).get("ok"))
+        and bool((steps.get("test_paper_order") or {}).get("ok"))
+    )
+    tm = int(wizard.get("target_minutes") or target_mins)
+    completed_under_target = bool(completion and elapsed_minutes is not None and elapsed_minutes <= tm)
+    payload: dict[str, Any] = {
+        **meta,
+        "started_at": wizard.get("started_at"),
+        "target_minutes": tm,
+        "steps": steps,
+        "elapsed_minutes": elapsed_minutes,
+        "completed_under_target": completed_under_target,
+        "schwab_linked": linked,
+        "onboarding_required": not linked,
+        "connection_status": "connected" if linked else "disconnected",
+        "api_health": api_health,
+        "wizard": wizard,
+    }
+    return _ok(payload)
 
 
 @app.post("/api/scan", response_model=ApiResponse)
@@ -546,6 +698,7 @@ def run_scan(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     _scan_rate_limit(user.id)
+    _scan_daily_limit_check(user.id, user)
     cooldown = int(os.getenv("SAAS_SCAN_COOLDOWN_SEC", "60"))
     if not acquire_scan_cooldown(user.id, cooldown):
         raise HTTPException(
@@ -565,7 +718,14 @@ def run_scan(
         },
         request_id=_request_id(request),
     )
-    return _ok({"task_id": task.id, "status": "queued"})
+    return _ok(
+        {
+            "task_id": task.id,
+            "status": "queued",
+            "worker_queue": _celery_queue_estimate(),
+            "daily_scan_limit": _scan_daily_limit_for_user(user),
+        }
+    )
 
 
 @app.get("/api/scan/{task_id}", response_model=ApiResponse)
@@ -578,6 +738,7 @@ def scan_task_status(
     payload: dict[str, Any] = {
         "task_id": task_id,
         "status": task.status.lower(),
+        "worker_queue": _celery_queue_estimate(),
     }
     if task.ready():
         result = task.result if isinstance(task.result, dict) else {"raw_result": str(task.result)}
