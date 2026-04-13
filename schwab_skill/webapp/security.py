@@ -9,6 +9,7 @@ from typing import Any
 import jwt
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import Depends, Header, HTTPException, Request
+from jwt import PyJWKClient
 from sqlalchemy.orm import Session
 
 from .billing_stripe import user_has_paid_entitlement
@@ -60,13 +61,13 @@ def decrypt_secret(ciphertext: str | None) -> str | None:
 
 
 def _jwt_secrets_for_decode() -> list[str]:
-    """Primary JWT secret first, then optional legacy (Supabase secret rotation / migration)."""
+    """Primary JWT secret first, then optional legacy (Supabase secret rotation / migration).
+
+    May be empty when the host relies only on asymmetric (JWKS) verification — see decode_supabase_jwt.
+    """
     primary = (os.getenv("SUPABASE_JWT_SECRET") or "").strip()
     if not primary:
-        raise HTTPException(
-            status_code=503,
-            detail="SUPABASE_JWT_SECRET is not configured.",
-        )
+        return []
     out: list[str] = [primary]
     legacy = (os.getenv("SUPABASE_JWT_SECRET_LEGACY") or "").strip()
     if legacy and legacy not in out:
@@ -74,16 +75,82 @@ def _jwt_secrets_for_decode() -> list[str]:
     return out
 
 
-def decode_supabase_jwt(token: str) -> dict[str, Any]:
+def _jwt_leeway_seconds() -> int:
+    raw = (os.getenv("SUPABASE_JWT_LEEWAY_SECONDS") or "120").strip()
+    try:
+        return max(0, min(int(raw), 86_400))
+    except ValueError:
+        return 120
+
+
+def _jwt_verify_audience() -> str | None:
+    """If set, jwt.decode verifies the aud claim (Supabase user access tokens often use 'authenticated')."""
+    aud = (os.getenv("SUPABASE_JWT_AUDIENCE") or "").strip()
+    return aud or None
+
+
+def _jwt_verify_issuer() -> str | None:
+    """If set, jwt.decode verifies iss (e.g. https://<ref>.supabase.co/auth/v1)."""
+    iss = (os.getenv("SUPABASE_JWT_ISSUER") or "").strip()
+    return iss or None
+
+
+def _supabase_jwks_url() -> str:
+    base = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
+    if not base:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "SUPABASE_URL is not configured; it is required to verify asymmetric "
+                "(ES256/RS256) Supabase JWTs via JWKS."
+            ),
+        )
+    return f"{base}/auth/v1/.well-known/jwks.json"
+
+
+# One client per JWKS URL; PyJWKClient caches keys internally.
+_jwks_clients: dict[str, PyJWKClient] = {}
+
+
+def _jwks_client_for(url: str) -> PyJWKClient:
+    client = _jwks_clients.get(url)
+    if client is None:
+        client = PyJWKClient(url, cache_keys=True)
+        _jwks_clients[url] = client
+    return client
+
+
+_ASYMMETRIC_ALGS = frozenset({"ES256", "ES384", "RS256", "RS384", "RS512"})
+
+
+def _decode_supabase_jwt_symmetric(token: str) -> dict[str, Any]:
+    secrets = _jwt_secrets_for_decode()
+    if not secrets:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "SUPABASE_JWT_SECRET is not configured. "
+                "In Supabase: Project Settings → API → copy JWT Secret into SUPABASE_JWT_SECRET on your host. "
+                "Asymmetric access tokens (ES256) only need SUPABASE_URL for JWKS; HS256 tokens always need the JWT secret."
+            ),
+        )
+    aud = _jwt_verify_audience()
+    iss = _jwt_verify_issuer()
+    leeway = _jwt_leeway_seconds()
+    opts: dict[str, Any] = {"verify_aud": bool(aud)}
     last_exc: jwt.PyJWTError | None = None
-    for secret in _jwt_secrets_for_decode():
+    for secret in secrets:
         try:
-            return jwt.decode(
-                token,
-                secret,
-                algorithms=["HS256"],
-                options={"verify_aud": False},
-            )
+            kwargs: dict[str, Any] = {
+                "algorithms": ["HS256"],
+                "options": opts,
+                "leeway": leeway,
+            }
+            if aud:
+                kwargs["audience"] = aud
+            if iss:
+                kwargs["issuer"] = iss
+            return jwt.decode(token, secret, **kwargs)
         except jwt.PyJWTError as exc:
             last_exc = exc
             continue
@@ -97,6 +164,64 @@ def decode_supabase_jwt(token: str) -> dict[str, Any]:
     else:
         detail = f"Invalid JWT: {last_exc}"
     raise HTTPException(status_code=401, detail=detail) from last_exc
+
+
+def _decode_supabase_jwt_asymmetric(token: str, alg: str) -> dict[str, Any]:
+    jwks_url = _supabase_jwks_url()
+    aud = _jwt_verify_audience()
+    iss = _jwt_verify_issuer()
+    leeway = _jwt_leeway_seconds()
+    opts: dict[str, Any] = {"verify_aud": bool(aud)}
+    try:
+        jwks = _jwks_client_for(jwks_url)
+        signing_key = jwks.get_signing_key_from_jwt(token)
+        kwargs: dict[str, Any] = {
+            "algorithms": [alg],
+            "options": opts,
+            "leeway": leeway,
+        }
+        if aud:
+            kwargs["audience"] = aud
+        if iss:
+            kwargs["issuer"] = iss
+        return jwt.decode(token, signing_key.key, **kwargs)
+    except HTTPException:
+        raise
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid JWT: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Could not verify JWT against Supabase JWKS ({jwks_url}): {exc}. "
+                "Confirm SUPABASE_URL matches your project API URL and the API host can reach the internet."
+            ),
+        ) from exc
+
+
+def decode_supabase_jwt(token: str) -> dict[str, Any]:
+    try:
+        header = jwt.get_unverified_header(token)
+    except jwt.PyJWTError as exc:
+        msg = str(exc).lower()
+        if "not enough segments" in msg or "segments" in msg:
+            detail = (
+                "Invalid JWT: expected a Supabase access token (three dot-separated parts), "
+                "not a refresh token or API key."
+            )
+        else:
+            detail = f"Invalid JWT: {exc}"
+        raise HTTPException(status_code=401, detail=detail) from exc
+
+    alg = str(header.get("alg") or "").upper()
+    if alg in _ASYMMETRIC_ALGS:
+        return _decode_supabase_jwt_asymmetric(token, alg)
+    if alg == "HS256" or not alg:
+        return _decode_supabase_jwt_symmetric(token)
+    raise HTTPException(
+        status_code=401,
+        detail=f"Unsupported JWT algorithm {alg!r}; expected HS256 or Supabase asymmetric (e.g. ES256).",
+    )
 
 
 def auth_session_cookie_name() -> str:

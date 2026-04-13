@@ -148,10 +148,15 @@ class FullReport:
 # 1. Technical Analysis
 # ---------------------------------------------------------------------------
 
-def _build_technical(ticker: str, df: pd.DataFrame, auth: Any) -> TechnicalSection:
+def _resolve_skill_dir(skill_dir: Path | None) -> Path:
+    return SKILL_DIR if skill_dir is None else Path(skill_dir)
+
+
+def _build_technical(ticker: str, df: pd.DataFrame, auth: Any, skill_dir: Path | None = None) -> TechnicalSection:
     from sector_strength import get_ticker_sector_etf
     from stage_analysis import add_indicators, check_vcp_volume, compute_signal_score, is_stage_2
 
+    sd = _resolve_skill_dir(skill_dir)
     sec = TechnicalSection(ticker=ticker)
 
     if df.empty or len(df) < 5:
@@ -172,8 +177,8 @@ def _build_technical(ticker: str, df: pd.DataFrame, auth: Any) -> TechnicalSecti
     sec.low_52w = float(df["low"].iloc[-lookback:].min())
     sec.pct_from_high = (sec.current_price / sec.high_52w * 100) if sec.high_52w > 0 else 0
 
-    sec.stage_2 = is_stage_2(df, SKILL_DIR)
-    sec.vcp = check_vcp_volume(df, SKILL_DIR)
+    sec.stage_2 = is_stage_2(df, sd)
+    sec.vcp = check_vcp_volume(df, sd)
     sec.signal_score = compute_signal_score(df)
 
     etf = get_ticker_sector_etf(ticker)
@@ -469,7 +474,8 @@ def _build_health(ticker: str) -> HealthSection:
 # 5. SEC EDGAR
 # ---------------------------------------------------------------------------
 
-def _build_edgar(ticker: str) -> EdgarSection:
+def _build_edgar(ticker: str, skill_dir: Path | None = None) -> EdgarSection:
+    sd = _resolve_skill_dir(skill_dir)
     sec = EdgarSection()
     try:
         from config import (
@@ -481,13 +487,13 @@ def _build_edgar(ticker: str) -> EdgarSection:
             get_sec_filing_llm_summary_enabled,
             get_sec_filing_max_chars,
         )
-        enabled = get_sec_enrichment_enabled(SKILL_DIR)
-        cache_hours = get_sec_cache_hours(SKILL_DIR)
-        user_agent = get_edgar_user_agent(SKILL_DIR)
-        filing_analysis_enabled = get_sec_filing_analysis_enabled(SKILL_DIR)
-        filing_llm_enabled = get_sec_filing_llm_summary_enabled(SKILL_DIR)
-        filing_cache_hours = get_sec_filing_cache_hours(SKILL_DIR)
-        filing_max_chars = get_sec_filing_max_chars(SKILL_DIR)
+        enabled = get_sec_enrichment_enabled(sd)
+        cache_hours = get_sec_cache_hours(sd)
+        user_agent = get_edgar_user_agent(sd)
+        filing_analysis_enabled = get_sec_filing_analysis_enabled(sd)
+        filing_llm_enabled = get_sec_filing_llm_summary_enabled(sd)
+        filing_cache_hours = get_sec_filing_cache_hours(sd)
+        filing_max_chars = get_sec_filing_max_chars(sd)
     except Exception:
         enabled = True
         cache_hours = 12.0
@@ -502,7 +508,7 @@ def _build_edgar(ticker: str) -> EdgarSection:
         from sec_enrichment import fetch_sec_snapshot
         snap = fetch_sec_snapshot(
             ticker,
-            skill_dir=SKILL_DIR,
+            skill_dir=sd,
             user_agent=user_agent,
             cache_hours=cache_hours,
             enabled=enabled,
@@ -524,7 +530,7 @@ def _build_edgar(ticker: str) -> EdgarSection:
                     ticker=ticker,
                     form_type="10-K",
                     user_agent=user_agent,
-                    skill_dir=SKILL_DIR,
+                    skill_dir=sd,
                     cache_hours=filing_cache_hours,
                     max_chars=filing_max_chars,
                     enable_llm=filing_llm_enabled,
@@ -544,11 +550,12 @@ def _build_edgar(ticker: str) -> EdgarSection:
 # 6. MiroFish Simulation
 # ---------------------------------------------------------------------------
 
-def _build_mirofish(ticker: str, df: pd.DataFrame, auth: Any) -> MiroFishSection:
+def _build_mirofish(ticker: str, df: pd.DataFrame, auth: Any, skill_dir: Path | None = None) -> MiroFishSection:
+    sd = _resolve_skill_dir(skill_dir)
     sec = MiroFishSection()
     try:
         from engine_analysis import MarketSimulation
-        sim = MarketSimulation(ticker=ticker, seed_df=df, auth=auth, skill_dir=SKILL_DIR)
+        sim = MarketSimulation(ticker=ticker, seed_df=df, auth=auth, skill_dir=sd)
         result = sim.run()
         sec.conviction_score = result.get("conviction_score", 0)
         sec.summary = result.get("summary", "")
@@ -810,6 +817,7 @@ def generate_full_report(
     skip_mirofish: bool = False,
     skip_edgar: bool = False,
     auth: Any = None,
+    skill_dir: Path | None = None,
 ) -> FullReport:
     """
     Generate a complete financial report for a ticker.
@@ -817,13 +825,14 @@ def generate_full_report(
     """
     from datetime import datetime, timezone
 
+    sd = _resolve_skill_dir(skill_dir)
     ticker = ticker.upper().strip()
     report = FullReport(ticker=ticker, generated_at=datetime.now(timezone.utc).isoformat())
 
     # Fetch price data (yfinance fallback built into market_data)
     try:
         from market_data import get_daily_history
-        df = get_daily_history(ticker, days=400, auth=auth, skill_dir=SKILL_DIR)
+        df = get_daily_history(ticker, days=400, auth=auth, skill_dir=sd)
     except Exception:
         try:
             import yfinance as yf
@@ -835,7 +844,7 @@ def generate_full_report(
             df = pd.DataFrame()
 
     LOG.info("Building technical analysis for %s ...", ticker)
-    report.technical = _build_technical(ticker, df, auth)
+    report.technical = _build_technical(ticker, df, auth, sd)
 
     LOG.info("Building DCF model for %s ...", ticker)
     report.dcf = _build_dcf(ticker)
@@ -848,11 +857,11 @@ def generate_full_report(
 
     if not skip_edgar:
         LOG.info("Fetching SEC EDGAR filings for %s ...", ticker)
-        report.edgar = _build_edgar(ticker)
+        report.edgar = _build_edgar(ticker, sd)
 
     if not skip_mirofish:
         LOG.info("Running MiroFish simulation for %s ...", ticker)
-        report.mirofish = _build_mirofish(ticker, df, auth)
+        report.mirofish = _build_mirofish(ticker, df, auth, sd)
 
     report.synthesis = _synthesize(report)
     return report
@@ -1147,18 +1156,19 @@ def send_report_to_discord(report: FullReport) -> bool:
     return True
 
 
-def quick_check(ticker: str, auth: Any = None) -> dict[str, Any]:
+def quick_check(ticker: str, auth: Any = None, skill_dir: Path | None = None) -> dict[str, Any]:
     """
     Fast 3-line verdict for a ticker. Returns a single Discord embed dict.
     No MiroFish, no EDGAR -- just technicals + DCF + comps + health in ~5 seconds.
     """
     from datetime import datetime, timezone
 
+    sd = _resolve_skill_dir(skill_dir)
     ticker = ticker.upper().strip()
 
     try:
         from market_data import get_daily_history
-        df = get_daily_history(ticker, days=400, auth=auth, skill_dir=SKILL_DIR)
+        df = get_daily_history(ticker, days=400, auth=auth, skill_dir=sd)
     except Exception:
         try:
             import yfinance as yf
@@ -1169,7 +1179,7 @@ def quick_check(ticker: str, auth: Any = None) -> dict[str, Any]:
         except Exception:
             df = pd.DataFrame()
 
-    tech = _build_technical(ticker, df, auth)
+    tech = _build_technical(ticker, df, auth, sd)
     dcf = _build_dcf(ticker)
     health = _build_health(ticker)
 

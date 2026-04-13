@@ -1,5 +1,6 @@
 # Secrets
 .env
+.cursor/mcp.json
 *.enc
 tokens_*.enc
 localhost.pem

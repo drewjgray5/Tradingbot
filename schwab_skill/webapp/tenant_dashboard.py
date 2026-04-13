@@ -11,6 +11,7 @@ import os
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -18,15 +19,17 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session as OrmSession
 
 from execution import get_account_status, get_position_size_usd, place_order
+from full_report import REPORT_SECTION_MAP, generate_full_report, quick_check, report_to_json
 from market_data import extract_schwab_last_price, get_current_quote, get_current_quote_with_status
 from schwab_auth import DualSchwabAuth
+from sec_filing_compare import compare_ticker_over_time, compare_ticker_vs_ticker
 from sector_strength import get_sector_heatmap
 from signal_scanner import scan_for_signals_detailed
 
 from .audit import log_audit
 from .billing_stripe import user_has_paid_entitlement
 from .checklist_language import with_plain_language
-from .models import AppState, PendingTrade, User, UserCredential
+from .models import AppState, BacktestRun, Order, PendingTrade, ScanResult, User, UserCredential
 from .oauth_schwab import (
     SCHWAB_OAUTH_KIND_ACCOUNT,
     SCHWAB_OAUTH_KIND_MARKET,
@@ -236,6 +239,71 @@ def _request_id(request: Request) -> str | None:
     return getattr(request.state, "request_id", None)
 
 
+def _build_report_verdicts(report: dict[str, Any]) -> dict[str, Any]:
+    technical = report.get("technical") or {}
+    dcf = report.get("dcf") or {}
+    health = report.get("health") or {}
+    miro = report.get("mirofish") or {}
+    signal_score = float(technical.get("signal_score", 0) or 0)
+    mos = float(dcf.get("margin_of_safety", 0) or 0)
+    health_flags = health.get("flags") or []
+    conviction = float(miro.get("conviction_score", 0) or 0)
+
+    def bucket(score: float, high: float, low: float) -> str:
+        if score >= high:
+            return "bullish"
+        if score <= low:
+            return "bearish"
+        return "neutral"
+
+    return {
+        "technical": {
+            "verdict": bucket(signal_score, 65.0, 45.0),
+            "takeaway": "Trend setup aligned."
+            if technical.get("stage_2") and technical.get("vcp")
+            else "Setup quality is mixed.",
+        },
+        "dcf": {
+            "verdict": bucket(mos, 10.0, -10.0),
+            "takeaway": "Valuation supports upside." if mos >= 0 else "Valuation indicates premium pricing.",
+        },
+        "health": {
+            "verdict": "bullish"
+            if len(health_flags) == 0
+            else ("bearish" if len(health_flags) >= 3 else "neutral"),
+            "takeaway": "Balance sheet and margins are stable."
+            if len(health_flags) == 0
+            else "Review flagged financial risks.",
+        },
+        "mirofish": {
+            "verdict": bucket(conviction, 30.0, -30.0),
+            "takeaway": (miro.get("summary") or "No sentiment synthesis available.")[:220],
+        },
+    }
+
+
+def _sec_analysis_settings_sd(skill_dir: Path) -> dict[str, Any]:
+    from config import (
+        get_edgar_user_agent,
+        get_sec_filing_analysis_enabled,
+        get_sec_filing_cache_hours,
+        get_sec_filing_compare_enabled,
+        get_sec_filing_llm_summary_enabled,
+        get_sec_filing_max_chars,
+        get_sec_filing_max_compare_items,
+    )
+
+    return {
+        "analysis_enabled": bool(get_sec_filing_analysis_enabled(skill_dir)),
+        "compare_enabled": bool(get_sec_filing_compare_enabled(skill_dir)),
+        "user_agent": get_edgar_user_agent(skill_dir),
+        "cache_hours": float(get_sec_filing_cache_hours(skill_dir)),
+        "max_chars": int(get_sec_filing_max_chars(skill_dir)),
+        "max_compare_items": int(get_sec_filing_max_compare_items(skill_dir)),
+        "llm_enabled": bool(get_sec_filing_llm_summary_enabled(skill_dir)),
+    }
+
+
 @router.get("/api/status", response_model=ApiResponse)
 def tenant_status(user: User = Depends(get_current_user), db: OrmSession = Depends(_db)) -> ApiResponse:
     try:
@@ -269,7 +337,7 @@ def tenant_status(user: User = Depends(get_current_user), db: OrmSession = Depen
             }
         )
     except Exception as exc:
-        return _err("status", str(exc))
+        return _err(str(exc))
 
 
 @router.get("/api/health/deep", response_model=ApiResponse)
@@ -306,7 +374,7 @@ def tenant_health_deep(user: User = Depends(get_current_user), db: OrmSession = 
             }
         )
     except Exception as exc:
-        return _err("health_deep", str(exc))
+        return _err(str(exc))
 
 
 @router.get("/api/recovery/map", response_model=ApiResponse)
@@ -325,7 +393,7 @@ def tenant_portfolio(user: User = Depends(get_current_user), db: OrmSession = De
             return _err(status_data)
         return _ok(_build_portfolio_summary(status_data))
     except Exception as exc:
-        return _err("portfolio", str(exc))
+        return _err(str(exc))
 
 
 @router.get("/api/sectors", response_model=ApiResponse)
@@ -337,7 +405,7 @@ def tenant_sectors(user: User = Depends(get_current_user), db: OrmSession = Depe
             heatmap = get_sector_heatmap(auth=DualSchwabAuth(skill_dir=skill_dir), skill_dir=skill_dir)
         return _ok(heatmap)
     except Exception as exc:
-        return _err("sectors", str(exc))
+        return _err(str(exc))
 
 
 @router.get("/api/pending-trades", response_model=ApiResponse)
@@ -399,7 +467,7 @@ def tenant_create_pending(
         db.refresh(row)
         return _ok(_trade_to_dict(row))
     except Exception as exc:
-        return _err("create_pending_trade", str(exc))
+        return _err(str(exc))
 
 
 @router.post("/api/pending-trades/clear-pending", response_model=ApiResponse)
@@ -434,6 +502,333 @@ def tenant_calibration_summary(
         )
     data = parse_json(row.value_json, {})
     return _ok(data if isinstance(data, dict) else {"raw": data})
+
+
+@router.get("/api/scan/status", response_model=ApiResponse)
+def tenant_scan_status(user: User = Depends(get_current_user), db: OrmSession = Depends(_db)) -> ApiResponse:
+    """SaaS has no in-process scan worker; expose last_scan so the dashboard refresh path matches local shape."""
+    last_scan = _load_state(
+        db,
+        user.id,
+        "last_scan",
+        default={
+            "at": None,
+            "signals_found": None,
+            "job_id": None,
+            "diagnostics": None,
+            "diagnostics_summary": None,
+            "strategy_summary": None,
+        },
+    )
+    return _ok({"status": "idle", "last_scan": last_scan})
+
+
+@router.get("/api/decision-card/{ticker}", response_model=ApiResponse)
+def tenant_decision_card(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(_db),
+) -> ApiResponse:
+    symbol = ticker.upper().strip()
+    row = (
+        db.query(ScanResult)
+        .filter(ScanResult.user_id == user.id, ScanResult.ticker == symbol)
+        .order_by(ScanResult.created_at.desc())
+        .first()
+    )
+    if not row:
+        return ApiResponse(ok=False, error=f"{symbol} is not in recent scan results. Run scan first.")
+    signal = parse_json(row.payload_json, {})
+    if not isinstance(signal, dict) or not signal:
+        return ApiResponse(ok=False, error=f"{symbol} scan payload is unavailable.")
+
+    price = float(signal.get("price", 0) or 0)
+    with tenant_skill_dir(db, user.id) as skill_dir:
+        size_usd = get_position_size_usd(ticker=symbol, price=price if price > 0 else None, skill_dir=skill_dir)
+
+    qty = max(1, int(size_usd / price)) if price > 0 else 1
+    stop_pct = max(0.03, min(0.15, 0.07))
+    stop_level = round(price * (1.0 - stop_pct), 2) if price > 0 else None
+    entry_zone = (
+        {"low": round(price * 0.995, 2), "high": round(price * 1.005, 2)}
+        if price > 0
+        else {"low": None, "high": None}
+    )
+    confidence_bucket = str(((signal.get("advisory") or {}).get("confidence_bucket") or "unknown")).lower()
+    score = float(signal.get("signal_score", 0) or 0)
+    conviction = signal.get("mirofish_conviction")
+    reasons = [
+        f"signal_score={score:.1f}",
+        f"confidence={confidence_bucket}",
+        f"strategy={((signal.get('strategy_attribution') or {}).get('top_live') or 'unknown')}",
+    ]
+    if conviction is not None:
+        reasons.append(f"mirofish_conviction={conviction}")
+    ev = signal.get("event_risk")
+    if isinstance(ev, dict) and ev.get("flagged"):
+        rlist = ev.get("reasons") or []
+        reasons.append(f"event_risk={','.join(str(x) for x in rlist)}")
+
+    mock_trade = PendingTrade(
+        id="preview",
+        user_id=user.id,
+        ticker=symbol,
+        qty=qty,
+        price=price,
+        status="pending",
+        signal_json=json.dumps(signal),
+        note=None,
+    )
+    checklist = _saas_pretrade_checklist(mock_trade, signal)
+
+    return _ok(
+        {
+            "ticker": symbol,
+            "entry_zone": entry_zone,
+            "stop_invalidation": stop_level,
+            "size": {"qty": qty, "usd": size_usd},
+            "confidence": {
+                "bucket": confidence_bucket,
+                "signal_score": score,
+                "mirofish_conviction": conviction,
+            },
+            "key_reasons": reasons[:6],
+            "block_reason": (checklist.get("block_reasons") or [None])[0],
+            "checklist": checklist,
+        }
+    )
+
+
+@router.get("/api/check/{ticker}", response_model=ApiResponse)
+def tenant_check_ticker(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(_db),
+) -> ApiResponse:
+    if not user_has_account_session(db, user.id):
+        return _err("Link Schwab account before running a quick check.")
+    try:
+        with tenant_skill_dir(db, user.id) as skill_dir:
+            auth = DualSchwabAuth(skill_dir=skill_dir)
+            data = quick_check(ticker.upper().strip(), auth=auth, skill_dir=skill_dir)
+        return _ok(data)
+    except Exception as exc:
+        return _err(str(exc))
+
+
+@router.get("/api/report/{ticker}", response_model=ApiResponse)
+def tenant_report_ticker(
+    ticker: str,
+    section: str | None = None,
+    skip_mirofish: bool = False,
+    skip_edgar: bool = False,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(_db),
+) -> ApiResponse:
+    if not user_has_account_session(db, user.id):
+        return _err("Link Schwab account before loading a full report.")
+    try:
+        with tenant_skill_dir(db, user.id) as skill_dir:
+            auth = DualSchwabAuth(skill_dir=skill_dir)
+            section_key = None
+            if section:
+                section_key = REPORT_SECTION_MAP.get(section.lower().strip())
+                if not section_key:
+                    return ApiResponse(
+                        ok=False,
+                        error=(
+                            f"Invalid section '{section}'. Use: tech, dcf, comps, health, edgar, mirofish."
+                        ),
+                    )
+            report = generate_full_report(
+                ticker.upper().strip(),
+                skip_mirofish=skip_mirofish,
+                skip_edgar=skip_edgar,
+                auth=auth,
+                skill_dir=skill_dir,
+            )
+            data = json.loads(report_to_json(report))
+            section_verdicts = _build_report_verdicts(data)
+            if section_key:
+                section_data = data.get(section_key)
+                return _ok(
+                    {
+                        "ticker": data.get("ticker"),
+                        "generated_at": data.get("generated_at"),
+                        "section": section_key,
+                        "data": section_data,
+                        "section_verdicts": section_verdicts,
+                        "section_quick_verdict": section_verdicts.get(section_key, {}),
+                    }
+                )
+            data["section_verdicts"] = section_verdicts
+            return _ok(data)
+    except Exception as exc:
+        return _err(str(exc))
+
+
+@router.get("/api/sec/compare", response_model=ApiResponse)
+def tenant_sec_compare(
+    mode: str = "ticker_vs_ticker",
+    ticker: str = "",
+    ticker_b: str = "",
+    form_type: str = "10-K",
+    highlight_changes_only: bool = False,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(_db),
+) -> ApiResponse:
+    if not user_has_account_session(db, user.id):
+        return _err("Link Schwab account before SEC compare.")
+    try:
+        with tenant_skill_dir(db, user.id) as skill_dir:
+            cfg = _sec_analysis_settings_sd(skill_dir)
+            if not cfg["analysis_enabled"]:
+                return ApiResponse(ok=False, error="SEC filing analysis is disabled by configuration.")
+            if not cfg["compare_enabled"]:
+                return ApiResponse(ok=False, error="SEC filing compare is disabled by configuration.")
+            safe_mode = mode.strip().lower()
+            safe_form = form_type.upper().strip()
+            safe_ticker = ticker.upper().strip()
+            safe_ticker_b = ticker_b.upper().strip()
+            if cfg["max_compare_items"] < 2:
+                return ApiResponse(ok=False, error="SEC compare limit is below required minimum.")
+
+            if safe_mode == "ticker_vs_ticker":
+                if not safe_ticker or not safe_ticker_b:
+                    return ApiResponse(ok=False, error="ticker and ticker_b are required for ticker_vs_ticker mode.")
+                out = compare_ticker_vs_ticker(
+                    safe_ticker,
+                    safe_ticker_b,
+                    form_type=safe_form,
+                    user_agent=cfg["user_agent"],
+                    skill_dir=skill_dir,
+                    cache_hours=cfg["cache_hours"],
+                    max_chars=cfg["max_chars"],
+                    enable_llm=cfg["llm_enabled"],
+                    highlight_changes_only=bool(highlight_changes_only),
+                )
+            elif safe_mode == "ticker_over_time":
+                if not safe_ticker:
+                    return ApiResponse(ok=False, error="ticker is required for ticker_over_time mode.")
+                out = compare_ticker_over_time(
+                    safe_ticker,
+                    form_type=safe_form,
+                    user_agent=cfg["user_agent"],
+                    skill_dir=skill_dir,
+                    cache_hours=cfg["cache_hours"],
+                    max_chars=cfg["max_chars"],
+                    enable_llm=cfg["llm_enabled"],
+                    highlight_changes_only=bool(highlight_changes_only),
+                )
+            else:
+                return ApiResponse(ok=False, error="Invalid mode. Use ticker_vs_ticker or ticker_over_time.")
+
+            if not out.get("ok"):
+                return ApiResponse(ok=False, error=str(out.get("error", "SEC compare failed")))
+            compare_data = out.get("compare")
+            if isinstance(compare_data, dict):
+                similarities = compare_data.get("similarities") or []
+                differences = compare_data.get("differences") or []
+                investor_takeaway = str(compare_data.get("investor_takeaway") or "").strip()
+                compare_data.setdefault(
+                    "summary_headline",
+                    "SEC compare completed with meaningful differences."
+                    if differences
+                    else "SEC compare completed with broad alignment.",
+                )
+                compare_data.setdefault(
+                    "narrative_summary",
+                    (
+                        f"{investor_takeaway} "
+                        f"Shared signal: {(similarities[0] if similarities else 'limited overlap noted.')} "
+                        f"Key difference: {(differences[0] if differences else 'no major contrast highlighted.')}."
+                    ).strip(),
+                )
+                compare_data.setdefault("top_differences", differences[:3])
+                compare_data.setdefault("top_commonalities", similarities[:3])
+            return _ok(out)
+    except Exception as exc:
+        return _err(str(exc))
+
+
+@router.get("/api/performance", response_model=ApiResponse)
+def tenant_performance(user: User = Depends(get_current_user), db: OrmSession = Depends(_db)) -> ApiResponse:
+    latest_bt = (
+        db.query(BacktestRun)
+        .filter(BacktestRun.user_id == user.id)
+        .order_by(BacktestRun.created_at.desc())
+        .first()
+    )
+    bt_payload: dict[str, Any] = {
+        "source": "saas_backtest_runs",
+        "run_at": None,
+        "total_trades": None,
+        "win_rate": None,
+        "avg_return_pct": None,
+        "max_drawdown_pct": None,
+    }
+    if latest_bt and latest_bt.result_json:
+        parsed = parse_json(latest_bt.result_json, {})
+        if isinstance(parsed, dict):
+            bt_payload["run_at"] = latest_bt.created_at.isoformat() if latest_bt.created_at else None
+            bt_payload["total_trades"] = parsed.get("total_trades")
+            bt_payload["win_rate"] = parsed.get("win_rate_net")
+            bt_payload["avg_return_pct"] = parsed.get("avg_return_net_pct")
+            bt_payload["max_drawdown_pct"] = parsed.get("max_drawdown_net_pct")
+
+    ord_rows = (
+        db.query(Order)
+        .filter(Order.user_id == user.id, Order.status == "executed")
+        .order_by(Order.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    live_n = (
+        db.query(Order)
+        .filter(Order.user_id == user.id, Order.status == "executed")
+        .count()
+    )
+    latest_outcomes: list[dict[str, Any]] = []
+    for o in ord_rows[:5]:
+        res = parse_json(o.result_json, {})
+        if not isinstance(res, dict):
+            res = {}
+        latest_outcomes.append(
+            {
+                "ticker": o.ticker,
+                "side": o.side,
+                "qty": o.qty,
+                "fill_price": res.get("fill_price") or res.get("average_price") or o.price,
+                "date": o.created_at.isoformat() if o.created_at else None,
+                "mirofish_conviction": res.get("mirofish_conviction"),
+                "sector_etf": res.get("sector_etf") or "—",
+            }
+        )
+
+    return _ok(
+        {
+            "backtest": bt_payload,
+            "shadow_paper": {
+                "source": "saas_aggregate",
+                "shadow_actions": 0,
+                "notes": "Per-tenant shadow counters are not stored in the hosted API; live rows below reflect executed orders.",
+            },
+            "live": {
+                "source": "saas_orders",
+                "live_actions": live_n,
+                "recorded_outcomes": live_n,
+                "latest_outcomes": latest_outcomes,
+            },
+            "validation": {
+                "status": {"exists": False, "run_status": "idle", "source": "saas"},
+                "artifacts_present": False,
+            },
+            "separation_guard": {
+                "commingled_metric_allowed": False,
+                "message": "Backtest, shadow/paper, and live are reported as separate buckets only.",
+            },
+        }
+    )
 
 
 @router.post("/api/trades/{trade_id}/approve", response_model=ApiResponse)

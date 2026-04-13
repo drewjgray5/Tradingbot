@@ -275,8 +275,6 @@ function normalizeUserJwt(raw) {
 }
 
 async function getApiAccessToken() {
-  const cookieSession = await ensureCookieAuthSession();
-  if (cookieSession) return "";
   const manual = normalizeUserJwt(document.getElementById("jwtInput")?.value ?? "");
   if (manual) {
     if (!AuthJwt.isProbablyAccessJwt(manual)) {
@@ -285,13 +283,16 @@ async function getApiAccessToken() {
     }
     return manual;
   }
+  const stored = readStoredApiJwt();
+  if (stored) return stored;
   if (state.config?.auth_mode === "supabase" && supabaseClient) {
     const { data, error } = await supabaseClient.auth.getSession();
     if (error) console.warn("auth.getSession", error);
     const sessionToken = normalizeUserJwt(data?.session?.access_token ?? "");
     if (sessionToken && AuthJwt.isProbablyAccessJwt(sessionToken)) return sessionToken;
   }
-  return readStoredApiJwt();
+  if (await ensureCookieAuthSession()) return "";
+  return "";
 }
 
 function clearLegacyApiJwtKeys() {
@@ -389,10 +390,11 @@ let supabaseClient = null;
 const SUPABASE_ESM = "https://esm.sh/@supabase/supabase-js@2.49.1";
 
 function persistApiJwtFromSession(session) {
-  if (session?.access_token) {
-    localStorage.setItem(AUTH_TOKEN_KEY, session.access_token);
+  const at = normalizeUserJwt(session?.access_token ?? "");
+  if (at && AuthJwt.isProbablyAccessJwt(at)) {
+    localStorage.setItem(AUTH_TOKEN_KEY, at);
     clearLegacyApiJwtKeys();
-    void createCookieAuthSession(session.access_token);
+    void createCookieAuthSession(at);
     const inp = document.getElementById("jwtInput");
     if (inp) inp.value = "";
   }
@@ -540,6 +542,7 @@ const api = {
     try {
       const res = await fetch(path, {
         ...fetchOptions,
+        credentials: fetchOptions.credentials ?? "same-origin",
         headers,
         signal: controller.signal,
       });
@@ -1902,11 +1905,14 @@ async function loadConfig() {
   const authSetup = publicCfg?.auth_setup && typeof publicCfg.auth_setup === "object" ? publicCfg.auth_setup : {};
   const saasHost = Boolean(publicCfg?.saas_mode);
   const originHint = window.location.origin || "";
-  if (saasHost && authSetup.jwt_secret_configured === false) {
+  const jwtReady =
+    authSetup.jwt_verification_ready === true ||
+    (authSetup.jwt_verification_ready === undefined && authSetup.jwt_secret_configured === true);
+  if (saasHost && !jwtReady) {
     updateActionCenter({
-      title: "Server missing JWT secret",
+      title: "Server cannot verify Supabase tokens",
       message:
-        "This host cannot validate logins: SUPABASE_JWT_SECRET is not set (or is empty) on the server. In Render → your web service → Environment, add the JWT Secret from Supabase → Project Settings → API, then redeploy.",
+        "Set SUPABASE_URL (for ES256/RS256 JWKS) and/or SUPABASE_JWT_SECRET (for legacy HS256) from Supabase → Project Settings → API on your host (e.g. Render → Environment), then redeploy.",
       severity: "error",
     });
   } else if (saasHost && authSetup.supabase_sign_in_available === false) {

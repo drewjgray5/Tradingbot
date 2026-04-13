@@ -160,14 +160,28 @@ def _db() -> Session:
 
 
 def _auth_cookie_secure() -> bool:
-    """Default to secure cookies outside local dev."""
+    """Use Secure cookies on HTTPS / PaaS; allow plain HTTP for local dev."""
     raw = (os.getenv("AUTH_SESSION_COOKIE_SECURE") or "").strip().lower()
     if raw in ("1", "true", "yes", "on"):
         return True
     if raw in ("0", "false", "no", "off"):
         return False
     env = (os.getenv("ENV") or os.getenv("APP_ENV") or "").strip().lower()
-    return env not in ("", "dev", "development", "local")
+    if env in ("dev", "development", "local"):
+        return False
+    if env in ("production", "prod", "staging"):
+        return True
+    # Render often omits ENV; without Secure, browsers may drop the session cookie on https://.
+    if (os.getenv("RENDER") or "").strip():
+        return True
+    public_base = (
+        (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
+        or (os.getenv("WEB_PUBLIC_ORIGIN") or "").strip()
+        or (os.getenv("SAAS_FRONTEND_URL") or "").strip()
+    ).lower()
+    if public_base.startswith("https://"):
+        return True
+    return False
 
 
 def _set_auth_session_cookie(response: Response, token: str) -> None:
@@ -322,6 +336,7 @@ def public_config() -> ApiResponse:
         "on",
     )
     jwt_secret_ok = bool((os.getenv("SUPABASE_JWT_SECRET") or "").strip())
+    jwks_ready = bool(url)  # ES256/RS256 access tokens verify via SUPABASE_URL + JWKS
     data: dict[str, Any] = {
         "supabase": supabase,
         "schwab_oauth": schwab_oauth,
@@ -332,6 +347,9 @@ def public_config() -> ApiResponse:
         "auth_setup": {
             "supabase_sign_in_available": bool(url and anon),
             "jwt_secret_configured": jwt_secret_ok,
+            "supabase_jwks_ready": jwks_ready,
+            # True if server can verify at least one Supabase access-token style (HS256 via secret or asymmetric via JWKS).
+            "jwt_verification_ready": jwt_secret_ok or jwks_ready,
         },
     }
     impl = (os.getenv("WEB_IMPLEMENTATION_GUIDE_URL") or "").strip()
