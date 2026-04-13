@@ -95,8 +95,8 @@ def _get_db() -> Session:
 
 
 def get_current_user(
+    request: Request,
     authorization: str | None = Header(default=None),
-    request: Request | None = None,
     db: Session = Depends(_get_db),
 ) -> User:
     tokens: list[str] = []
@@ -104,10 +104,9 @@ def get_current_user(
         bearer = authorization.split(" ", 1)[1].strip()
         if bearer:
             tokens.append(bearer)
-    if request is not None:
-        cookie_token = (request.cookies.get(auth_session_cookie_name()) or "").strip()
-        if cookie_token:
-            tokens.append(cookie_token)
+    cookie_token = (request.cookies.get(auth_session_cookie_name()) or "").strip()
+    if cookie_token:
+        tokens.append(cookie_token)
     if not tokens:
         raise HTTPException(
             status_code=401,

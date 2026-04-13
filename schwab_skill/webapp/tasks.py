@@ -29,18 +29,29 @@ celery_app = Celery(
     backend=REDIS_URL,
 )
 
-celery_app.conf.update(
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    timezone="UTC",
-    task_routes={
+_celery_conf: dict[str, Any] = {
+    "task_serializer": "json",
+    "accept_content": ["json"],
+    "result_serializer": "json",
+    "timezone": "UTC",
+    "task_routes": {
         "webapp.scan_for_user": {"queue": "scan"},
         "webapp.execute_order_for_user": {"queue": "orders"},
         "webapp.backtest_for_user": {"queue": "scan"},
     },
-    task_default_queue="celery",
-)
+    "task_default_queue": "celery",
+}
+# Low-memory hosts (e.g. 512MB): set CELERY_WORKER_POOL=solo so one process loads pandas/scanner.
+_pool = (os.getenv("CELERY_WORKER_POOL") or "").strip().lower()
+if _pool:
+    _celery_conf["worker_pool"] = _pool
+_conc = (os.getenv("CELERY_WORKER_CONCURRENCY") or "").strip()
+if _conc:
+    try:
+        _celery_conf["worker_concurrency"] = max(1, int(_conc))
+    except ValueError:
+        pass
+celery_app.conf.update(**_celery_conf)
 
 
 def _json_default(value: Any) -> Any:

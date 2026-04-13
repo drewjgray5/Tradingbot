@@ -91,6 +91,8 @@ Workers **must** listen to `scan` and `orders`:
 celery -A webapp.tasks worker -Q scan,orders,celery --loglevel=info
 ```
 
+**Small instances (e.g. 512MB RAM):** Celery’s default **prefork** pool starts several child processes; each one imports pandas and the signal scanner and can exceed the limit alone. Set `CELERY_WORKER_POOL=solo` (one process, tasks run serially). Optionally lower `SCAN_STAGE_A_MAX_WORKERS` / `SCAN_STAGE_B_MAX_WORKERS` and use a small SQLAlchemy pool (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`). The Render blueprints in this repo set these for the worker service.
+
 ## Tunables
 
 | Env | Default | Meaning |
@@ -102,6 +104,8 @@ celery -A webapp.tasks worker -Q scan,orders,celery --loglevel=info
 | `SAAS_HEALTH_REQUIRE_REDIS` | `1` | If `0`, readiness skips Redis |
 | `WEB_ALLOWED_ORIGINS` | localhost | CORS allowlist (comma-separated) |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` / `DB_POOL_TIMEOUT` | `5` / `10` / `30` | Postgres pool (non-SQLite) |
+| `CELERY_WORKER_POOL` | (Celery default) | e.g. `solo` on low-RAM workers |
+| `CELERY_WORKER_CONCURRENCY` | (pool default) | Cap prefork/gevent concurrency when set |
 
 ## Docker
 
