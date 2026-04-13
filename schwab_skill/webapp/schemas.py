@@ -66,9 +66,15 @@ class ExecuteOrderRequest(BaseModel):
     idempotency_key: str | None = Field(default=None, max_length=128)
 
 
-class BillingCheckoutRequest(BaseModel):
+class BillingCheckoutPayload(BaseModel):
+    """Stripe Checkout URLs (optional; env fallbacks used when unset)."""
+
     success_url: HttpUrl | None = None
     cancel_url: HttpUrl | None = None
+
+
+# Backward-compatible name (avoid `*Request | None` annotations — FastAPI can misread them).
+BillingCheckoutRequest = BillingCheckoutPayload
 
 
 class QueueUserBacktestRequest(BaseModel):

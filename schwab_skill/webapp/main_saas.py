@@ -39,7 +39,7 @@ from .scan_payload import parse_scan_run_body
 from .prometheus_metrics import render_prometheus_text
 from .schemas import (
     ApiResponse,
-    BillingCheckoutRequest,
+    BillingCheckoutPayload,
     EnableLiveTradingRequest,
     QueueUserBacktestRequest,
     SchwabCredentialUpsert,
@@ -80,13 +80,7 @@ if os.getenv("SAAS_BOOTSTRAP_SCHEMA", "").lower() in ("1", "true", "yes"):
         from alembic import command
 
         command.stamp(Config(str(_ALEMBIC_INI)), "saas006")
-elif os.getenv("SAAS_RUN_ALEMBIC", "").lower() in ("1", "true", "yes"):
-    if _ALEMBIC_INI.is_file():
-        from alembic.config import Config
-
-        from alembic import command
-
-        command.upgrade(Config(str(_ALEMBIC_INI)), "head")
+# Production DB migrations: `docker-entrypoint-web.sh` when SAAS_RUN_ALEMBIC is set (not at import).
 elif DATABASE_URL.startswith("sqlite"):
     Base.metadata.create_all(bind=engine)
 
@@ -519,7 +513,7 @@ def billing_checkout_session(
     request: Request,
     user: User = Depends(get_current_user),
     db: Session = Depends(_db),
-    payload: BillingCheckoutRequest = Body(),
+    payload: BillingCheckoutPayload = Body(),
 ) -> ApiResponse:
     body = payload
     success = str(body.success_url) if body.success_url else (os.getenv("STRIPE_CHECKOUT_SUCCESS_URL") or "").strip()

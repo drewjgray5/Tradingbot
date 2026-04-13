@@ -11,10 +11,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+COPY docker-entrypoint-web.sh /usr/local/bin/docker-entrypoint-web.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint-web.sh
+
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-# Cloud hosts (Render, Railway, etc.) set PORT; local/docker-compose defaults to 8000.
-CMD ["sh", "-c", "uvicorn webapp.main_saas:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Migrations when SAAS_RUN_ALEMBIC is set (Render web service); workers override CMD with celery.
+CMD ["/usr/local/bin/docker-entrypoint-web.sh"]
 
 EXPOSE 8000
