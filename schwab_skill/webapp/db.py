@@ -72,14 +72,7 @@ def _normalize_database_url(url: str) -> str:
 
 def _validate_database_url(url: str) -> str:
     sanitized_url = _strip_invalid_host_brackets(url)
-    try:
-        parsed = urlparse(sanitized_url)
-    except ValueError as exc:
-        raise ValueError(
-            "Invalid DATABASE_URL: URL parsing failed. Check hostname formatting "
-            "(especially bracketed hosts) and provide a valid Postgres DSN."
-        ) from exc
-    scheme = (parsed.scheme or "").lower()
+    scheme = sanitized_url.split("://", 1)[0].strip().lower() if "://" in sanitized_url else ""
     if scheme.startswith("sqlite") or scheme.startswith("postgresql"):
         return sanitized_url
     if scheme in {"http", "https"}:
