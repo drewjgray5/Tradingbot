@@ -29,9 +29,12 @@ def _safe_float(v: Any) -> float | None:
 def _quote_epoch_ms(quote: dict[str, Any] | None) -> float | None:
     if not isinstance(quote, dict):
         return None
-    nested = quote.get("quote") if isinstance(quote.get("quote"), dict) else {}
-    regular = quote.get("regular") if isinstance(quote.get("regular"), dict) else {}
-    extended = quote.get("extended") if isinstance(quote.get("extended"), dict) else {}
+    _q = quote.get("quote")
+    nested: dict[str, Any] = _q if isinstance(_q, dict) else {}
+    _r = quote.get("regular")
+    regular: dict[str, Any] = _r if isinstance(_r, dict) else {}
+    _e = quote.get("extended")
+    extended: dict[str, Any] = _e if isinstance(_e, dict) else {}
     for layer in (quote, nested, regular, extended):
         for key in (
             "quoteTimeInLong",
@@ -192,7 +195,9 @@ def assess_symbol_data_health(
 
     quote_last = None
     if isinstance(quote, dict):
-        for layer in (quote, quote.get("quote") if isinstance(quote.get("quote"), dict) else {}):
+        _qi = quote.get("quote")
+        inner: dict[str, Any] = _qi if isinstance(_qi, dict) else {}
+        for layer in (quote, inner):
             for key in ("lastPrice", "mark", "regularMarketLastPrice", "closePrice"):
                 v = _safe_float(layer.get(key))
                 if v is not None and v > 0:

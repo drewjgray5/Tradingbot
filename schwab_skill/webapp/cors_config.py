@@ -30,8 +30,10 @@ def build_allowed_origins() -> list[str]:
     `WEB_ALLOWED_ORIGINS=` on Render does not collapse to localhost-only.
     """
     raw = os.getenv("WEB_ALLOWED_ORIGINS")
+    env = (os.getenv("ENV") or os.getenv("APP_ENV") or "").strip().lower()
+    production_like = env in ("prod", "production", "staging") or bool((os.getenv("RENDER") or "").strip())
     if raw is None or not raw.strip():
-        parts = _DEV_DEFAULT.split(",")
+        parts = [] if production_like else _DEV_DEFAULT.split(",")
     else:
         parts = raw.split(",")
     out: list[str] = []
@@ -48,4 +50,6 @@ def build_allowed_origins() -> list[str]:
             seen.add(origin)
             out.append(origin)
 
-    return out if out else ["http://127.0.0.1:8000"]
+    if out:
+        return out
+    return [] if production_like else ["http://127.0.0.1:8000"]

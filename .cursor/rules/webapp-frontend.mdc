@@ -1,0 +1,54 @@
+---
+description: Frontend patterns for TradingBot vanilla JS dashboard
+globs: schwab_skill/webapp/static/**/*.{js,html,css}
+alwaysApply: false
+---
+
+# Frontend Patterns
+
+## Architecture
+
+Two dashboards:
+- `app.js` + `index.html`: full-featured dashboard (scan, approve, portfolio, settings, SEC analysis)
+- `simple.js` + `simple.html`: lightweight scan + diagnostics UI for external/embed use
+
+## State Management
+
+Single top-level mutable object — no framework:
+```javascript
+const state = { latestSignals: [], approvingTradeId: null, ... };
+```
+
+## API Calls
+
+Use the shared `api` object (do NOT use raw `fetch`):
+```javascript
+const { ok, data, error } = await api.get("/api/endpoint");
+const result = await api.post("/api/action", { body: payload });
+```
+
+- `api.request()` handles: `AbortController` timeout (90s default), `Authorization: Bearer` from `getApiAccessToken()`, `X-API-Key` from localStorage when `publicConfig.api_key_required`, JSON parsing, error extraction
+- Auth: Supabase access token via `getApiAccessToken()`; cookie-based session as fallback
+
+## DOM Updates
+
+- `document.getElementById(id)` for element access
+- `el.innerHTML` for rich content, `el.textContent` for plain text
+- `el.classList.add/remove/toggle` for state-driven styling
+- `document.createElement` for dynamic list/table construction
+- Lazy loading: `IntersectionObserver` on `[data-lazy-api]` elements
+
+## Config
+
+Fetch `/api/public-config` at startup for client-side feature flags:
+```javascript
+const cfg = await api.get("/api/public-config");
+state.publicConfig = cfg.data;
+```
+
+## Conventions
+
+- No build step — vanilla ES6 modules
+- Template literals for HTML fragments
+- Error display via toast/banner pattern using `showError(msg)` or inline `.error` elements
+- Numeric formatting helpers: `fmtPct()`, `fmtUSD()`, `safeNum()`

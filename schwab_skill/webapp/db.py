@@ -37,8 +37,21 @@ def _strip_invalid_host_brackets(url: str) -> str:
     except Exception:
         return url
     return url
-
-
+def _reject_http_database_url(url: str) -> None:
+    """
+    SQLAlchemy treats the URL scheme as a dialect name. If DATABASE_URL is mistakenly set to
+    a Supabase REST URL (https://...supabase.co) or any https:// URL, you get:
+    NoSuchModuleError: Can't load plugin: sqlalchemy.dialects:https
+    """
+    u = (url or "").strip()
+    if u.startswith(("http://", "https://")):
+        raise RuntimeError(
+            "DATABASE_URL must be a SQLAlchemy database URI (e.g. postgresql+psycopg2://... or "
+            "sqlite:///...), not an HTTP(S) API URL. On Supabase use Settings, Database, "
+            "Connection string (URI) or the pooler URI; on Render use your Postgres service "
+            "Internal or External Database URL. SUPABASE_URL (https://...) belongs in SUPABASE_URL, "
+            "not DATABASE_URL."
+        )
 def _normalize_database_url(url: str) -> str:
     """Render/Heroku often use postgres://; SQLAlchemy 2 + psycopg2 expect postgresql+psycopg2://."""
     u = _strip_invalid_host_brackets(url.strip())
@@ -120,6 +133,7 @@ _raw_db_url = os.getenv("DATABASE_URL", f"sqlite:///{DEFAULT_SQLITE_PATH.as_posi
 DATABASE_URL = _validate_database_url(
     _maybe_require_ssl_for_render(_normalize_database_url(_raw_db_url))
 )
+_reject_http_database_url(DATABASE_URL)
 
 engine_kwargs: dict[str, object] = {}
 if DATABASE_URL.startswith("sqlite"):

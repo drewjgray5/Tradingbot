@@ -1,9 +1,12 @@
 {
   "plugins": {
-    "render": {
+    "slack": {
       "enabled": true
     },
-    "slack": {
+    "supabase": {
+      "enabled": true
+    },
+    "render": {
       "enabled": true
     }
   }

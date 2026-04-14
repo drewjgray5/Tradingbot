@@ -446,11 +446,65 @@ def run_scheduler() -> None:
             except Exception as e:
                 log.warning("Weekly digest failed: %s", e)
 
+    _last_evolve_minute: int | None = None
+
+    def _run_evolve_if_scheduled() -> None:
+        nonlocal _last_evolve_minute
+        now = datetime.now(TZ_NY)
+        key = now.day * 10000 + now.hour * 60 + now.minute
+        if now.weekday() == 4 and now.hour == 17 and now.minute == 0 and key != _last_evolve_minute:
+            _last_evolve_minute = key
+            try:
+                from evolve_logic import LearningEngine
+                engine = LearningEngine(skill_dir=SKILL_DIR)
+                result = engine.run(apply=False)
+                log.info("Evolve logic: status=%s, updates=%d",
+                         result.get("status"), result.get("updates_count", 0))
+                if result.get("status") == "ok" and result.get("updates_count", 0) > 0:
+                    send_alert(
+                        f"Learning Engine found {result['updates_count']} threshold adjustment(s). "
+                        "Review strategy_update.json and run challenger scan to validate.",
+                        kind="self_study",
+                        env_path=SKILL_DIR / ".env",
+                    )
+            except Exception as e:
+                log.warning("Evolve logic failed: %s", e)
+
+    _last_challenger_minute: int | None = None
+
+    def _run_challenger_if_scheduled() -> None:
+        nonlocal _last_challenger_minute
+        now = datetime.now(TZ_NY)
+        key = now.day * 10000 + now.hour * 60 + now.minute
+        if now.weekday() == 5 and now.hour == 10 and now.minute == 0 and key != _last_challenger_minute:
+            _last_challenger_minute = key
+            try:
+                from challenger_mode import ChallengerRunner
+                runner = ChallengerRunner(skill_dir=SKILL_DIR)
+                result = runner.run()
+                log.info("Challenger scan: status=%s", result.get("status"))
+                if result.get("status") == "ok":
+                    comp = result.get("comparison", {})
+                    send_alert(
+                        f"Challenger vs Champion: **{comp.get('verdict', '?')}** "
+                        f"(score delta: {comp.get('score_delta', 0):+.1f})\n"
+                        f"Champion: {comp.get('champion', {}).get('count', 0)} signals, "
+                        f"avg score {comp.get('champion', {}).get('avg_score', 0)}\n"
+                        f"Challenger: {comp.get('challenger', {}).get('count', 0)} signals, "
+                        f"avg score {comp.get('challenger', {}).get('avg_score', 0)}",
+                        kind="self_study",
+                        env_path=SKILL_DIR / ".env",
+                    )
+            except Exception as e:
+                log.warning("Challenger scan failed: %s", e)
+
     schedule.every().minute.do(_run_morning_brief_if_scheduled)
     schedule.every().minute.do(_run_signal_scan_if_scheduled)
     schedule.every().minute.do(_run_hold_reminder_if_scheduled)
     schedule.every().minute.do(_run_self_study_if_scheduled)
     schedule.every().minute.do(_run_weekly_digest_if_scheduled)
+    schedule.every().minute.do(_run_evolve_if_scheduled)
+    schedule.every().minute.do(_run_challenger_if_scheduled)
     build_morning_brief()
 
     try:

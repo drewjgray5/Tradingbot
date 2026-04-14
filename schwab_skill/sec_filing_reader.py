@@ -129,11 +129,16 @@ def _normalize_text(raw: str) -> str:
     txt = raw or ""
     txt = re.sub(r"(?is)<script.*?>.*?</script>", " ", txt)
     txt = re.sub(r"(?is)<style.*?>.*?</style>", " ", txt)
-    txt = re.sub(r"(?is)<table.*?>.*?</table>", " ", txt)
+    # Preserve table semantics so numeric disclosures remain available downstream.
+    txt = re.sub(r"(?is)<\s*/\s*tr\s*>", "\n", txt)
+    txt = re.sub(r"(?is)<\s*/\s*(td|th)\s*>", " | ", txt)
+    txt = re.sub(r"(?is)<\s*br\s*/?\s*>", "\n", txt)
+    txt = re.sub(r"(?is)<\s*/\s*(p|div|li|ul|ol|h[1-6])\s*>", "\n", txt)
     txt = re.sub(r"(?s)<[^>]+>", " ", txt)
     txt = unescape(txt)
     txt = txt.replace("\r", "\n")
     txt = re.sub(r"[ \t]+", " ", txt)
+    txt = re.sub(r"(?:\s*\|\s*){2,}", " | ", txt)
     txt = re.sub(r"\n{3,}", "\n\n", txt)
     txt = re.sub(r"[^\S\n]{2,}", " ", txt)
     return txt.strip()
@@ -144,7 +149,30 @@ def _clip_text(text: str, max_chars: int) -> str:
         return ""
     if len(text) <= max_chars:
         return text
-    return text[:max_chars]
+    # Keep diverse context (opening, midpoint, and latest sections) rather than
+    # returning only the start of very long filings.
+    marker = "\n\n...[TRUNCATED FOR LENGTH]...\n\n"
+    marker_budget = len(marker) * 2
+    budget = max_chars - marker_budget
+    if budget <= 60:
+        return text[:max_chars]
+    head_budget = int(budget * 0.42)
+    mid_budget = int(budget * 0.24)
+    tail_budget = budget - head_budget - mid_budget
+    if tail_budget < 20:
+        tail_budget = 20
+        head_budget = max(20, budget - mid_budget - tail_budget)
+    if mid_budget < 20:
+        mid_budget = 20
+        head_budget = max(20, budget - tail_budget - mid_budget)
+    mid_budget = budget - head_budget - tail_budget
+    mid_start = max(0, (len(text) - mid_budget) // 2)
+    mid_end = min(len(text), mid_start + mid_budget)
+    head = text[:head_budget]
+    mid = text[mid_start:mid_end]
+    tail = text[-tail_budget:] if tail_budget > 0 else ""
+    clipped = f"{head}{marker}{mid}{marker}{tail}"
+    return clipped[:max_chars]
 
 
 def resolve_cik_for_ticker(ticker: str, *, user_agent: str) -> str:
@@ -228,7 +256,7 @@ def read_filing_document(
     key = _cache_key(cik, accession, primary_document)
     cached = (cache.get("filings") or {}).get(key)
     if _is_fresh(cached, cache_hours):
-        payload = cached.get("payload") or {}
+        payload = (cached or {}).get("payload") or {}
         return FilingDocument(
             ticker=ticker,
             cik=cik,

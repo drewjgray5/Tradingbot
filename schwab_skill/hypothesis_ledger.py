@@ -86,7 +86,8 @@ def record_from_signal(
     price = signal.get("price")
     sma50 = signal.get("sma_50")
     sma200 = signal.get("sma_200")
-    advisory = signal.get("advisory") if isinstance(signal.get("advisory"), dict) else {}
+    _adv = signal.get("advisory")
+    advisory: dict[str, Any] = _adv if isinstance(_adv, dict) else {}
     model_id = strategy_or_model_id
     if not model_id:
         try:

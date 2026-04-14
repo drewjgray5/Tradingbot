@@ -498,6 +498,20 @@ def _compute_stage_a_shortlist_limit(
     return max(1, min(total_candidates, widened))
 
 
+def _scan_primary_provider_mode() -> str:
+    """
+    Controls whether fallback-provider candidates are filtered during scan.
+
+    Values:
+    - allow (default): keep fallback rows, annotate diagnostics.
+    - hard: require primary provider for Stage A shortlist.
+    """
+    import os
+
+    raw = (os.getenv("SCAN_PRIMARY_PROVIDER_MODE") or "allow").strip().lower()
+    return raw if raw in {"allow", "hard"} else "allow"
+
+
 def _scan_stage_a_one(
     ticker: str,
     auth: Any,
@@ -505,8 +519,13 @@ def _scan_stage_a_one(
     skill_dir: Path,
     breakout_enabled: bool,
     breakout_min_time: int,
+    vcp_gate_mode: str,
+    sector_gate_mode: str,
+    vcp_penalty_points: float,
+    sector_penalty_points: float,
+    sector_unresolved_penalty_points: float,
 ) -> dict[str, Any]:
-    from market_data import extract_schwab_last_price, get_current_quote, get_daily_history
+    from market_data import extract_schwab_last_price, get_current_quote, get_daily_history_with_meta
     from sector_strength import get_ticker_sector_etf
     from stage_analysis import (
         add_indicators,
@@ -516,22 +535,57 @@ def _scan_stage_a_one(
     )
 
     try:
-        df = get_daily_history(ticker, days=300, auth=auth, skill_dir=skill_dir)
+        df, history_meta = get_daily_history_with_meta(ticker, days=300, auth=auth, skill_dir=skill_dir)
+        provider = str(history_meta.get("provider") or "unknown")
+        used_fallback = bool(history_meta.get("used_fallback"))
         if df.empty:
-            return {"ok": False, "reason": "df_empty"}
+            return {
+                "ok": False,
+                "reason": "df_empty",
+                "provider": provider,
+                "used_fallback": used_fallback,
+            }
         if len(df) < 50:
-            return {"ok": False, "reason": "too_few_candles"}
+            return {
+                "ok": False,
+                "reason": "too_few_candles",
+                "provider": provider,
+                "used_fallback": used_fallback,
+            }
         df = add_indicators(df)
         if not is_stage_2(df, skill_dir):
-            return {"ok": False, "reason": "stage2_fail"}
-        if not check_vcp_volume(df, skill_dir):
-            return {"ok": False, "reason": "vcp_fail"}
+            return {
+                "ok": False,
+                "reason": "stage2_fail",
+                "provider": provider,
+                "used_fallback": used_fallback,
+            }
+        vcp_ok = bool(check_vcp_volume(df, skill_dir))
+        if not vcp_ok and vcp_gate_mode == "hard":
+            return {
+                "ok": False,
+                "reason": "vcp_fail",
+                "provider": provider,
+                "used_fallback": used_fallback,
+            }
 
         sector_etf = get_ticker_sector_etf(ticker, skill_dir=skill_dir)
-        if sector_etf is None:
-            return {"ok": False, "reason": "no_sector_etf"}
-        if sector_etf not in winning_etfs:
-            return {"ok": False, "reason": "sector_not_winning"}
+        sector_unresolved = sector_etf is None
+        sector_winning = sector_etf in winning_etfs if sector_etf is not None else False
+        if sector_unresolved and sector_gate_mode == "hard":
+            return {
+                "ok": False,
+                "reason": "no_sector_etf",
+                "provider": provider,
+                "used_fallback": used_fallback,
+            }
+        if (not sector_unresolved and not sector_winning) and sector_gate_mode == "hard":
+            return {
+                "ok": False,
+                "reason": "sector_not_winning",
+                "provider": provider,
+                "used_fallback": used_fallback,
+            }
 
         quote = get_current_quote(ticker, auth=auth, skill_dir=skill_dir)
         price = float(df["close"].iloc[-1])
@@ -553,10 +607,26 @@ def _scan_stage_a_one(
             now_et = datetime.now(ZoneInfo("America/New_York"))
             current_minutes = now_et.hour * 60 + now_et.minute
             if current_minutes >= breakout_min_time and price < prior_high:
-                return {"ok": False, "reason": "breakout_not_confirmed"}
+                return {
+                    "ok": False,
+                    "reason": "breakout_not_confirmed",
+                    "provider": provider,
+                    "used_fallback": used_fallback,
+                }
 
-        components = compute_signal_components(df)
+        components = compute_signal_components(df, skill_dir=skill_dir)
         stage_a_score = float(components.get("score", 0) or 0)
+        stage_a_penalties: list[str] = []
+        if not vcp_ok:
+            stage_a_score -= float(vcp_penalty_points)
+            stage_a_penalties.append("vcp_fail")
+        if sector_unresolved:
+            stage_a_score -= float(sector_unresolved_penalty_points)
+            stage_a_penalties.append("no_sector_etf")
+        elif not sector_winning:
+            stage_a_score -= float(sector_penalty_points)
+            stage_a_penalties.append("sector_not_winning")
+        stage_a_score = max(0.0, stage_a_score)
         candidate = {
             "ticker": ticker,
             "df": df,
@@ -569,6 +639,11 @@ def _scan_stage_a_one(
             "sma_200": round(float(df["sma_200"].iloc[-1]), 2),
             "stage_a_score": stage_a_score,
             "score_components_stage_a": components,
+            "stage_a_penalties": stage_a_penalties,
+            "data_provider": provider,
+            "data_provider_primary": provider == "schwab",
+            "used_fallback_data": used_fallback,
+            "fallback_reason": history_meta.get("fallback_reason"),
         }
         return {"ok": True, "candidate": candidate}
     except Exception as e:
@@ -679,8 +754,9 @@ def _scan_stage_b_enrich(
             df,
             mirofish_conviction=mirofish_result.get("conviction_score") if mirofish_result else None,
             mirofish_result=mirofish_result,
+            skill_dir=skill_dir,
         )
-        score = float(components["score"])
+        score = float(components["score"] or 0.0)
         latest_volume = candidate.get("latest_volume")
         avg_vol_50 = candidate.get("avg_vol_50")
         sec_risk_tag = "unknown"
@@ -856,6 +932,10 @@ def _scan_stage_b_enrich(
             "guidance_signal": guidance_signal,
             "guidance_score_delta": guidance_score_delta,
             "breakout_confirmed": bool(candidate.get("breakout_confirmed")),
+            "data_provider": candidate.get("data_provider"),
+            "data_provider_primary": bool(candidate.get("data_provider_primary")),
+            "used_fallback_data": bool(candidate.get("used_fallback_data")),
+            "fallback_reason": candidate.get("fallback_reason"),
         }
         try:
             from strategy_plugins import build_default_strategy_plugins
@@ -873,9 +953,10 @@ def _scan_stage_b_enrich(
 
             advisory = score_signal_advisory(signal_row, skill_dir=skill_dir)
             if advisory is not None:
-                signal_row["advisory"] = advisory.to_dict()
+                adv_dict = advisory.to_dict()
+                signal_row["advisory"] = adv_dict
                 diag_delta["advisory_scored"] += 1
-                bucket = str(signal_row["advisory"].get("confidence_bucket", "low")).lower()
+                bucket = str(adv_dict.get("confidence_bucket", "low")).lower()
                 if bucket == "high":
                     diag_delta["advisory_high_confidence"] += 1
                 elif bucket == "medium":
@@ -967,6 +1048,9 @@ def scan_for_signals_detailed(
         "stage_a_candidates": 0,
         "stage_a_shortlisted": 0,
         "stage_a_pruned": 0,
+        "stage_a_vcp_would_filter": 0,
+        "stage_a_sector_would_filter": 0,
+        "stage_a_no_sector_would_filter": 0,
         "stage_a_timeouts": 0,
         "stage_b_processed": 0,
         "stage_b_exceptions": 0,
@@ -982,7 +1066,15 @@ def scan_for_signals_detailed(
         "data_quality": None,
         "data_quality_reasons": [],
         "session_data_health": None,
+        "data_provider_primary_count": 0,
+        "data_provider_fallback_count": 0,
+        "data_provider_unknown_count": 0,
+        "primary_provider_filtered": 0,
     }
+
+    import uuid as _uuid_mod
+    _scan_id = _uuid_mod.uuid4().hex[:12]
+    diagnostics["scan_id"] = _scan_id
 
     try:
         from schwab_auth import DualSchwabAuth
@@ -1111,11 +1203,16 @@ def scan_for_signals_detailed(
         get_pead_score_penalty,
         get_regime_v2_entry_min_score,
         get_regime_v2_mode,
+        get_scan_sector_gate_mode,
+        get_scan_sector_penalty_points,
+        get_scan_sector_unresolved_penalty_points,
         get_scan_stage_a_max_workers,
         get_scan_stage_a_shortlist_cap,
         get_scan_stage_a_shortlist_multiplier,
         get_scan_stage_b_max_workers,
         get_scan_stage_task_timeout_sec,
+        get_scan_vcp_gate_mode,
+        get_scan_vcp_penalty_points,
         get_sec_cache_hours,
         get_sec_enrichment_enabled,
         get_sec_filing_cache_hours,
@@ -1166,10 +1263,17 @@ def scan_for_signals_detailed(
     shortlist_multiplier = get_scan_stage_a_shortlist_multiplier(skill_dir)
     shortlist_cap = get_scan_stage_a_shortlist_cap(skill_dir)
     task_timeout_sec = max(5.0, float(get_scan_stage_task_timeout_sec(skill_dir)))
+    vcp_gate_mode = get_scan_vcp_gate_mode(skill_dir)
+    sector_gate_mode = get_scan_sector_gate_mode(skill_dir)
+    vcp_penalty_points = float(get_scan_vcp_penalty_points(skill_dir))
+    sector_penalty_points = float(get_scan_sector_penalty_points(skill_dir))
+    sector_unresolved_penalty_points = float(get_scan_sector_unresolved_penalty_points(skill_dir))
     breakout_enabled = get_breakout_confirm_enabled(skill_dir)
     breakout_min_time = get_breakout_confirm_min_time(skill_dir)
     regime_v2_mode = get_regime_v2_mode(skill_dir)
     regime_v2_entry_min_score = get_regime_v2_entry_min_score(skill_dir)
+    diagnostics["scan_vcp_gate_mode"] = vcp_gate_mode
+    diagnostics["scan_sector_gate_mode"] = sector_gate_mode
 
     # Optional composite regime diagnostics/gate.
     regime_v2_snapshot: dict[str, Any] | None = None
@@ -1219,6 +1323,11 @@ def scan_for_signals_detailed(
                 skill_dir,
                 breakout_enabled,
                 breakout_min_time,
+                vcp_gate_mode,
+                sector_gate_mode,
+                vcp_penalty_points,
+                sector_penalty_points,
+                sector_unresolved_penalty_points,
             )
             future_map_a[fut] = ticker
         try:
@@ -1229,14 +1338,52 @@ def scan_for_signals_detailed(
                 ticker = future_map_a[fut]
                 try:
                     out = fut.result()
+                    provider = str(out.get("provider") or (out.get("candidate") or {}).get("data_provider") or "unknown")
+                    if provider == "schwab":
+                        diagnostics["data_provider_primary_count"] = int(
+                            diagnostics.get("data_provider_primary_count", 0) or 0
+                        ) + 1
+                    elif provider == "yfinance":
+                        diagnostics["data_provider_fallback_count"] = int(
+                            diagnostics.get("data_provider_fallback_count", 0) or 0
+                        ) + 1
+                    else:
+                        diagnostics["data_provider_unknown_count"] = int(
+                            diagnostics.get("data_provider_unknown_count", 0) or 0
+                        ) + 1
                     if out.get("ok"):
-                        stage_a_candidates.append(out["candidate"])
-                        continue
-                    reason = str(out.get("reason") or "exceptions")
-                    if reason in stage_a_reason_keys:
-                        diagnostics[reason] = int(diagnostics.get(reason, 0) or 0) + 1
-                    if out.get("error"):
-                        data_failures.append(str(out["error"]))
+                        candidate = out["candidate"]
+                        stage_a_candidates.append(candidate)
+                        for penalty in list(candidate.get("stage_a_penalties") or []):
+                            if penalty == "vcp_fail":
+                                diagnostics["stage_a_vcp_would_filter"] = int(
+                                    diagnostics.get("stage_a_vcp_would_filter", 0) or 0
+                                ) + 1
+                            elif penalty == "sector_not_winning":
+                                diagnostics["stage_a_sector_would_filter"] = int(
+                                    diagnostics.get("stage_a_sector_would_filter", 0) or 0
+                                ) + 1
+                            elif penalty == "no_sector_etf":
+                                diagnostics["stage_a_no_sector_would_filter"] = int(
+                                    diagnostics.get("stage_a_no_sector_would_filter", 0) or 0
+                                ) + 1
+                    else:
+                        reason = str(out.get("reason") or "exceptions")
+                        if reason in stage_a_reason_keys:
+                            diagnostics[reason] = int(diagnostics.get(reason, 0) or 0) + 1
+                        if out.get("error"):
+                            data_failures.append(str(out["error"]))
+                    try:
+                        from feature_store import log_stage_a_result
+                        log_stage_a_result(
+                            scan_id=_scan_id,
+                            ticker=ticker,
+                            result=out,
+                            regime_bucket=diagnostics.get("regime_v2_bucket"),
+                            skill_dir=skill_dir,
+                        )
+                    except Exception:
+                        pass
                 except Exception as e:
                     diagnostics["exceptions"] += 1
                     data_failures.append(f"{ticker}: {e}")
@@ -1250,6 +1397,12 @@ def scan_for_signals_detailed(
 
     diagnostics["stage_a_candidates"] = len(stage_a_candidates)
     stage_a_candidates.sort(key=lambda c: c.get("stage_a_score", 0), reverse=True)
+    provider_mode = _scan_primary_provider_mode()
+    diagnostics["scan_primary_provider_mode"] = provider_mode
+    if provider_mode == "hard":
+        before_primary_filter = len(stage_a_candidates)
+        stage_a_candidates = [c for c in stage_a_candidates if bool(c.get("data_provider_primary"))]
+        diagnostics["primary_provider_filtered"] = max(0, before_primary_filter - len(stage_a_candidates))
     shortlist_limit = _compute_stage_a_shortlist_limit(
         total_candidates=len(stage_a_candidates),
         top_n=top_n,
@@ -1371,6 +1524,15 @@ def scan_for_signals_detailed(
             for r in reasons:
                 key = f"quality_reason_{r}"
                 diagnostics[key] = int(diagnostics.get(key, 0) or 0) + 1
+                # Preserve legacy counter names consumed by older digests and scripts.
+                if r == "weak_breakout_volume":
+                    diagnostics["low_breakout_volume"] = int(diagnostics.get("low_breakout_volume", 0) or 0) + 1
+                elif r == "forensic_sloan_high":
+                    diagnostics["forensic_sloan_flags"] = int(diagnostics.get("forensic_sloan_flags", 0) or 0) + 1
+                elif r == "forensic_beneish_manipulator":
+                    diagnostics["forensic_beneish_flags"] = int(diagnostics.get("forensic_beneish_flags", 0) or 0) + 1
+                elif r == "forensic_altman_distress":
+                    diagnostics["forensic_altman_flags"] = int(diagnostics.get("forensic_altman_flags", 0) or 0) + 1
             has_forensic_reason = any(
                 r in {"forensic_sloan_high", "forensic_beneish_manipulator", "forensic_altman_distress"}
                 for r in reasons
@@ -1379,6 +1541,16 @@ def scan_for_signals_detailed(
                 diagnostics["quality_gates_filtered"] += 1
                 if has_forensic_reason:
                     diagnostics["forensic_filtered"] += 1
+                try:
+                    from feature_store import log_stage_b_signal
+                    log_stage_b_signal(
+                        scan_id=_scan_id, signal=s,
+                        quality_reasons=reasons, quality_filtered=True,
+                        regime_bucket=diagnostics.get("regime_v2_bucket"),
+                        skill_dir=skill_dir,
+                    )
+                except Exception:
+                    pass
                 continue
             diagnostics["quality_gates_would_filter"] += 1
             gated.append(s)
@@ -1419,6 +1591,18 @@ def scan_for_signals_detailed(
                 "bucket": regime_v2_snapshot.get("bucket"),
                 "mode": regime_v2_mode,
             }
+
+    try:
+        from feature_store import log_stage_b_signal
+        for s in signals:
+            log_stage_b_signal(
+                scan_id=_scan_id, signal=s,
+                quality_reasons=None, quality_filtered=False,
+                regime_bucket=diagnostics.get("regime_v2_bucket"),
+                skill_dir=skill_dir,
+            )
+    except Exception:
+        pass
 
     try:
         _record_quality_snapshot(skill_dir, diagnostics, signals)

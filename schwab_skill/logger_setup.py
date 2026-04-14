@@ -13,6 +13,8 @@ from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from webapp.redaction import redact_sensitive_text
+
 LOG_FILE = "trading_bot.log"
 MAX_BYTES = 5 * 1024 * 1024  # 5MB
 BACKUP_COUNT = 3
@@ -29,6 +31,24 @@ class RequestIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         rid = request_id_var.get()
         record.request_id = rid if rid else "-"
+        return True
+
+
+class RedactionFilter(logging.Filter):
+    """Mask token-like payloads before they hit any sink."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = redact_sensitive_text(str(record.msg))
+            if record.args:
+                if isinstance(record.args, dict):
+                    record.args = {k: redact_sensitive_text(str(v)) for k, v in record.args.items()}
+                elif isinstance(record.args, tuple):
+                    record.args = tuple(redact_sensitive_text(str(v)) for v in record.args)
+                else:
+                    record.args = (redact_sensitive_text(str(record.args)),)
+        except Exception:
+            return True
         return True
 
 
@@ -52,12 +72,14 @@ def setup_logging(
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     req_filt = RequestIdFilter()
+    redact_filt = RedactionFilter()
 
     # Console
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(level)
     ch.setFormatter(fmt)
     ch.addFilter(req_filt)
+    ch.addFilter(redact_filt)
     root.addHandler(ch)
 
     # Rotating file (5MB)
@@ -70,6 +92,7 @@ def setup_logging(
     fh.setLevel(level)
     fh.setFormatter(fmt)
     fh.addFilter(req_filt)
+    fh.addFilter(redact_filt)
     root.addHandler(fh)
 
     return root

@@ -3,7 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="TradingBot Dashboard — scan, approve, and manage your automated trading pipeline." />
+    <meta name="theme-color" content="#07080d" />
     <title>TradingBot Dashboard</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect rx='20' width='100' height='100' fill='%230c0e14'/><path d='M20 65 L35 45 L50 55 L65 30 L80 40' stroke='%2338bdf8' stroke-width='6' fill='none' stroke-linecap='round' stroke-linejoin='round'/><circle cx='80' cy='40' r='5' fill='%23818cf8'/></svg>" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -11,6 +14,7 @@
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/static/styles.css" />
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
   </head>
   <body>
     <a class="skip-link" href="#mainContent">Skip to main content</a>
@@ -40,6 +44,19 @@
           <div class="hero-actions">
             <button id="refreshBtn" class="btn secondary">Refresh All</button>
             <button id="scanBtn" class="btn primary">Run Scan</button>
+            <button id="notifBellBtn" class="btn icon-btn" type="button" aria-label="Notifications" data-tooltip="Notifications">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+              <span id="notifBadge" class="notif-badge hidden">0</span>
+            </button>
+          </div>
+          <div id="notifPanel" class="notif-panel hidden">
+            <div class="notif-panel-header">
+              <strong>Notifications</strong>
+              <button id="notifClearBtn" class="btn small secondary" type="button">Clear all</button>
+            </div>
+            <ul id="notifList" class="notif-list">
+              <li class="muted">No notifications yet.</li>
+            </ul>
           </div>
           <div class="hero-toolbar" role="group" aria-label="Dashboard layout">
             <label class="field-label" for="displayModeSelect">View</label>
@@ -299,12 +316,22 @@
             >
               ×
             </button>
+            <button
+              type="button"
+              id="deleteAllTradesBtn"
+              class="btn-clear-pending"
+              title="Permanently delete all trades from history"
+              aria-label="Delete all trades"
+              style="font-size: 0.7rem; width: auto; padding: 0 8px;"
+            >
+              Delete All
+            </button>
           </div>
           <div class="inline-form compact">
             <label class="muted">Status
               <select id="pendingFilter">
                 <option value="all">All</option>
-                <option value="pending">Pending</option>
+                <option value="pending" selected>Pending</option>
                 <option value="executed">Executed</option>
                 <option value="rejected">Rejected</option>
                 <option value="failed">Failed</option>
@@ -350,7 +377,15 @@
             <input id="tickerInput" placeholder="AAPL" />
             <button id="checkBtn" class="btn secondary">Check</button>
           </div>
-          <pre id="checkOutput" class="code-block">No check run yet.</pre>
+          <div id="tickerChartContainer" class="ticker-chart-container hidden"></div>
+          <div id="checkOutputHost" class="tool-output-host tool-output-padded">
+            <p id="checkPlaceholder" class="muted tool-output-placeholder">Enter a ticker and click Check.</p>
+            <div id="checkSummary" class="tool-summary-card hidden" aria-live="polite"></div>
+            <details id="checkJsonDetails" class="tool-json-details hidden">
+              <summary>Raw data</summary>
+              <pre id="checkOutput" class="code-block"></pre>
+            </details>
+          </div>
         </article>
 
         <section id="toolsSection" class="card tools-hub section-advanced" aria-labelledby="toolsHeading">
@@ -433,7 +468,15 @@
             <button id="onboardingScanBtn" class="btn small secondary">3) Test scan</button>
             <button id="onboardingPaperBtn" class="btn small secondary">4) Test paper order</button>
           </div>
-          <pre id="onboardingOutput" class="code-block">Wizard not started.</pre>
+          <div id="onboardingOutputHost" class="tool-output-host tool-output-padded">
+            <div id="onboardingCards" aria-live="polite">
+              <p class="muted">Run the wizard or click individual steps above.</p>
+            </div>
+            <details id="onboardingJsonDetails" class="tool-json-details hidden">
+              <summary>Raw data</summary>
+              <pre id="onboardingOutput" class="code-block"></pre>
+            </details>
+          </div>
         </article>
         <article id="settingsSection" class="card settings-advanced-only section-advanced" data-lazy-api="profiles">
           <div class="section-title">
@@ -477,6 +520,9 @@
                 Pause new live orders for this account (approvals blocked until you uncheck and save)
               </label>
               <button id="saveTradingHaltBtn" type="button" class="btn secondary small">Save pause setting</button>
+            </div>
+            <div id="twoFaPanel" style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid rgba(127, 127, 127, 0.25)">
+              <p class="muted small">2FA controls loading...</p>
             </div>
           </div>
           <div id="profilePanel" class="preset-panel" aria-live="polite">
@@ -603,6 +649,16 @@
               </tbody>
             </table>
           </div>
+
+          <details id="portfolioRiskPanel" class="panel-disclosure">
+            <summary class="panel-disclosure-summary">
+              Risk Analysis
+              <span class="disclosure-hint muted">sector allocation, concentration, day P/L</span>
+            </summary>
+            <div id="portfolioRiskContent" class="risk-panel-content">
+              <div class="muted">Click to load risk analytics...</div>
+            </div>
+          </details>
         </article>
 
         <article id="sectorsSection" class="card" data-lazy-api="sectors">
@@ -631,6 +687,27 @@
             <pre id="performanceRaw" class="code-block"></pre>
           </details>
         </article>
+
+        <article id="learningSection" class="card">
+          <div class="section-title">
+            <h2>Learning Engine</h2>
+            <small class="muted">Closed-loop analysis: features logged per scan, ML identifies what predicts failure, challenger tests suggested thresholds.</small>
+          </div>
+          <div class="inline-form">
+            <button id="evolveBtn" class="btn secondary" type="button">Run Post-Mortem Analysis</button>
+            <button id="challengerBtn" class="btn secondary" type="button">Run Challenger Scan</button>
+          </div>
+          <div id="learningPanel" class="performance-panel" aria-live="polite">
+            <div class="report-empty">No learning engine results yet. Click <em>Run Post-Mortem Analysis</em> to start.</div>
+          </div>
+          <div id="challengerPanel" class="performance-panel" aria-live="polite" style="margin-top:1rem;">
+          </div>
+          <details id="learningRawDetails" class="details-raw hidden">
+            <summary>Raw JSON</summary>
+            <pre id="learningRaw" class="code-block"></pre>
+          </details>
+        </article>
+
         <article id="backtestSection" class="card backtest-hub" data-lazy-api="backtest">
           <div class="section-title">
             <h2>Run a historical backtest</h2>
@@ -925,7 +1002,12 @@
         <h3>Decision Quick View</h3>
         <button id="closeQuickViewBtn" class="btn small secondary" type="button">Close</button>
       </div>
-      <pre id="quickViewOutput" class="code-block">Select Quick View on a task card to preview decision details.</pre>
+      <div id="quickViewSummary" class="tool-summary-card hidden" aria-live="polite"></div>
+      <details id="quickViewJsonDetails" class="tool-json-details hidden">
+        <summary>Raw data</summary>
+        <pre id="quickViewOutput" class="code-block"></pre>
+      </details>
+      <p id="quickViewPlaceholder" class="muted tool-output-placeholder">Select Quick View on a task card to preview decision details.</p>
     </aside>
 
     <section id="activityDrawer" class="activity-drawer">
@@ -943,6 +1025,8 @@
         <p id="approveSummary" class="muted"></p>
         <label class="field-label" for="approveTickerInput">Type the ticker to confirm this live order</label>
         <input id="approveTickerInput" type="text" autocomplete="off" placeholder="e.g. AAPL" />
+        <label class="field-label" for="approveOtpInput">2FA code (required for high-value approvals)</label>
+        <input id="approveOtpInput" type="text" inputmode="numeric" maxlength="8" autocomplete="one-time-code" placeholder="123456" />
         <p class="warn-text">
           This sends a live market order through Schwab. You alone decide whether the order is suitable; nothing here is
           personalized investment advice.
@@ -978,6 +1062,22 @@
         </div>
       </div>
     </dialog>
+
+    <button id="scrollTopBtn" class="scroll-top-btn" type="button" aria-label="Scroll to top" data-tooltip="Back to top">
+      <svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+    </button>
+    <div id="toastContainer" class="toast-container" aria-live="polite"></div>
+
+    <div id="cmdPaletteDialog" class="cmd-palette-overlay" role="dialog" aria-label="Command palette">
+      <div class="cmd-palette">
+        <div class="cmd-palette-header">
+          <svg class="cmd-palette-search-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+          <input id="cmdPaletteInput" type="text" class="cmd-palette-input" placeholder="Type a command or section name..." autocomplete="off" spellcheck="false" />
+          <kbd class="cmd-palette-esc">Esc</kbd>
+        </div>
+        <div id="cmdPaletteList" class="cmd-palette-list" role="listbox"></div>
+      </div>
+    </div>
 
     <script src="/static/auth-jwt-utils.js"></script>
     <script src="/static/app.js"></script>

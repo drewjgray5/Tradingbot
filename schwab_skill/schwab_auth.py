@@ -100,7 +100,17 @@ def exchange_code(client_id: str, client_secret: str, code: str, redirect_uri: s
         data={"grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri},
         timeout=60,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        detail = ""
+        try:
+            payload = resp.json()
+            detail = str(payload)
+        except Exception:
+            detail = (resp.text or "").strip()
+        raise RuntimeError(
+            "OAuth code exchange failed "
+            f"(status={resp.status_code}, redirect_uri={redirect_uri}, detail={detail[:300]})"
+        )
     return resp.json()
 
 
@@ -252,7 +262,8 @@ class DualSchwabAuth:
         self.skill_dir = Path(skill_dir or Path(__file__).resolve().parent)
         env = _load_env(self.skill_dir / ".env")
 
-        callback = env.get("SCHWAB_CALLBACK_URL", "https://127.0.0.1").strip()
+        account_callback = env.get("SCHWAB_CALLBACK_URL", "https://127.0.0.1").strip()
+        market_callback = env.get("SCHWAB_MARKET_CALLBACK_URL", account_callback).strip()
 
         market_key = env.get("SCHWAB_MARKET_APP_KEY", "")
         market_secret = env.get("SCHWAB_MARKET_APP_SECRET", "")
@@ -263,7 +274,7 @@ class DualSchwabAuth:
             session_name="market",
             client_id=market_key,
             client_secret=market_secret,
-            redirect_uri=callback,
+            redirect_uri=market_callback,
             token_path=self.skill_dir / "tokens_market.enc",
             skill_dir=self.skill_dir,
         )
@@ -271,7 +282,7 @@ class DualSchwabAuth:
             session_name="account",
             client_id=account_key,
             client_secret=account_secret,
-            redirect_uri=callback,
+            redirect_uri=account_callback,
             token_path=self.skill_dir / "tokens_account.enc",
             skill_dir=self.skill_dir,
         )

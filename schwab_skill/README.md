@@ -112,6 +112,23 @@ Production-oriented API: Supabase JWT auth, encrypted per-user Schwab tokens, Po
 uvicorn webapp.main_saas:app --host 0.0.0.0 --port 8000
 ```
 
+### Minimal production checklist (simple mode)
+
+Set these env vars before first deploy (API + worker where applicable):
+
+- `DATABASE_URL`, `REDIS_URL`
+- `CREDENTIAL_ENCRYPTION_KEY`
+- `OAUTH_STATE_SECRET`
+- `SUPABASE_JWT_SECRET`, `SUPABASE_JWT_AUDIENCE`, `SUPABASE_JWT_ISSUER`
+- `WEB_ALLOWED_ORIGINS`
+- `SCHWAB_MARKET_APP_KEY`, `SCHWAB_MARKET_APP_SECRET`
+- `SCHWAB_ACCOUNT_APP_KEY`, `SCHWAB_ACCOUNT_APP_SECRET`
+- `SCHWAB_CALLBACK_URL`, `SCHWAB_MARKET_CALLBACK_URL`
+
+Optional but recommended:
+
+- `WEB_INTERNAL_API_KEY` (protects `/metrics`; use request header `X-Internal-Key`)
+
 **Run workers** (same working directory, same env as API):
 
 ```
@@ -132,7 +149,7 @@ Empty Postgres: run once `python scripts/saas_bootstrap.py` or set `SAAS_BOOTSTR
 - **Browser OAuth:** Set `SCHWAB_CALLBACK_URL` (account app) and `SCHWAB_MARKET_CALLBACK_URL` (market app, e.g. `…/api/oauth/schwab/market/callback`). The hosted dashboard shows **Connect Schwab (account)** and **Connect Schwab (market)** in **Connect Schwab & setup**, with plain-language copy and a default **Schwab setup guide** at `/static/connect-schwab-guide.html` unless `WEB_IMPLEMENTATION_GUIDE_URL` is set (`docs/CONNECT_SCHWAB_END_USERS.md`).
 - **API upload:** Each user can POST `/api/credentials/schwab` with `account_oauth_json` and `market_oauth_json` (encrypted at rest), or legacy `access_token` / `refresh_token` (account only) plus **`SAAS_PLATFORM_MARKET_SKILL_DIR`** for a shared platform `tokens_market.enc` if you skip per-user market OAuth.
 
-**Health:** `GET /api/health/live`, `GET /api/health/ready` (DB + Redis; set `SAAS_HEALTH_REQUIRE_REDIS=0` to skip Redis in dev).
+**Health:** `GET /api/health/live`, `GET /api/health/ready` (`/ready` checks DB, Redis, and reachable Celery workers on `scan` + `orders`; set `SAAS_HEALTH_REQUIRE_REDIS=0` to skip Redis in dev).
 
 **Deploy:** see `docs/SAAS_DEPLOYMENT.md` and `docker-compose.saas.yml`.
 

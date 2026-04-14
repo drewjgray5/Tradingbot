@@ -1,0 +1,56 @@
+---
+description: Database schema and Supabase patterns for TradingBot
+globs: schwab_skill/webapp/{db,models,schemas,main_saas,tenant_dashboard}.py
+alwaysApply: false
+---
+
+# Database & Supabase Patterns
+
+## ORM Setup
+
+- SQLAlchemy 2.x with `declarative_base()`
+- Engine: SQLite locally, Postgres in SaaS (via `DATABASE_URL`)
+- Connection pool: `pool_size=5`, `max_overflow=10`, `pool_pre_ping=True` for Postgres
+- Render requires SSL: auto-appended `?sslmode=require` for `postgresql://` URLs
+
+## Key Tables
+
+- `users` — user accounts (SaaS)
+- `orders` — trade orders and execution records
+- `pending_trades` — trades awaiting approval
+- `scan_results` — stored scan outputs and diagnostics
+- `user_credentials` — encrypted Schwab OAuth tokens (SaaS, per-tenant)
+- `backtest_runs` — async backtest job results
+
+## Auth Patterns
+
+### Local Dashboard
+- `X-API-Key` header matched against `WEB_API_KEY` env var
+- `require_trade_api_key` — always requires key (trade mutations)
+- `require_api_key_if_set` — only enforces when `WEB_API_KEY` is configured
+
+### SaaS
+- Supabase JWT in `Authorization: Bearer <token>`
+- JWT validated using `SUPABASE_JWT_SECRET`
+- User ID extracted from JWT claims to scope all queries
+- `CREDENTIAL_ENCRYPTION_KEY` encrypts stored Schwab tokens at rest
+
+## Session Pattern
+
+```python
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+```
+
+Use `db: Session = Depends(get_db)` in route signatures.
+
+## Migrations
+
+- Alembic for schema migrations
+- Auto-upgrade on SQLite startup via `_run_alembic_upgrade_head_for_sqlite()`
+- SaaS: `SAAS_RUN_ALEMBIC=1` or manual `alembic upgrade head`
+- Bootstrap: `SAAS_BOOTSTRAP_SCHEMA=1` or `python scripts/saas_bootstrap.py`

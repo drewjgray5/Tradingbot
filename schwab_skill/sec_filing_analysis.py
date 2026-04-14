@@ -120,6 +120,117 @@ def _extract_guidance_signal(text: str) -> str:
     return "neutral"
 
 
+def _extract_evidence_snippets(
+    text: str,
+    *,
+    guidance_signal: str,
+    risk_terms: list[str],
+    max_items: int = 8,
+) -> list[dict[str, str]]:
+    if not text:
+        return []
+    sentences = re.split(r"(?<=[\.\!\?])\s+", text)
+    evidence: list[dict[str, str]] = []
+
+    guidance_terms = tuple(KEY_TERMS["guidance_up"] + KEY_TERMS["guidance_down"])
+    watch_terms = (
+        "liquidity",
+        "credit facility",
+        "revolver",
+        "cash and cash equivalents",
+        "long-term debt",
+        "interest expense",
+    )
+
+    def _append_if_match(sentence: str, claim: str, terms: tuple[str, ...], section_hint: str) -> None:
+        lowered = sentence.lower()
+        for term in terms:
+            if term in lowered:
+                evidence.append(
+                    {
+                        "claim": claim,
+                        "term": term,
+                        "quote": sentence[:240],
+                        "section_hint": section_hint,
+                    }
+                )
+                return
+
+    for sentence in sentences:
+        s = sentence.strip()
+        if len(s) < 55:
+            continue
+        _append_if_match(
+            s,
+            claim=f"Guidance signal appears {guidance_signal}",
+            terms=guidance_terms,
+            section_hint="outlook",
+        )
+        if risk_terms:
+            _append_if_match(
+                s,
+                claim="Risk language appears in current filing",
+                terms=tuple(risk_terms),
+                section_hint="risk_factors",
+            )
+        _append_if_match(
+            s,
+            claim="Balance sheet or funding language referenced",
+            terms=watch_terms,
+            section_hint="liquidity_and_capital",
+        )
+        if len(evidence) >= max_items:
+            break
+    return evidence[:max_items]
+
+
+def _derive_verdict(guidance_signal: str, risk_terms: list[str], evidence_count: int) -> str:
+    guidance = (guidance_signal or "neutral").lower()
+    risk_count = len(risk_terms)
+    if guidance == "positive" and risk_count <= 1 and evidence_count >= 2:
+        return "bullish"
+    if guidance == "negative" and risk_count >= 2:
+        return "bearish"
+    if risk_count >= 4:
+        return "bearish"
+    return "neutral"
+
+
+def _derive_why(
+    *,
+    guidance_signal: str,
+    risk_terms: list[str],
+    evidence_count: int,
+    coverage_ratio: float,
+) -> list[str]:
+    reasons: list[str] = []
+    reasons.append(f"Guidance language is {guidance_signal}.")
+    reasons.append(f"Detected {len(risk_terms)} notable risk terms.")
+    reasons.append(f"Extracted {evidence_count} supporting evidence snippets.")
+    if coverage_ratio < 0.15:
+        reasons.append("Coverage of analyzed text is limited; confidence is reduced.")
+    return reasons[:4]
+
+
+def _derive_limits(*, coverage_ratio: float, char_count: int, evidence_count: int) -> list[str]:
+    limits: list[str] = []
+    if coverage_ratio < 0.15:
+        limits.append("Low excerpt coverage ratio")
+    if char_count < 5000:
+        limits.append("Short normalized filing text")
+    if evidence_count == 0:
+        limits.append("No direct quote evidence captured")
+    return limits
+
+
+def _estimate_confidence(*, coverage_ratio: float, evidence_count: int, limits: list[str]) -> int:
+    score = 45.0
+    score += min(25.0, coverage_ratio * 100.0 * 0.25)
+    score += min(20.0, float(evidence_count) * 2.5)
+    score -= float(len(limits)) * 8.0
+    return int(max(5.0, min(95.0, score)))
+
+
 def _derive_takeaway(analysis: dict[str, Any]) -> str:
     risk_terms = analysis.get("risk_terms") or []
     guidance = analysis.get("guidance_signal", "neutral")
@@ -227,6 +338,29 @@ def analyze_filing_document(
 
     coverage_chars = sum(len(s) for s in theme_sentences[:max_theme_sentences])
     coverage_ratio = min(1.0, coverage_chars / max(1, char_count))
+    evidence = _extract_evidence_snippets(
+        text,
+        guidance_signal=guidance_signal,
+        risk_terms=risk_terms,
+        max_items=8,
+    )
+    limits = _derive_limits(
+        coverage_ratio=coverage_ratio,
+        char_count=char_count,
+        evidence_count=len(evidence),
+    )
+    verdict = _derive_verdict(guidance_signal, risk_terms, len(evidence))
+    why = _derive_why(
+        guidance_signal=guidance_signal,
+        risk_terms=risk_terms,
+        evidence_count=len(evidence),
+        coverage_ratio=coverage_ratio,
+    )
+    confidence = _estimate_confidence(
+        coverage_ratio=coverage_ratio,
+        evidence_count=len(evidence),
+        limits=limits,
+    )
 
     llm_summary = ""
     if enable_llm:
@@ -257,6 +391,11 @@ def analyze_filing_document(
         "from_cache": doc.from_cache,
         "coverage_ratio": round(float(coverage_ratio), 4),
         "char_count": char_count,
+        "verdict": verdict,
+        "confidence": confidence,
+        "why": why,
+        "evidence": evidence,
+        "limits": limits,
         "guidance_signal": guidance_signal,
         "risk_terms": risk_terms,
         "key_themes": theme_sentences[:max_theme_sentences],
@@ -272,5 +411,12 @@ def analyze_filing_document(
         "llm_summary": llm_summary,
     }
     analysis["high_level_takeaway"] = _derive_takeaway(analysis)
+    analysis["analyst_summary"] = " ".join(why[:2]).strip()
+    analysis["summary_headline"] = (
+        f"{doc.ticker} {doc.form} looks {verdict} with confidence {confidence}/100."
+    )
+    analysis["narrative_summary"] = (
+        f"{analysis['analyst_summary']} {analysis['high_level_takeaway']}".strip()
+    )
     return analysis
 

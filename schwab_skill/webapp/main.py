@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import queue
 import threading
 import time
 import uuid
@@ -15,26 +17,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
+from starlette.responses import StreamingResponse
 
 from execution import get_account_status, get_position_size_usd, place_order
-from full_report import REPORT_SECTION_MAP, generate_full_report, quick_check, report_to_json
 from market_data import extract_schwab_last_price, get_current_quote, get_current_quote_with_status
 from schwab_auth import DualSchwabAuth
-from sec_filing_compare import (
-    analyze_latest_filing_for_ticker,
-    compare_ticker_over_time,
-    compare_ticker_vs_ticker,
-)
 from sector_strength import get_sector_heatmap
 from signal_scanner import scan_for_signals_detailed
 
-from .calibration_snapshot import build_calibration_snapshot
 from .checklist_language import with_plain_language
 from .cors_config import build_allowed_origins
 from .db import DATABASE_URL, Base, SessionLocal, engine
 from .models import AppState, PendingTrade, User
 from .preset_catalog import PRESET_PROFILES, build_preset_catalog_payload
 from .recovery_map import map_failure as _map_failure
+from .routes.learning import router as learning_router
+from .routes.research import router as research_router
 from .scan_payload import parse_scan_run_body, scan_runtime_kwargs
 from .schemas import ApiResponse, ApproveTradeRequest, CreatePendingTrade
 
@@ -90,9 +88,28 @@ def _run_alembic_upgrade_head_for_sqlite() -> None:
     command.upgrade(Config(str(alembic_ini)), "head")
 
 
+def _validate_startup_configuration() -> None:
+    env = (os.getenv("ENV") or os.getenv("APP_ENV") or "").strip().lower()
+    production_like = env in ("prod", "production", "staging") or bool((os.getenv("RENDER") or "").strip())
+    if not production_like:
+        return
+    configured = (os.getenv("WEB_API_KEY") or "").strip()
+    if configured:
+        return
+    unsafe = (os.getenv("WEB_ALLOW_UNSAFE_LOCAL_WRITES") or "").strip().lower() in ("1", "true", "yes", "on")
+    if not unsafe:
+        raise RuntimeError("WEB_API_KEY is required in production-like environments.")
+
+
 Base.metadata.create_all(bind=engine)
+try:
+    from feature_store import ensure_table as _ensure_feature_store_table
+    _ensure_feature_store_table()
+except Exception:
+    pass
 _run_alembic_upgrade_head_for_sqlite()
 _ensure_local_dashboard_user()
+_validate_startup_configuration()
 
 app = FastAPI(
     title="TradingBot Web Dashboard API",
@@ -111,6 +128,9 @@ app.add_middleware(
 )
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+app.include_router(research_router)
+app.include_router(learning_router)
 
 _metrics_lock = threading.Lock()
 _request_metrics: dict[str, Any] = {
@@ -137,6 +157,23 @@ _scan_job: dict[str, Any] = {
     "signals": [],
     "error": None,
 }
+
+
+_sse_subscribers: list[queue.Queue] = []
+_sse_subscribers_lock = threading.Lock()
+
+
+def _sse_publish(event: str, data: dict[str, Any] | None = None) -> None:
+    payload = json.dumps({"event": event, **(data or {})}, default=_json_default)
+    with _sse_subscribers_lock:
+        dead: list[queue.Queue] = []
+        for q in _sse_subscribers:
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                dead.append(q)
+        for q in dead:
+            _sse_subscribers.remove(q)
 
 
 def _record_endpoint_error(endpoint: str) -> None:
@@ -183,6 +220,10 @@ async def metrics_middleware(request: Request, call_next):
     elapsed_ms = (time.perf_counter() - started) * 1000
     _record_request(request.url.path, request.method, response.status_code, elapsed_ms)
     LOG.info("%s %s -> %s (%.1f ms)", request.method, request.url.path, response.status_code, elapsed_ms)
+
+    if request.url.path.startswith("/api/"):
+        response.headers["X-Response-Time"] = f"{elapsed_ms:.1f}ms"
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
@@ -392,6 +433,48 @@ def _scan_snapshot() -> dict[str, Any]:
         }
 
 
+def _scan_lifecycle_payload(
+    snapshot: dict[str, Any],
+    last_scan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    status = str(snapshot.get("status") or "idle")
+    out: dict[str, Any] = {
+        "mode": "local",
+        "transport": "local_thread",
+        "job_id": snapshot.get("job_id"),
+        "task_id": None,
+        "status": status,
+        "phase": "idle",
+        "started_at": snapshot.get("started_at"),
+        "finished_at": snapshot.get("finished_at"),
+        "elapsed_seconds": snapshot.get("elapsed_seconds"),
+        "signals_found": snapshot.get("signals_found"),
+        "scan_id": None,
+        "worker_queue": None,
+    }
+    if status == "running":
+        out["phase"] = "running"
+    elif status == "completed":
+        out["phase"] = "completed"
+    elif status == "failed":
+        out["phase"] = "failed"
+    elif status == "idle":
+        out["phase"] = "idle"
+    if status in {"completed", "failed"}:
+        diag = snapshot.get("diagnostics") or {}
+        if isinstance(diag, dict):
+            out["scan_id"] = diag.get("scan_id")
+    if status == "idle" and isinstance(last_scan, dict):
+        out["last_scan"] = last_scan
+        out["signals_found"] = last_scan.get("signals_found")
+        diag = last_scan.get("diagnostics") or {}
+        if isinstance(diag, dict):
+            out["scan_id"] = diag.get("scan_id")
+    if status == "failed":
+        out["error"] = snapshot.get("error")
+    return out
+
+
 def _latest_validation_status() -> dict[str, Any]:
     status_file = VALIDATION_ARTIFACT_DIR / "continuous_validation_status.json"
     if status_file.exists():
@@ -496,7 +579,7 @@ def _diagnostics_summary(diag: dict[str, Any] | None, signals: list[dict[str, An
     if blocked_reason == "bear_regime_spy_below_200sma":
         blocked_human = "Scan blocked by regime gate: SPY is below 200 SMA."
 
-    ranked = []
+    ranked: list[dict[str, Any]] = []
     for key, raw in diagnostics.items():
         try:
             value = int(raw)
@@ -511,7 +594,7 @@ def _diagnostics_summary(diag: dict[str, Any] | None, signals: list[dict[str, An
                 "severity": "error" if key in {"exceptions", "df_empty"} else "warn",
             }
         )
-    ranked.sort(key=lambda x: int(x["value"]), reverse=True)
+    ranked.sort(key=lambda x: int(x.get("value") or 0), reverse=True)
     watchlist = int(diagnostics.get("watchlist_size", 0) or 0)
     stage2_fail = int(diagnostics.get("stage2_fail", 0) or 0)
     vcp_fail = int(diagnostics.get("vcp_fail", 0) or 0)
@@ -593,6 +676,7 @@ def _sec_analysis_settings() -> dict[str, Any]:
 
 def _scan_worker(job_id: str, scan_kwargs: dict[str, Any] | None = None) -> None:
     try:
+        _sse_publish("scan_started", {"job_id": job_id})
         skw = scan_kwargs or {}
         signals, diagnostics = scan_for_signals_detailed(skill_dir=SKILL_DIR, **skw)
         diagnostics_summary = _diagnostics_summary(diagnostics, signals)
@@ -626,6 +710,12 @@ def _scan_worker(job_id: str, scan_kwargs: dict[str, Any] | None = None) -> None
                         "error": None,
                     }
                 )
+        _sse_publish("scan_completed", {
+            "job_id": job_id,
+            "signals_found": len(signals),
+            "diagnostics_summary": diagnostics_summary,
+            "strategy_summary": strategy_summary,
+        })
     except Exception as e:
         with _scan_lock:
             if _scan_job.get("job_id") == job_id:
@@ -636,6 +726,7 @@ def _scan_worker(job_id: str, scan_kwargs: dict[str, Any] | None = None) -> None
                         "error": str(e),
                     }
                 )
+        _sse_publish("scan_failed", {"job_id": job_id, "error": str(e)})
         _record_endpoint_error("scan_worker")
 
 
@@ -702,15 +793,32 @@ def require_trade_api_key(
     x_api_key: str | None = Header(default=None),
     x_user: str | None = Header(default=None),
 ) -> dict[str, str]:
+    """Require a configured API key for trade-grade mutating operations."""
     configured = os.getenv("WEB_API_KEY", "").strip()
     if not configured:
+        unsafe = (os.getenv("WEB_ALLOW_UNSAFE_LOCAL_WRITES") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if unsafe:
+            return {"actor": (x_user or "unsafe-local-user").strip() or "unsafe-local-user"}
         raise HTTPException(
             status_code=503,
-            detail="WEB_API_KEY is not configured on the server.",
+            detail="WEB_API_KEY is required for write operations. Configure WEB_API_KEY on the server.",
         )
     if not x_api_key or x_api_key != configured:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key.")
     return {"actor": (x_user or "web-user").strip() or "web-user"}
+
+
+def require_api_key_if_set(
+    x_api_key: str | None = Header(default=None),
+    x_user: str | None = Header(default=None),
+) -> dict[str, str]:
+    """Backward-compatible wrapper that now enforces strict key checks."""
+    return require_trade_api_key(x_api_key=x_api_key, x_user=x_user)
 
 
 @app.get("/")
@@ -730,9 +838,54 @@ def login_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "login.html")
 
 
+_STARTUP_TIME = datetime.now(timezone.utc)
+
+
 @app.get("/api/health", response_model=ApiResponse)
 def health() -> ApiResponse:
-    return _ok({"status": "ok", "time": datetime.now(timezone.utc).isoformat()})
+    now = datetime.now(timezone.utc)
+    uptime_seconds = int((now - _STARTUP_TIME).total_seconds())
+    return _ok({
+        "status": "ok",
+        "time": now.isoformat(),
+        "uptime_seconds": uptime_seconds,
+        "version": app.version,
+    })
+
+
+@app.get("/api/events")
+async def sse_events(
+    _auth: dict[str, str] = Depends(require_api_key_if_set),
+) -> StreamingResponse:
+    """Server-Sent Events stream for real-time dashboard updates."""
+    q: queue.Queue = queue.Queue(maxsize=256)
+    with _sse_subscribers_lock:
+        _sse_subscribers.append(q)
+
+    async def stream():
+        try:
+            yield "event: connected\ndata: {}\n\n"
+            while True:
+                try:
+                    payload = q.get_nowait()
+                    yield f"data: {payload}\n\n"
+                except queue.Empty:
+                    await asyncio.sleep(1)
+                    yield ": heartbeat\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            with _sse_subscribers_lock:
+                try:
+                    _sse_subscribers.remove(q)
+                except ValueError:
+                    pass
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/public-config", response_model=ApiResponse)
@@ -752,8 +905,12 @@ def public_config() -> ApiResponse:
     data: dict[str, Any] = {
         "supabase": supabase,
         "saas_mode": False,
+        "scan_transport": "local_thread",
+        "sse_enabled": True,
         "schwab_oauth": False,
+        "manual_jwt_entry_enabled": True,
         "platform_live_trading_kill_switch": plat_kill,
+        "api_key_required": bool(os.getenv("WEB_API_KEY", "").strip()),
     }
     impl = (os.getenv("WEB_IMPLEMENTATION_GUIDE_URL") or "").strip()
     if impl.startswith(("http://", "https://")):
@@ -762,7 +919,10 @@ def public_config() -> ApiResponse:
 
 
 @app.get("/api/health/deep", response_model=ApiResponse)
-def health_deep(db: Session = Depends(get_db)) -> ApiResponse:
+def health_deep(
+    db: Session = Depends(get_db),
+    _auth: dict[str, str] = Depends(require_api_key_if_set),
+) -> ApiResponse:
     try:
         db_ok = bool(db.query(PendingTrade).limit(1).all() is not None)
         auth = DualSchwabAuth(skill_dir=SKILL_DIR)
@@ -808,7 +968,10 @@ def config() -> ApiResponse:
 
 
 @app.get("/api/status", response_model=ApiResponse)
-def status(db: Session = Depends(get_db)) -> ApiResponse:
+def status(
+    db: Session = Depends(get_db),
+    _auth: dict[str, str] = Depends(require_api_key_if_set),
+) -> ApiResponse:
     try:
         auth = DualSchwabAuth(skill_dir=SKILL_DIR)
         checked_at = datetime.now(timezone.utc).isoformat()
@@ -854,6 +1017,7 @@ def validation_status() -> ApiResponse:
 @app.post("/api/scan", response_model=ApiResponse)
 def scan(
     async_mode: bool = True,
+    _auth: dict[str, str] = Depends(require_api_key_if_set),
     db: Session = Depends(get_db),
     body: dict[str, Any] | None = Body(default=None),
 ) -> ApiResponse:
@@ -944,182 +1108,26 @@ def scan_status(db: Session = Depends(get_db)) -> ApiResponse:
     return _ok(snapshot)
 
 
-@app.get("/api/check/{ticker}", response_model=ApiResponse)
-def check_ticker(ticker: str) -> ApiResponse:
-    try:
-        data = quick_check(ticker.upper().strip())
-        return _ok(data)
-    except Exception as e:
-        return _err("check", e)
-
-
-@app.get("/api/report/{ticker}", response_model=ApiResponse)
-def report_ticker(
-    ticker: str,
-    section: str | None = None,
-    skip_mirofish: bool = False,
-    skip_edgar: bool = False,
-) -> ApiResponse:
-    try:
-        section_key = None
-        if section:
-            section_key = REPORT_SECTION_MAP.get(section.lower().strip())
-            if not section_key:
-                _record_endpoint_error("report")
-                return ApiResponse(ok=False, error=f"Invalid section '{section}'. Use: tech, dcf, comps, health, edgar, mirofish.")
-
-        report = generate_full_report(
-            ticker=ticker.upper().strip(),
-            skip_mirofish=skip_mirofish,
-            skip_edgar=skip_edgar,
+@app.get("/api/scan-lifecycle", response_model=ApiResponse)
+def scan_lifecycle(db: Session = Depends(get_db)) -> ApiResponse:
+    snapshot = _scan_snapshot()
+    last_scan = None
+    if snapshot.get("status") == "idle":
+        last_scan = _load_state(
+            db,
+            key="last_scan",
+            default={
+                "at": None,
+                "signals_found": None,
+                "signals": [],
+                "diagnostics": None,
+                "diagnostics_summary": None,
+                "strategy_summary": None,
+            },
         )
-        data = json.loads(report_to_json(report))
-        section_verdicts = _build_report_verdicts(data)
-        if section_key:
-            section_data = data.get(section_key)
-            return _ok(
-                {
-                    "ticker": data.get("ticker"),
-                    "generated_at": data.get("generated_at"),
-                    "section": section_key,
-                    "data": section_data,
-                    "section_verdicts": section_verdicts,
-                    "section_quick_verdict": section_verdicts.get(section_key, {}),
-                }
-            )
-        data["section_verdicts"] = section_verdicts
-        return _ok(data)
-    except Exception as e:
-        return _err("report", e)
+    return _ok(_scan_lifecycle_payload(snapshot, last_scan=last_scan))
 
 
-@app.get("/api/sec/analyze/{ticker}", response_model=ApiResponse)
-def sec_analyze_ticker(
-    ticker: str,
-    form_type: str = "10-K",
-) -> ApiResponse:
-    try:
-        cfg = _sec_analysis_settings()
-        if not cfg["analysis_enabled"]:
-            return ApiResponse(ok=False, error="SEC filing analysis is disabled by configuration.")
-        out = analyze_latest_filing_for_ticker(
-            ticker=ticker.upper().strip(),
-            form_type=form_type.upper().strip(),
-            user_agent=cfg["user_agent"],
-            skill_dir=SKILL_DIR,
-            cache_hours=cfg["cache_hours"],
-            max_chars=cfg["max_chars"],
-            enable_llm=cfg["llm_enabled"],
-        )
-        if not out.get("ok"):
-            _record_endpoint_error("sec_analyze")
-            return ApiResponse(ok=False, error=str(out.get("error", "SEC analysis failed")))
-        return _ok(out)
-    except Exception as e:
-        return _err("sec_analyze", e)
-
-
-@app.get("/sec/analyze/{ticker}", response_model=ApiResponse)
-def sec_analyze_ticker_alias(
-    ticker: str,
-    form_type: str = "10-K",
-) -> ApiResponse:
-    return sec_analyze_ticker(ticker=ticker, form_type=form_type)
-
-
-@app.get("/api/sec/compare", response_model=ApiResponse)
-def sec_compare(
-    mode: str = "ticker_vs_ticker",
-    ticker: str = "",
-    ticker_b: str = "",
-    form_type: str = "10-K",
-    highlight_changes_only: bool = False,
-) -> ApiResponse:
-    try:
-        cfg = _sec_analysis_settings()
-        if not cfg["analysis_enabled"]:
-            return ApiResponse(ok=False, error="SEC filing analysis is disabled by configuration.")
-        if not cfg["compare_enabled"]:
-            return ApiResponse(ok=False, error="SEC filing compare is disabled by configuration.")
-        safe_mode = mode.strip().lower()
-        safe_form = form_type.upper().strip()
-        safe_ticker = ticker.upper().strip()
-        safe_ticker_b = ticker_b.upper().strip()
-        if cfg["max_compare_items"] < 2:
-            return ApiResponse(ok=False, error="SEC compare limit is below required minimum.")
-
-        if safe_mode == "ticker_vs_ticker":
-            if not safe_ticker or not safe_ticker_b:
-                return ApiResponse(ok=False, error="ticker and ticker_b are required for ticker_vs_ticker mode.")
-            out = compare_ticker_vs_ticker(
-                safe_ticker,
-                safe_ticker_b,
-                form_type=safe_form,
-                user_agent=cfg["user_agent"],
-                skill_dir=SKILL_DIR,
-                cache_hours=cfg["cache_hours"],
-                max_chars=cfg["max_chars"],
-                enable_llm=cfg["llm_enabled"],
-                highlight_changes_only=bool(highlight_changes_only),
-            )
-        elif safe_mode == "ticker_over_time":
-            if not safe_ticker:
-                return ApiResponse(ok=False, error="ticker is required for ticker_over_time mode.")
-            out = compare_ticker_over_time(
-                safe_ticker,
-                form_type=safe_form,
-                user_agent=cfg["user_agent"],
-                skill_dir=SKILL_DIR,
-                cache_hours=cfg["cache_hours"],
-                max_chars=cfg["max_chars"],
-                enable_llm=cfg["llm_enabled"],
-                highlight_changes_only=bool(highlight_changes_only),
-            )
-        else:
-            return ApiResponse(ok=False, error="Invalid mode. Use ticker_vs_ticker or ticker_over_time.")
-
-        if not out.get("ok"):
-            _record_endpoint_error("sec_compare")
-            return ApiResponse(ok=False, error=str(out.get("error", "SEC compare failed")))
-        compare_data = out.get("compare")
-        if isinstance(compare_data, dict):
-            similarities = compare_data.get("similarities") or []
-            differences = compare_data.get("differences") or []
-            investor_takeaway = str(compare_data.get("investor_takeaway") or "").strip()
-            compare_data.setdefault(
-                "summary_headline",
-                "SEC compare completed with meaningful differences." if differences else "SEC compare completed with broad alignment.",
-            )
-            compare_data.setdefault(
-                "narrative_summary",
-                (
-                    f"{investor_takeaway} "
-                    f"Shared signal: {(similarities[0] if similarities else 'limited overlap noted.')}. "
-                    f"Key difference: {(differences[0] if differences else 'no major contrast highlighted.')}."
-                ).strip(),
-            )
-            compare_data.setdefault("top_differences", differences[:3])
-            compare_data.setdefault("top_commonalities", similarities[:3])
-        return _ok(out)
-    except Exception as e:
-        return _err("sec_compare", e)
-
-
-@app.get("/sec/compare", response_model=ApiResponse)
-def sec_compare_alias(
-    mode: str = "ticker_vs_ticker",
-    ticker: str = "",
-    ticker_b: str = "",
-    form_type: str = "10-K",
-    highlight_changes_only: bool = False,
-) -> ApiResponse:
-    return sec_compare(
-        mode=mode,
-        ticker=ticker,
-        ticker_b=ticker_b,
-        form_type=form_type,
-        highlight_changes_only=highlight_changes_only,
-    )
 
 
 @app.get("/api/portfolio", response_model=ApiResponse)
@@ -1133,6 +1141,111 @@ def portfolio() -> ApiResponse:
         return _ok(_build_portfolio_summary(status_data))
     except Exception as e:
         return _err("portfolio", e)
+
+
+@app.get("/api/portfolio/risk", response_model=ApiResponse)
+def portfolio_risk() -> ApiResponse:
+    """Portfolio risk analytics: sector allocation, concentration, and exposure metrics."""
+    try:
+        from sector_strength import SECTOR_TO_ETF, get_ticker_sector_etf
+
+        auth = DualSchwabAuth(skill_dir=SKILL_DIR)
+        status_data = get_account_status(auth=auth, skill_dir=SKILL_DIR)
+        if isinstance(status_data, str):
+            _record_endpoint_error("portfolio_risk")
+            return ApiResponse(ok=False, error=status_data)
+
+        summary = _build_portfolio_summary(status_data)
+        positions = summary.get("positions", [])
+        total_value = summary.get("total_market_value", 0.0)
+
+        if not positions or total_value <= 0:
+            return _ok({
+                "total_value": 0,
+                "position_count": 0,
+                "sector_allocation": [],
+                "concentration": {},
+                "positions_weighted": [],
+                "day_pl_total": 0,
+                "day_pl_breakdown": [],
+            })
+
+        sector_buckets: dict[str, float] = {}
+        etf_reverse: dict[str, str] = {}
+        for name, etf in SECTOR_TO_ETF.items():
+            etf_reverse.setdefault(etf, name.title())
+
+        weighted_positions: list[dict[str, Any]] = []
+        day_pl_total = 0.0
+        day_pl_breakdown: list[dict[str, Any]] = []
+
+        for pos in positions:
+            sym = pos["symbol"]
+            mkt = float(pos.get("market_value", 0))
+            weight = round((mkt / total_value) * 100, 2) if total_value > 0 else 0
+            day_pl = float(pos.get("day_pl", 0))
+            day_pl_total += day_pl
+
+            sector_etf = get_ticker_sector_etf(sym, skill_dir=SKILL_DIR)
+            sector_name = etf_reverse.get(sector_etf, "Unknown") if sector_etf else "Unknown"
+            sector_buckets[sector_name] = sector_buckets.get(sector_name, 0) + mkt
+
+            weighted_positions.append({
+                "symbol": sym,
+                "weight_pct": weight,
+                "market_value": mkt,
+                "sector": sector_name,
+                "sector_etf": sector_etf,
+                "pl_pct": pos.get("pl_pct", 0),
+                "day_pl": day_pl,
+            })
+            day_pl_breakdown.append({
+                "symbol": sym,
+                "day_pl": round(day_pl, 2),
+                "contribution_pct": round((day_pl / total_value) * 100, 4) if total_value > 0 else 0,
+            })
+
+        sector_allocation = sorted(
+            [
+                {
+                    "sector": name,
+                    "value": round(val, 2),
+                    "weight_pct": round((val / total_value) * 100, 2),
+                }
+                for name, val in sector_buckets.items()
+            ],
+            key=lambda x: x["weight_pct"],
+            reverse=True,
+        )
+
+        weights = [p["weight_pct"] for p in weighted_positions]
+        hhi = round(sum(w ** 2 for w in weights), 2)
+        top1 = max(weights) if weights else 0
+        top5_weight = round(sum(sorted(weights, reverse=True)[:5]), 2)
+        sector_count = len([s for s in sector_allocation if s["weight_pct"] > 0])
+
+        concentration = {
+            "hhi": hhi,
+            "hhi_label": "Concentrated" if hhi > 2500 else ("Moderate" if hhi > 1500 else "Diversified"),
+            "top_position_pct": top1,
+            "top_5_pct": top5_weight,
+            "sector_count": sector_count,
+            "position_count": len(positions),
+        }
+
+        day_pl_breakdown.sort(key=lambda x: abs(x["day_pl"]), reverse=True)
+
+        return _ok({
+            "total_value": round(total_value, 2),
+            "position_count": len(positions),
+            "sector_allocation": sector_allocation,
+            "concentration": concentration,
+            "positions_weighted": weighted_positions,
+            "day_pl_total": round(day_pl_total, 2),
+            "day_pl_breakdown": day_pl_breakdown[:10],
+        })
+    except Exception as e:
+        return _err("portfolio_risk", e)
 
 
 @app.get("/api/sectors", response_model=ApiResponse)
@@ -1163,7 +1276,11 @@ def list_pending_trades(
 
 
 @app.post("/api/pending-trades", response_model=ApiResponse)
-def create_pending_trade(payload: CreatePendingTrade, db: Session = Depends(get_db)) -> ApiResponse:
+def create_pending_trade(
+    payload: CreatePendingTrade,
+    _auth: dict[str, str] = Depends(require_api_key_if_set),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
     try:
         ticker = payload.ticker.upper().strip()
         signal = payload.signal or {}
@@ -1196,6 +1313,7 @@ def create_pending_trade(payload: CreatePendingTrade, db: Session = Depends(get_
         db.commit()
         db.refresh(row)
         _audit_event("pending_trade_created", "system", {"trade_id": trade_id, "ticker": ticker, "qty": qty})
+        _sse_publish("trade_created", {"trade_id": trade_id, "ticker": ticker, "qty": qty, "status": "pending"})
         return _ok(_trade_to_dict(row))
     except Exception as e:
         return _err("create_pending_trade", e)
@@ -1225,6 +1343,51 @@ def clear_all_pending_trades(
     return _ok({"cleared": len(cleared_ids)})
 
 
+@app.post("/api/pending-trades/delete-all", response_model=ApiResponse)
+def delete_all_pending_trades(
+    _auth: dict[str, str] = Depends(require_api_key_if_set),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
+    """Permanently remove all trades (executed/rejected/failed/pending) from the history."""
+    rows = (
+        db.query(PendingTrade)
+        .filter(PendingTrade.user_id == LOCAL_DASHBOARD_USER_ID)
+        .all()
+    )
+    deleted_ids = [r.id for r in rows]
+    status_breakdown: dict[str, int] = {}
+    for row in rows:
+        status_breakdown[row.status] = status_breakdown.get(row.status, 0) + 1
+        db.delete(row)
+    db.commit()
+    if deleted_ids:
+        _audit_event("pending_trades_deleted_all", "web-user", {
+            "deleted": len(deleted_ids),
+            "trade_ids": deleted_ids,
+            "by_status": status_breakdown,
+        })
+    return _ok({"deleted": len(deleted_ids), "by_status": status_breakdown})
+
+
+@app.post("/api/trades/{trade_id}/delete", response_model=ApiResponse)
+def delete_trade(
+    trade_id: str,
+    _auth: dict[str, str] = Depends(require_api_key_if_set),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
+    row = (
+        db.query(PendingTrade)
+        .filter(PendingTrade.id == trade_id, PendingTrade.user_id == LOCAL_DASHBOARD_USER_ID)
+        .first()
+    )
+    if not row:
+        return ApiResponse(ok=False, error="Trade not found.")
+    db.delete(row)
+    db.commit()
+    _audit_event("trade_deleted", "web-user", {"trade_id": trade_id})
+    return _ok({"deleted": trade_id})
+
+
 @app.post("/api/trades/{trade_id}/approve", response_model=ApiResponse)
 def approve_trade(
     trade_id: str,
@@ -1233,6 +1396,11 @@ def approve_trade(
     auth_ctx: dict[str, str] = Depends(require_trade_api_key),
     db: Session = Depends(get_db),
 ) -> ApiResponse:
+    if (os.getenv("LIVE_TRADING_KILL_SWITCH") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return ApiResponse(
+            ok=False,
+            error="Platform kill switch is enabled. New live orders are blocked until cleared.",
+        )
     row = (
         db.query(PendingTrade)
         .filter(PendingTrade.id == trade_id, PendingTrade.user_id == LOCAL_DASHBOARD_USER_ID)
@@ -1287,6 +1455,7 @@ def approve_trade(
             {"trade": _trade_to_dict(row), "error": result},
         )
         _record_endpoint_error("approve_trade")
+        _sse_publish("trade_failed", {"trade_id": trade_id, "ticker": row.ticker, "error": result})
         return ApiResponse(
             ok=False,
             error=result,
@@ -1304,6 +1473,7 @@ def approve_trade(
         actor,
         {"trade": _trade_to_dict(row), "result": result},
     )
+    _sse_publish("trade_approved", {"trade_id": trade_id, "ticker": row.ticker})
     return _ok({"trade": _trade_to_dict(row), "result": result})
 
 
@@ -1328,6 +1498,7 @@ def reject_trade(
     db.commit()
     db.refresh(row)
     _audit_event("trade_rejected", auth_ctx.get("actor", "web-user"), {"trade": _trade_to_dict(row)})
+    _sse_publish("trade_rejected", {"trade_id": trade_id, "ticker": row.ticker})
     return _ok(_trade_to_dict(row))
 
 
@@ -1378,6 +1549,7 @@ def set_profile(
     profile: str = DEFAULT_PROFILE,
     mode: str = DEFAULT_UI_MODE,
     automation_opt_in: bool = False,
+    _auth: dict[str, str] = Depends(require_api_key_if_set),
     db: Session = Depends(get_db),
 ) -> ApiResponse:
     p = str(profile or DEFAULT_PROFILE).strip().lower()
@@ -1399,7 +1571,10 @@ def set_profile(
 
 
 @app.post("/api/onboarding/start", response_model=ApiResponse)
-def onboarding_start(db: Session = Depends(get_db)) -> ApiResponse:
+def onboarding_start(
+    _auth: dict[str, str] = Depends(require_api_key_if_set),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
     state = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "target_minutes": ONBOARDING_TARGET_MINUTES,
@@ -1415,7 +1590,11 @@ def onboarding_start(db: Session = Depends(get_db)) -> ApiResponse:
 
 
 @app.post("/api/onboarding/step/{step}", response_model=ApiResponse)
-def onboarding_step(step: str, db: Session = Depends(get_db)) -> ApiResponse:
+def onboarding_step(
+    step: str,
+    _auth: dict[str, str] = Depends(require_api_key_if_set),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
     current = _load_state(
         db,
         key="onboarding",
@@ -1548,7 +1727,8 @@ def onboarding_status(db: Session = Depends(get_db)) -> ApiResponse:
             elapsed_minutes = round((datetime.now(timezone.utc) - dt).total_seconds() / 60.0, 1)
         except Exception:
             elapsed_minutes = None
-    steps = current.get("steps") if isinstance(current.get("steps"), dict) else {}
+    _st = current.get("steps")
+    steps: dict[str, Any] = _st if isinstance(_st, dict) else {}
     completion = (
         bool((steps.get("connect") or {}).get("ok"))
         and bool((steps.get("verify_token_health") or {}).get("ok"))
@@ -1621,55 +1801,4 @@ def decision_card(ticker: str, db: Session = Depends(get_db)) -> ApiResponse:
     )
 
 
-@app.get("/api/performance", response_model=ApiResponse)
-def performance() -> ApiResponse:
-    backtest = _read_json_file(BACKTEST_RESULTS_PATH, {})
-    outcomes = _read_json_file(TRADE_OUTCOMES_PATH, [])
-    metrics = _read_json_file(EXECUTION_METRICS_PATH, {"days": {}})
-    days = metrics.get("days", {}) if isinstance(metrics, dict) else {}
-
-    shadow_actions = 0
-    live_actions = 0
-    for bucket in days.values() if isinstance(days, dict) else []:
-        events = (bucket or {}).get("events", {}) if isinstance(bucket, dict) else {}
-        shadow_actions += int(events.get("action_shadow", 0) or 0)
-        live_actions += int(events.get("action_live", 0) or 0)
-
-    total_outcomes = len(outcomes) if isinstance(outcomes, list) else 0
-    return _ok(
-        {
-            "backtest": {
-                "source": str(BACKTEST_RESULTS_PATH.name),
-                "run_at": backtest.get("run_at") if isinstance(backtest, dict) else None,
-                "total_trades": backtest.get("total_trades") if isinstance(backtest, dict) else None,
-                "win_rate": backtest.get("win_rate_net") if isinstance(backtest, dict) else None,
-                "avg_return_pct": backtest.get("avg_return_net_pct") if isinstance(backtest, dict) else None,
-                "max_drawdown_pct": backtest.get("max_drawdown_net_pct") if isinstance(backtest, dict) else None,
-            },
-            "shadow_paper": {
-                "source": "execution_safety_metrics.json",
-                "shadow_actions": shadow_actions,
-                "notes": "Derived from shadow execution event counters.",
-            },
-            "live": {
-                "source": ".trade_outcomes.json",
-                "live_actions": live_actions,
-                "recorded_outcomes": total_outcomes,
-                "latest_outcomes": (outcomes[-5:] if isinstance(outcomes, list) else []),
-            },
-            "validation": {
-                "status": _latest_validation_status(),
-                "artifacts_present": VALIDATION_ARTIFACT_DIR.exists(),
-            },
-            "separation_guard": {
-                "commingled_metric_allowed": False,
-                "message": "Backtest, shadow/paper, and live are reported as separate buckets only.",
-            },
-        }
-    )
-
-
-@app.get("/api/calibration/summary", response_model=ApiResponse)
-def api_calibration_summary() -> ApiResponse:
-    return _ok(build_calibration_snapshot(SKILL_DIR))
 

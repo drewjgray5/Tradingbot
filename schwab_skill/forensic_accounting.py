@@ -78,9 +78,9 @@ def compute_sloan_ratio(ticker: str) -> dict[str, Any] | None:
 
         return {
             "sloan_ratio": float(ratio),
-            "net_income": float(net_income),
-            "ocf": float(ocf),
-            "total_assets": float(total_assets),
+            "net_income": float(net_income or 0.0),
+            "ocf": float(ocf or 0.0),
+            "total_assets": float(total_assets or 0.0),
         }
     except Exception as exc:
         LOG.debug("Sloan ratio failed for %s: %s", ticker, exc)
@@ -192,14 +192,14 @@ def compute_beneish_m_score(ticker: str) -> dict[str, Any] | None:
 
         m_score = (
             -4.84
-            + (0.920 * dsri)
-            + (0.528 * gmi)
-            + (0.404 * aqi)
-            + (0.892 * sgi)
-            + (0.115 * depi)
-            - (0.172 * sgai)
-            + (4.679 * tata)
-            - (0.327 * lvgi)
+            + (0.920 * (dsri or 0.0))
+            + (0.528 * (gmi or 0.0))
+            + (0.404 * (aqi or 0.0))
+            + (0.892 * (sgi or 0.0))
+            + (0.115 * (depi or 0.0))
+            - (0.172 * (sgai or 0.0))
+            + (4.679 * (tata or 0.0))
+            - (0.327 * (lvgi or 0.0))
         )
         components = {
             "dsri": dsri,
@@ -213,7 +213,7 @@ def compute_beneish_m_score(ticker: str) -> dict[str, Any] | None:
         }
         return {
             "m_score": float(m_score),
-            "components": {k: float(v) for k, v in components.items()},
+            "components": {k: float(v or 0.0) for k, v in components.items()},
             "likely_manipulator": bool(m_score > -1.78),
         }
     except Exception as exc:
@@ -268,17 +268,17 @@ def compute_altman_z_score(ticker: str) -> dict[str, Any] | None:
         if any(v is None for v in (a_val, b_val, c_val, d_val, e_val)):
             return None
 
-        z_score = (1.2 * a_val) + (1.4 * b_val) + (3.3 * c_val) + (0.6 * d_val) + (1.0 * e_val)
+        z_score = (1.2 * (a_val or 0.0)) + (1.4 * (b_val or 0.0)) + (3.3 * (c_val or 0.0)) + (0.6 * (d_val or 0.0)) + (1.0 * (e_val or 0.0))
         zone = "safe" if z_score > 3.0 else "grey" if z_score >= 1.8 else "distress"
         return {
             "z_score": float(z_score),
             "zone": zone,
             "components": {
-                "A_working_capital_over_assets": float(a_val),
-                "B_retained_earnings_over_assets": float(b_val),
-                "C_ebit_over_assets": float(c_val),
-                "D_market_cap_over_liabilities": float(d_val),
-                "E_revenue_over_assets": float(e_val),
+                "A_working_capital_over_assets": float(a_val or 0.0),
+                "B_retained_earnings_over_assets": float(b_val or 0.0),
+                "C_ebit_over_assets": float(c_val or 0.0),
+                "D_market_cap_over_liabilities": float(d_val or 0.0),
+                "E_revenue_over_assets": float(e_val or 0.0),
             },
         }
     except Exception as exc:
@@ -356,7 +356,7 @@ def compute_forensic_snapshot(
     cache = _load_cache(skill_dir)
     entry = (cache.get("tickers") or {}).get(tkr)
     if _is_fresh(entry, cache_hours):
-        payload = dict(entry.get("payload") or {})
+        payload: dict[str, Any] = dict((entry or {}).get("payload") or {})
         payload["from_cache"] = True
         sloan = payload.get("sloan")
         beneish = payload.get("beneish")
@@ -369,7 +369,7 @@ def compute_forensic_snapshot(
     sloan = compute_sloan_ratio(tkr)
     beneish = compute_beneish_m_score(tkr)
     altman = compute_altman_z_score(tkr)
-    payload: dict[str, Any] = {
+    payload = {
         "ok": any(x is not None for x in (sloan, beneish, altman)),
         "ticker": tkr,
         "sloan": sloan,

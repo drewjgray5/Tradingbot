@@ -98,3 +98,44 @@ def test_hs256_requires_jwt_secret(monkeypatch: pytest.MonkeyPatch) -> None:
         decode_supabase_jwt(token)
     assert ei.value.status_code == 503
     assert "SUPABASE_JWT_SECRET" in str(ei.value.detail)
+
+
+def test_production_requires_audience_and_issuer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENV", "production")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", "prod_secret")
+    monkeypatch.delenv("SUPABASE_JWT_AUDIENCE", raising=False)
+    monkeypatch.delenv("SUPABASE_JWT_ISSUER", raising=False)
+    token = jwt.encode({"sub": "prod_user"}, "prod_secret", algorithm="HS256")
+    with pytest.raises(HTTPException) as ei:
+        decode_supabase_jwt(token)
+    assert ei.value.status_code == 503
+    assert "SUPABASE_JWT_AUDIENCE" in str(ei.value.detail)
+
+
+def test_decode_rejects_expired_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", "exp_secret")
+    monkeypatch.setenv("SUPABASE_JWT_LEEWAY_SECONDS", "0")
+    token = jwt.encode({"sub": "u_exp", "exp": 1}, "exp_secret", algorithm="HS256")
+    with pytest.raises(HTTPException) as ei:
+        decode_supabase_jwt(token)
+    assert ei.value.status_code == 401
+
+
+def test_decode_validates_audience_and_issuer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", "claims_secret")
+    monkeypatch.setenv("SUPABASE_JWT_AUDIENCE", "authenticated")
+    monkeypatch.setenv("SUPABASE_JWT_ISSUER", "https://proj.supabase.co/auth/v1")
+    good = jwt.encode(
+        {"sub": "u_claims", "aud": "authenticated", "iss": "https://proj.supabase.co/auth/v1"},
+        "claims_secret",
+        algorithm="HS256",
+    )
+    bad_aud = jwt.encode(
+        {"sub": "u_claims", "aud": "anon", "iss": "https://proj.supabase.co/auth/v1"},
+        "claims_secret",
+        algorithm="HS256",
+    )
+    assert decode_supabase_jwt(good)["sub"] == "u_claims"
+    with pytest.raises(HTTPException) as ei:
+        decode_supabase_jwt(bad_aud)
+    assert ei.value.status_code == 401

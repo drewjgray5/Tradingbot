@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "hooks": {
+    "afterFileEdit": [
+      {
+        "command": "python .cursor/hooks/format-python.py",
+        "matcher": "\\.py$",
+        "timeout": 20
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "python .cursor/hooks/gate-dangerous-commands.py",
+        "failClosed": false,
+        "timeout": 10
+      }
+    ]
+  }
+}

@@ -21,8 +21,9 @@ const AuthJwt = globalThis.TradingBotAuthJwt || {
 };
 
 const state = {
-  publicConfig: { supabase: null, saas_mode: false },
+  publicConfig: { supabase: null, saas_mode: false, scan_transport: "local_thread" },
   config: { auth_mode: "jwt" },
+  allowManualJwt: true,
   latestSignals: [],
 };
 
@@ -204,13 +205,15 @@ function normalizeUserJwt(raw) {
 }
 
 async function getApiAccessToken() {
-  const manual = normalizeUserJwt(document.getElementById("simpleJwt")?.value ?? "");
-  if (manual) {
-    if (!AuthJwt.isProbablyAccessJwt(manual)) {
-      console.warn(AuthJwt.JWT_BAD_SHAPE_HINT);
-      return "";
+  if (state.allowManualJwt) {
+    const manual = normalizeUserJwt(document.getElementById("simpleJwt")?.value ?? "");
+    if (manual) {
+      if (!AuthJwt.isProbablyAccessJwt(manual)) {
+        console.warn(AuthJwt.JWT_BAD_SHAPE_HINT);
+        return "";
+      }
+      return manual;
     }
-    return manual;
   }
   if (state.config?.auth_mode === "supabase" && supabaseClient) {
     const { data, error } = await supabaseClient.auth.getSession();
@@ -218,7 +221,7 @@ async function getApiAccessToken() {
     const sessionToken = normalizeUserJwt(data?.session?.access_token ?? "");
     if (sessionToken && AuthJwt.isProbablyAccessJwt(sessionToken)) return sessionToken;
   }
-  return readStoredApiJwt();
+  return state.allowManualJwt ? readStoredApiJwt() : "";
 }
 
 function clearLegacyApiJwtKeys() {
@@ -266,6 +269,9 @@ const api = {
       "Content-Type": "application/json",
       ...(fetchOptions.headers || {}),
     };
+    if (!headers["X-Request-ID"]) {
+      headers["X-Request-ID"] = `simple-ui-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    }
     const token = await getApiAccessToken();
     if (token) headers.Authorization = `Bearer ${token}`;
     try {
@@ -308,8 +314,10 @@ const api = {
 function persistJwt(session) {
   const token = normalizeUserJwt(session?.access_token ?? "");
   if (token && AuthJwt.isProbablyAccessJwt(token)) {
-    localStorage.setItem(AUTH_TOKEN_KEY, token);
-    clearLegacyApiJwtKeys();
+    if (state.allowManualJwt) {
+      localStorage.setItem(AUTH_TOKEN_KEY, token);
+      clearLegacyApiJwtKeys();
+    }
     void applyCookieSessionToken(token);
     const inp = document.getElementById("simpleJwt");
     if (inp) inp.value = "";
@@ -399,7 +407,16 @@ async function loadPublicConfig() {
   state.publicConfig = {
     supabase: payload?.supabase || null,
     saas_mode: Boolean(payload?.saas_mode),
+    scan_transport: safeText(payload?.scan_transport || "local_thread"),
   };
+  state.allowManualJwt = payload?.manual_jwt_entry_enabled !== false;
+  if (!state.allowManualJwt) clearStoredApiJwt();
+  const jwtDetails = document.querySelector(".simple-jwt-details");
+  if (jwtDetails) jwtDetails.classList.toggle("hidden", !state.allowManualJwt);
+  const jwtInput = document.getElementById("simpleJwt");
+  if (jwtInput) jwtInput.disabled = !state.allowManualJwt;
+  const jwtSave = document.getElementById("simpleJwtSave");
+  if (jwtSave) jwtSave.disabled = !state.allowManualJwt;
   const sb = state.publicConfig.supabase;
   const sbWrap = document.getElementById("simpleSupabase");
   if (sb?.url && sb?.anon_key) {
@@ -463,7 +480,9 @@ async function refreshStatus() {
   document.getElementById("simpleMarket").textContent = safeText(s.market_state || (s.market_token_ok ? "Connected" : "Disconnected"));
   document.getElementById("simpleAccount").textContent = safeText(s.account_state || (s.account_token_ok ? "Connected" : "Disconnected"));
 
-  const deep = await api.get("/api/health/deep", { timeoutMs: 25000 });
+  const deep = state.publicConfig?.saas_mode
+    ? { ok: false, error: "deep health disabled for SaaS" }
+    : await api.get("/api/health/deep", { timeoutMs: 25000 });
   const quoteOk = deep.ok && deep.data?.quote_ok;
   document.getElementById("simpleQuotes").textContent = quoteOk ? "OK" : deep.ok ? "Degraded" : "Unknown";
 
@@ -488,7 +507,7 @@ async function waitSaaS(taskId) {
   const headline = document.getElementById("simpleScanHeadline");
   setProgress(0.05, "Queued…");
   for (let i = 0; i < 180; i++) {
-    const status = await api.get(`/api/scan/${encodeURIComponent(taskId)}`);
+    const status = await api.get(`/api/scan-lifecycle?task_id=${encodeURIComponent(taskId)}`);
     if (!status.ok) {
       headline.textContent = "Scan failed.";
       setMessage(status.error, "error");
@@ -577,7 +596,7 @@ async function waitLocal() {
   const headline = document.getElementById("simpleScanHeadline");
   setProgress(0.1, "Starting…");
   for (let i = 0; i < 180; i++) {
-    const status = await api.get("/api/scan/status");
+    const status = await api.get("/api/scan-lifecycle");
     if (!status.ok) {
       headline.textContent = "Scan failed.";
       setMessage(status.error, "error");
@@ -665,6 +684,7 @@ async function runScan() {
 }
 
 function wireJwt() {
+  if (!state.allowManualJwt) return;
   const saved = readStoredApiJwt();
   const inp = document.getElementById("simpleJwt");
   if (inp && saved && !inp.value) inp.placeholder = "Token saved in browser";
@@ -687,8 +707,8 @@ function wireJwt() {
 }
 
 async function main() {
-  wireJwt();
   await loadPublicConfig();
+  wireJwt();
   await refreshStatus();
   document.getElementById("simpleRefreshStatus")?.addEventListener("click", () => refreshStatus());
   document.getElementById("simpleScanBtn")?.addEventListener("click", () => runScan());

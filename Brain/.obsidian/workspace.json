@@ -1,0 +1,240 @@
+{
+  "main": {
+    "id": "216918877bff2f33",
+    "type": "split",
+    "children": [
+      {
+        "id": "6ad9769f627b7596",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "af2f98d66ae27196",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "API/Local Dashboard Endpoints.md",
+                "mode": "preview",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Local Dashboard Endpoints"
+            }
+          }
+        ]
+      },
+      {
+        "id": "df564ca38f5e3d03",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "ff30d665fc6e0bae",
+            "type": "leaf",
+            "state": {
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "Graph view"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "1f0fdf987f5363ac",
+    "type": "split",
+    "children": [
+      {
+        "id": "51e4fd281a2858e9",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "387ed098351fbc82",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "8931a4b227563d1a",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "670758d61b216236",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "d791ec75014565fe",
+    "type": "split",
+    "children": [
+      {
+        "id": "c948ff9268422ea1",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "0e722a383f97c264",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "API/Local Dashboard Endpoints.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for Local Dashboard Endpoints"
+            }
+          },
+          {
+            "id": "ae99e4ca040a99f1",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "API/Local Dashboard Endpoints.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from Local Dashboard Endpoints"
+            }
+          },
+          {
+            "id": "fe287e1f16221fd9",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "553b1f41ea58b1eb",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "81d53b6ef66a3d4e",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "API/Local Dashboard Endpoints.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of Local Dashboard Endpoints"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "af2f98d66ae27196",
+  "lastOpenFiles": [
+    "Runbooks/SLO and Alerting.md",
+    "Runbooks/Incident Response SaaS.md",
+    "Runbooks/Backup Restore.md",
+    "Templates/New Strategy Idea.md",
+    "Templates/Bug Investigation.md",
+    "Templates/Decision Record.md",
+    "Templates/Trade Analysis.md",
+    "Templates/Daily Journal.md",
+    "API/Tenant Dashboard Endpoints.md",
+    "API/SaaS Endpoints.md",
+    "API/Local Dashboard Endpoints.md",
+    "Config/Feature Flags.md",
+    "Config/SaaS Infrastructure.md",
+    "Config/Plugin Modes Config.md",
+    "Config/Scanner Tunables.md",
+    "Config/Schwab API Keys.md",
+    "Runbooks/Troubleshooting.md",
+    "Runbooks/Schwab OAuth Setup.md",
+    "Runbooks/Signal Quality Rollout.md",
+    "Runbooks/Validation.md",
+    "Runbooks/Canary Rollout.md",
+    "Runbooks/Deployment.md",
+    "Strategies/Self-Study.md",
+    "Strategies/Adaptive Stops.md",
+    "Strategies/PEAD.md",
+    "Strategies/Forensic Accounting.md",
+    "MOCs",
+    "Templates",
+    "Journal",
+    "Decisions",
+    "API",
+    "Config",
+    "Runbooks",
+    "Strategies",
+    "Architecture"
+  ]
+}

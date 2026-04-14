@@ -230,7 +230,7 @@ def get_sector_heatmap(
         "XLC": "Communication", "XLRE": "Real Estate",
     }
 
-    rows = []
+    rows: list[dict[str, Any]] = []
     for etf in sorted(set(SECTOR_ETFS)):
         ret = perf.get(etf)
         if ret is None:

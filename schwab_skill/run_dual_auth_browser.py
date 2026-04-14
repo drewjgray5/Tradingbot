@@ -118,9 +118,17 @@ def _run_session(session, name: str) -> bool:
         print(f"OAuth error: {_captured['error']}")
         return False
     if _captured["code"]:
-        session.complete_auth(_captured["code"])
-        print("  Saved.")
-        return True
+        try:
+            session.complete_auth(_captured["code"])
+            print("  Saved.")
+            return True
+        except Exception as e:
+            print(f"OAuth token exchange failed: {e}")
+            print("Likely causes:")
+            print("  - Callback URL mismatch in Schwab app settings")
+            print("  - Authorization code already used or expired")
+            print("  - Wrong app key/secret pair for this session")
+            return False
     print("  No code received.")
     return False
 
@@ -132,6 +140,7 @@ def main():
         input("Press Enter to start...")
 
     os.environ["SCHWAB_CALLBACK_URL"] = CALLBACK_URL
+    os.environ["SCHWAB_MARKET_CALLBACK_URL"] = CALLBACK_URL
 
     from schwab_auth import DualSchwabAuth
     auth = DualSchwabAuth(skill_dir=SKILL_DIR)
@@ -143,12 +152,31 @@ def main():
 
     if ok1 and ok2:
         print("\nDone. Both sessions saved.")
-        # Update .env so future refreshes use this callback
+        # Update .env so future refreshes use this callback.
         env_path = SKILL_DIR / ".env"
-        txt = env_path.read_text()
-        if CALLBACK_URL not in txt:
-            txt = txt.replace("SCHWAB_CALLBACK_URL=https://127.0.0.1", f"SCHWAB_CALLBACK_URL={CALLBACK_URL}")
-            env_path.write_text(txt)
+        txt = env_path.read_text() if env_path.exists() else ""
+        lines = txt.splitlines() if txt else []
+        out_lines = []
+        saw_account = False
+        saw_market = False
+
+        for line in lines:
+            if line.startswith("SCHWAB_CALLBACK_URL="):
+                out_lines.append(f"SCHWAB_CALLBACK_URL={CALLBACK_URL}")
+                saw_account = True
+                continue
+            if line.startswith("SCHWAB_MARKET_CALLBACK_URL="):
+                out_lines.append(f"SCHWAB_MARKET_CALLBACK_URL={CALLBACK_URL}")
+                saw_market = True
+                continue
+            out_lines.append(line)
+
+        if not saw_account:
+            out_lines.append(f"SCHWAB_CALLBACK_URL={CALLBACK_URL}")
+        if not saw_market:
+            out_lines.append(f"SCHWAB_MARKET_CALLBACK_URL={CALLBACK_URL}")
+
+        env_path.write_text("\n".join(out_lines).rstrip() + "\n")
     else:
         print("\nOne or more failed. See TROUBLESHOOTING.md")
 

@@ -79,6 +79,32 @@ def _check_web_health() -> tuple[bool, str]:
     return True, "web health contract"
 
 
+def _check_saas_web_health() -> tuple[bool, str]:
+    from fastapi.testclient import TestClient
+
+    prev = os.environ.get("SAAS_HEALTH_REQUIRE_REDIS")
+    os.environ["SAAS_HEALTH_REQUIRE_REDIS"] = "0"
+    try:
+        from webapp.main_saas import app as saas_app
+
+        with TestClient(saas_app) as client:
+            health = client.get("/api/health")
+            if health.status_code != 200:
+                return False, f"saas /api/health status {health.status_code}"
+            payload = health.json()
+            if not payload.get("ok"):
+                return False, "saas /api/health returned ok=false"
+            ready = client.get("/api/health/ready")
+            if ready.status_code != 200:
+                return False, f"saas /api/health/ready status {ready.status_code}"
+    finally:
+        if prev is None:
+            os.environ.pop("SAAS_HEALTH_REQUIRE_REDIS", None)
+        else:
+            os.environ["SAAS_HEALTH_REQUIRE_REDIS"] = prev
+    return True, "saas health contract"
+
+
 def _check_discord_payload_shape() -> tuple[bool, str]:
     from signal_scanner import _build_comparison_embed
 
@@ -103,6 +129,7 @@ def main() -> int:
     checks = [
         _check_demo_scan,
         _check_web_health,
+        _check_saas_web_health,
         _check_discord_payload_shape,
     ]
     failures: list[str] = []

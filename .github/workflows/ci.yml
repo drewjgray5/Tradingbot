@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+defaults:
+  run:
+    working-directory: schwab_skill
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Ruff
+        run: python -m ruff check .
+
+      - name: Pytest
+        run: python -m pytest -q --cov=webapp --cov-report=term-missing --cov-fail-under=60
+
+      - name: Mypy
+        run: python -m mypy
+
+      - name: Pip audit
+        run: python -m pip_audit -r requirements.txt
+
+  strategy_ci_profile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Strict CI validation profile
+        run: |
+          python scripts/validate_all.py --profile ci --skip-backtest --strict
+
+      - name: Upload validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-strategy-quick-artifacts
+          path: |
+            schwab_skill/validation_artifacts/**
+            schwab_skill/.backtest_results.json
+          if-no-files-found: ignore

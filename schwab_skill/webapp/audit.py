@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from .models import AuditLog
+from .redaction import redact_mapping
 
 LOG = logging.getLogger("webapp.audit")
 
@@ -26,7 +27,7 @@ def log_audit(
     detail: dict[str, Any] | None = None,
     request_id: str | None = None,
 ) -> None:
-    safe_detail = {k: v for k, v in (detail or {}).items() if "token" not in k.lower()}
+    safe_detail = redact_mapping(detail)
     row = AuditLog(
         user_id=user_id,
         action=action[:64],

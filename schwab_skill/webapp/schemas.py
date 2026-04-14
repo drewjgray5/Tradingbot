@@ -44,6 +44,7 @@ class ApproveTradeRequest(BaseModel):
     """In-app confirmation: user must re-type the trade ticker before a live order is sent."""
 
     typed_ticker: str = Field(min_length=1, max_length=16)
+    otp_code: str | None = Field(default=None, min_length=6, max_length=8)
 
 
 class EnableLiveTradingRequest(BaseModel):

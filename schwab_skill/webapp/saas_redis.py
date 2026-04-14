@@ -29,12 +29,13 @@ def acquire_scan_cooldown(user_id: str, cooldown_sec: int) -> bool:
         key = f"saas:scan:cooldown:{user_id}"
         return bool(redis_client().set(key, "1", nx=True, ex=cooldown_sec))
     except redis.RedisError:
-        return True
+        fail_open = (os.getenv("SAAS_RATE_LIMIT_FAIL_OPEN") or "").strip().lower() in ("1", "true", "yes", "on")
+        return bool(fail_open)
 
 
 def fixed_window_rate_limit(user_id: str, bucket: str, limit: int, window_sec: int) -> tuple[bool, int]:
     """
-    Return (allowed, current_count). If Redis fails, allows the request (fail-open for local dev).
+    Return (allowed, current_count). On Redis failure default to deny (fail-closed).
     """
     try:
         r = redis_client()
@@ -45,7 +46,8 @@ def fixed_window_rate_limit(user_id: str, bucket: str, limit: int, window_sec: i
             r.expire(key, window_sec)
         return n <= limit, n
     except redis.RedisError:
-        return True, 0
+        fail_open = (os.getenv("SAAS_RATE_LIMIT_FAIL_OPEN") or "").strip().lower() in ("1", "true", "yes", "on")
+        return bool(fail_open), 0
 
 
 def order_idempotency_existing_task(user_id: str, idempotency_key: str) -> str | None:

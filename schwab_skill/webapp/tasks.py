@@ -15,7 +15,9 @@ from signal_scanner import scan_for_signals_detailed
 from .billing_stripe import user_has_paid_entitlement
 from .calibration_snapshot import build_calibration_snapshot
 from .db import SessionLocal
+from .learning_state import upsert_trade_outcome
 from .models import AppState, BacktestRun, Order, ScanResult, User
+from .redaction import safe_exception_message
 from .scan_payload import scan_runtime_kwargs
 from .tenant_runtime import tenant_skill_dir
 
@@ -58,6 +60,15 @@ def _json_default(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     return str(value)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _strategy_summary_from_signals(signals: list[dict[str, Any]]) -> dict[str, Any]:
@@ -115,6 +126,12 @@ def _persist_user_last_scan(
         "vcp_fail",
         "exceptions",
         "scan_blocked",
+        "scan_id",
+        "data_quality",
+        "data_quality_reasons",
+        "data_provider_primary_count",
+        "data_provider_fallback_count",
+        "primary_provider_filtered",
     )
     diagnostics_summary = {k: diagnostics.get(k) for k in summary_keys}
     payload = {
@@ -132,6 +149,42 @@ def _persist_user_last_scan(
     else:
         row.value_json = blob
     db.commit()
+
+
+def _build_trade_outcome_payload(
+    *,
+    user_id: str,
+    order_row: Order,
+    result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    now_iso = datetime.now(timezone.utc).date().isoformat()
+    safe_result = result if isinstance(result, dict) else {}
+    fill_price = (
+        safe_result.get("fill_price")
+        or safe_result.get("average_price")
+        or safe_result.get("avg_fill_price")
+        or order_row.price
+    )
+    return {
+        "source": "saas_order_execution",
+        "user_id": user_id,
+        "order_id": str(
+            safe_result.get("orderId")
+            or safe_result.get("order_id")
+            or order_row.broker_order_id
+            or order_row.id
+        ),
+        "ticker": str(order_row.ticker or "").upper(),
+        "side": str(order_row.side or "BUY").upper(),
+        "qty": int(order_row.qty or 0),
+        "fill_price": float(fill_price) if fill_price is not None else None,
+        "date": now_iso,
+        "return_pct": safe_result.get("return_pct"),
+        "pnl_pct": safe_result.get("pnl_pct"),
+        "sector_etf": safe_result.get("sector_etf"),
+        "mirofish_conviction": safe_result.get("mirofish_conviction"),
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @celery_app.task(name="webapp.scan_for_user")
@@ -152,7 +205,7 @@ def scan_for_user(user_id: str, scan_options: dict[str, Any] | None = None) -> d
                     user_id=user_id,
                     job_id=job_id,
                     ticker=str(sig.get("ticker") or sig.get("symbol") or "").upper(),
-                    signal_score=(float(sig.get("signal_score")) if sig.get("signal_score") is not None else None),
+                    signal_score=_optional_float(sig.get("signal_score")),
                     payload_json=json.dumps(sig, default=_json_default),
                 )
                 db.add(row)
@@ -198,7 +251,7 @@ def scan_for_user(user_id: str, scan_options: dict[str, Any] | None = None) -> d
                 }
     except Exception as exc:
         db.rollback()
-        return {"ok": False, "job_id": job_id, "error": str(exc)}
+        return {"ok": False, "job_id": job_id, "error": safe_exception_message(exc, fallback="scan_failed")}
     finally:
         db.close()
 
@@ -218,9 +271,9 @@ def backtest_for_user(run_id: str, user_id: str) -> dict[str, Any]:
             spec = parse_strategy_spec(json.loads(row.spec_json))
         except Exception as exc:
             row.status = "failed"
-            row.error_message = str(exc)
+            row.error_message = safe_exception_message(exc, fallback="invalid_backtest_spec")
             db.commit()
-            return {"ok": False, "error": str(exc), "run_id": run_id}
+            return {"ok": False, "error": row.error_message, "run_id": run_id}
         try:
             with tenant_skill_dir(db, user_id) as skill_dir:
                 result = run_strategy_backtest(skill_dir, spec)
@@ -239,10 +292,10 @@ def backtest_for_user(run_id: str, user_id: str) -> dict[str, Any]:
             return {"ok": True, "run_id": run_id, "summary": summary}
         except Exception as exc:
             row.status = "failed"
-            row.error_message = str(exc)
+            row.error_message = safe_exception_message(exc, fallback="backtest_failed")
             row.result_json = None
             db.commit()
-            return {"ok": False, "error": str(exc), "run_id": run_id}
+            return {"ok": False, "error": row.error_message, "run_id": run_id}
     finally:
         db.close()
 
@@ -297,15 +350,24 @@ def execute_order_for_user(
         row.status = "executed"
         row.result_json = json.dumps(result, default=_json_default)
         db.commit()
+        try:
+            upsert_trade_outcome(
+                db,
+                user_id,
+                _build_trade_outcome_payload(user_id=user_id, order_row=row, result=result),
+            )
+        except Exception as outcome_exc:
+            LOG.debug("Trade outcome persist skipped for user=%s order=%s: %s", user_id, row.id, outcome_exc)
         return {"ok": True, "order_id": row.id, "result": result}
     except Exception as exc:
         db.rollback()
         row = db.query(Order).filter(Order.id == order_id).first()
+        safe_error = safe_exception_message(exc, fallback="order_execution_failed")
         if row:
             row.status = "failed"
-            row.error_message = str(exc)
-            row.result_json = json.dumps({"ok": False, "error": str(exc)})
+            row.error_message = safe_error
+            row.result_json = json.dumps({"ok": False, "error": safe_error})
             db.commit()
-        return {"ok": False, "order_id": order_id, "error": str(exc)}
+        return {"ok": False, "order_id": order_id, "error": safe_error}
     finally:
         db.close()

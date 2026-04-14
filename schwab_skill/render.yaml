@@ -29,7 +29,7 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile.saas
     dockerContext: .
-    healthCheckPath: /api/health
+    healthCheckPath: /api/health/ready
     envVars:
       - key: DATABASE_URL
         fromDatabase:
@@ -52,11 +52,31 @@ services:
         sync: false
       - key: SUPABASE_JWT_SECRET
         sync: false
+      - key: SUPABASE_JWT_AUDIENCE
+        sync: false
+      - key: SUPABASE_JWT_ISSUER
+        sync: false
       - key: SUPABASE_JWT_SECRET_LEGACY
         sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SAAS_BILLING_ENFORCE
+        value: "0"
+      - key: WEB_INTERNAL_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_ID
+        sync: false
+      - key: STRIPE_CHECKOUT_SUCCESS_URL
+        sync: false
+      - key: STRIPE_CHECKOUT_CANCEL_URL
+        sync: false
+      - key: STRIPE_PORTAL_RETURN_URL
         sync: false
       - key: SCHWAB_MARKET_APP_KEY
         sync: false
@@ -105,8 +125,14 @@ services:
         sync: false
       - key: SUPABASE_JWT_SECRET
         sync: false
+      - key: SUPABASE_JWT_AUDIENCE
+        sync: false
+      - key: SUPABASE_JWT_ISSUER
+        sync: false
       - key: SUPABASE_JWT_SECRET_LEGACY
         sync: false
+      - key: SAAS_BILLING_ENFORCE
+        value: "0"
       - key: SCHWAB_MARKET_APP_KEY
         sync: false
       - key: SCHWAB_MARKET_APP_SECRET
@@ -119,3 +145,4 @@ services:
         sync: false
       - key: SCHWAB_MARKET_CALLBACK_URL
         sync: false
+

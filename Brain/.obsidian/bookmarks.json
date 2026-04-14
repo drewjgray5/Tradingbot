@@ -1,0 +1,34 @@
+{
+  "items": [
+    {
+      "type": "file",
+      "ctime": 1744588200000,
+      "path": "MOCs/Home.md",
+      "title": "Home"
+    },
+    {
+      "type": "file",
+      "ctime": 1744588200000,
+      "path": "MOCs/Architecture MOC.md",
+      "title": "Architecture"
+    },
+    {
+      "type": "file",
+      "ctime": 1744588200000,
+      "path": "MOCs/Trading Strategy MOC.md",
+      "title": "Strategy"
+    },
+    {
+      "type": "file",
+      "ctime": 1744588200000,
+      "path": "MOCs/Operations MOC.md",
+      "title": "Operations"
+    },
+    {
+      "type": "file",
+      "ctime": 1744588200000,
+      "path": "MOCs/Config Reference MOC.md",
+      "title": "Config"
+    }
+  ]
+}

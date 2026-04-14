@@ -876,7 +876,7 @@ def run_exit_manager_sweep(
                         be_stop = _hard_stop_payload(
                             ticker,
                             remaining_qty,
-                            stop_price=float(entry_px),
+                            stop_price=float(entry_px or 0.0),
                             skill_dir=skill_dir_p,
                         )
                         be_resp = _post_order_with_refresh(orders_url, be_stop, auth)

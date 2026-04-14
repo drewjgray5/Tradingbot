@@ -140,7 +140,7 @@ def _get_news_seed(ticker: str) -> str:
     try:
         import yfinance as yf
         t = yf.Ticker(ticker)
-        news = getattr(t, "get_news", lambda: [])(count=5)
+        news: list[dict[str, Any]] = getattr(t, "get_news", lambda **_kw: [])(count=5)
         if not news:
             return "No recent news available."
         lines = []
@@ -233,7 +233,7 @@ def compute_seed_fingerprint(seed_df, ticker: str, skill_dir: Path | None = None
     df = _normalize_ohlcv_df(seed_df)
     vcp_days = int(get_vcp_days(skill_dir))
     if df.empty:
-        payload = {"ticker": ticker.upper(), "last_close_date": None, "vcp_days": vcp_days, "ratios": None}
+        payload: dict[str, str | int | float | None] = {"ticker": ticker.upper(), "last_close_date": None, "vcp_days": vcp_days, "ratios": None}
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
     vcp_days_eff = max(1, min(vcp_days, len(df)))

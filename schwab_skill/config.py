@@ -133,6 +133,47 @@ def get_scan_stage_task_timeout_sec(skill_dir: Path | None = None) -> float:
     return _get_float("SCAN_STAGE_TASK_TIMEOUT_SEC", 120.0, skill_dir)
 
 
+def get_scan_vcp_gate_mode(skill_dir: Path | None = None) -> str:
+    """
+    VCP gate mode for Stage A:
+    - hard: reject candidate when VCP fails
+    - shadow: keep candidate, apply score penalty, track would-filter diagnostics
+    """
+    env = _load_env(skill_dir)
+    raw = _env_value("SCAN_VCP_GATE_MODE", env).strip().lower()
+    if raw in {"hard", "shadow"}:
+        return raw
+    return "shadow"
+
+
+def get_scan_sector_gate_mode(skill_dir: Path | None = None) -> str:
+    """
+    Sector gate mode for Stage A:
+    - hard: reject candidate when sector is unresolved or underperforming
+    - shadow: keep candidate, apply score penalty, track would-filter diagnostics
+    """
+    env = _load_env(skill_dir)
+    raw = _env_value("SCAN_SECTOR_GATE_MODE", env).strip().lower()
+    if raw in {"hard", "shadow"}:
+        return raw
+    return "shadow"
+
+
+def get_scan_vcp_penalty_points(skill_dir: Path | None = None) -> float:
+    """Stage A score penalty applied when VCP fails in shadow mode."""
+    return _get_float("SCAN_VCP_PENALTY_POINTS", 14.0, skill_dir)
+
+
+def get_scan_sector_penalty_points(skill_dir: Path | None = None) -> float:
+    """Stage A score penalty applied when sector underperforms in shadow mode."""
+    return _get_float("SCAN_SECTOR_PENALTY_POINTS", 10.0, skill_dir)
+
+
+def get_scan_sector_unresolved_penalty_points(skill_dir: Path | None = None) -> float:
+    """Stage A score penalty applied when sector mapping is unavailable in shadow mode."""
+    return _get_float("SCAN_SECTOR_UNRESOLVED_PENALTY_POINTS", 6.0, skill_dir)
+
+
 # Scanner: allow scans to run even when SPY is below 200 SMA.
 def get_scan_allow_bear_regime(skill_dir: Path | None = None) -> bool:
     return _get_bool("SCAN_ALLOW_BEAR_REGIME", False, skill_dir)

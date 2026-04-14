@@ -1,17 +1,21 @@
-# One manual step: Complete OAuth
+# Complete OAuth (best-fit flow)
 
-Open a terminal in this folder and run:
+Open a terminal in `schwab_skill/` and run:
 
 ```
-python run_dual_auth.py
+python scripts/fix_schwab_auth.py
 ```
 
-For **each** session (Market, then Account):
+What this does for you:
 
-1. Copy the URL printed
-2. Open it in your browser
-3. Log in to Schwab and approve
-4. Copy the full redirect URL (e.g. `https://127.0.0.1/?code=...`)
-5. Paste it when prompted
+1. Validates required Schwab app keys/secrets in `.env`
+2. Ensures both callback vars are present (`SCHWAB_CALLBACK_URL`, `SCHWAB_MARKET_CALLBACK_URL`)
+3. Deletes old token files
+4. Runs browser OAuth for **Market** then **Account**
+5. Runs `healthcheck.py` to confirm both endpoints are authorized
 
-After both sessions complete, `tokens_market.enc` and `tokens_account.enc` will be created. You're done.
+If you only want to preview what it will fix:
+
+```
+python scripts/fix_schwab_auth.py --dry-run
+```

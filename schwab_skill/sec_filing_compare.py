@@ -41,6 +41,37 @@ def _metric_deltas(left: dict[str, Any], right: dict[str, Any]) -> dict[str, int
     return out
 
 
+def _rank_evidence(left: dict[str, Any], right: dict[str, Any], max_items: int = 6) -> list[dict[str, str]]:
+    ranked: list[dict[str, str]] = []
+    for label, payload in (("left", left), ("right", right)):
+        for item in list(payload.get("evidence") or [])[: max(1, max_items // 2)]:
+            if not isinstance(item, dict):
+                continue
+            ranked.append(
+                {
+                    "side": label,
+                    "claim": str(item.get("claim") or ""),
+                    "term": str(item.get("term") or ""),
+                    "quote": str(item.get("quote") or "")[:240],
+                    "section_hint": str(item.get("section_hint") or ""),
+                }
+            )
+            if len(ranked) >= max_items:
+                return ranked
+    return ranked
+
+
+def _compare_confidence(left: dict[str, Any], right: dict[str, Any], differences: list[str]) -> int:
+    left_conf = float(left.get("confidence", 50) or 50)
+    right_conf = float(right.get("confidence", 50) or 50)
+    score = (left_conf + right_conf) / 2.0
+    if not differences:
+        score -= 8.0
+    elif len(differences) >= 3:
+        score += 5.0
+    return int(max(5.0, min(95.0, score)))
+
+
 def compare_analyses(
     left: dict[str, Any],
     right: dict[str, Any],
@@ -196,6 +227,24 @@ def compare_analyses(
         f"Margin & Moat: {margin_moat_bullets[0]} "
         f"TL;DR Verdict: {tldr_verdict}"
     )
+    guidance_shift = "unchanged"
+    if left.get("guidance_signal") != right.get("guidance_signal"):
+        guidance_shift = f"{right.get('guidance_signal')} -> {left.get('guidance_signal')}"
+    evidence_ranked = _rank_evidence(left, right, max_items=6)
+    compare_confidence = _compare_confidence(left, right, differences)
+    rationale: list[str] = []
+    rationale.append(f"Guidance shift: {guidance_shift}.")
+    rationale.append(
+        f"Risk delta: +{len(left_risk_only)} unique to {left_label}, +{len(right_risk_only)} unique to {right_label}."
+    )
+    rationale.append(f"Evidence snippets considered: {len(evidence_ranked)}.")
+    change_summary = {
+        "new_risks": left_risk_only[:8],
+        "resolved_risks": right_risk_only[:8],
+        "guidance_shift": guidance_shift,
+        "evidence_ranked": evidence_ranked,
+        "plain_english_rationale": rationale,
+    }
     return {
         "ok": True,
         "mode": mode,
@@ -213,6 +262,8 @@ def compare_analyses(
         "top_differences": top_differences,
         "top_commonalities": top_commonalities,
         "investor_takeaway": investor_takeaway,
+        "change_summary": change_summary,
+        "compare_confidence": compare_confidence,
     }
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import time
 import uuid
@@ -11,7 +12,7 @@ from typing import Any
 
 import stripe
 from celery.result import AsyncResult
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +37,7 @@ from .cors_config import build_allowed_origins
 from .db import DATABASE_URL, Base, SessionLocal, engine
 from .models import AppState, BacktestRun, Order, Position, ScanResult, User, UserCredential
 from .prometheus_metrics import render_prometheus_text
+from .redaction import safe_exception_message
 from .saas_redis import acquire_scan_cooldown, fixed_window_rate_limit, redis_ping
 from .scan_payload import parse_scan_run_body
 from .schemas import (
@@ -72,6 +74,7 @@ from .tenant_runtime import (
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 _ALEMBIC_INI = APP_DIR.parent / "alembic.ini"
+LOG = logging.getLogger("webapp.saas")
 
 if os.getenv("SAAS_BOOTSTRAP_SCHEMA", "").lower() in ("1", "true", "yes"):
     Base.metadata.create_all(bind=engine)
@@ -85,6 +88,28 @@ if os.getenv("SAAS_BOOTSTRAP_SCHEMA", "").lower() in ("1", "true", "yes"):
 elif DATABASE_URL.startswith("sqlite"):
     Base.metadata.create_all(bind=engine)
 
+
+def _validate_startup_configuration() -> None:
+    if not _is_production_like():
+        return
+    required = (
+        "DATABASE_URL",
+        "REDIS_URL",
+        "CREDENTIAL_ENCRYPTION_KEY",
+        "OAUTH_STATE_SECRET",
+        "SUPABASE_URL",
+        "SUPABASE_ANON_KEY",
+        "SUPABASE_JWT_SECRET",
+        "SUPABASE_JWT_AUDIENCE",
+        "SUPABASE_JWT_ISSUER",
+        "WEB_ALLOWED_ORIGINS",
+    )
+    missing = [key for key in required if not (os.getenv(key) or "").strip()]
+    if missing:
+        joined = ", ".join(missing)
+        raise RuntimeError(f"Missing required production configuration: {joined}")
+
+
 app = FastAPI(
     title="TradingBot SaaS API",
     version="1.0.0",
@@ -97,7 +122,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Request-ID", "Idempotency-Key"],
 )
 
@@ -231,8 +256,98 @@ def _load_state(db: Session, user_id: str, key: str, default: dict[str, Any]) ->
     return parsed if isinstance(parsed, dict) else default
 
 
+def _save_user_task_binding(db: Session, user_id: str, task_scope: str, task_id: str) -> None:
+    key = f"task_binding:{task_scope}:{task_id}"
+    _save_state(
+        db,
+        user_id,
+        key,
+        {
+            "task_id": task_id,
+            "scope": task_scope,
+            "bound_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def _require_user_task_binding(db: Session, user_id: str, task_scope: str, task_id: str) -> None:
+    key = f"task_binding:{task_scope}:{task_id}"
+    row = db.query(AppState).filter(AppState.user_id == user_id, AppState.key == key).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Task not found for this user.")
+
+
+def _is_production_like() -> bool:
+    env = (os.getenv("ENV") or os.getenv("APP_ENV") or "").strip().lower()
+    if env in ("prod", "production", "staging"):
+        return True
+    if (os.getenv("RENDER") or "").strip():
+        return True
+    return False
+
+
+_validate_startup_configuration()
+
+
+def _require_metrics_access(
+    request: Request,
+    x_internal_key: str | None = Header(default=None, alias="X-Internal-Key"),
+) -> None:
+    configured = (os.getenv("WEB_INTERNAL_API_KEY") or "").strip()
+    if configured:
+        if not x_internal_key or x_internal_key != configured:
+            raise HTTPException(status_code=401, detail="Invalid or missing X-Internal-Key.")
+        return
+    host = (request.client.host if request.client else "").strip()
+    if host in ("127.0.0.1", "::1", "localhost"):
+        return
+    if _is_production_like():
+        raise HTTPException(
+            status_code=503,
+            detail="Metrics endpoint requires WEB_INTERNAL_API_KEY in production.",
+        )
+
+
 def _is_schwab_linked(db: Session, user_id: str) -> bool:
     return user_has_account_session(db, user_id)
+
+
+def _scan_lifecycle_payload(
+    task_id: str,
+    task_status: str,
+    *,
+    worker_queue: dict[str, Any] | None = None,
+    task_result: dict[str, Any] | None = None,
+    last_scan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    status = str(task_status or "pending").lower()
+    phase_map = {
+        "pending": "queued",
+        "received": "queued",
+        "started": "running",
+        "retry": "running",
+        "success": "completed",
+        "failure": "failed",
+        "revoked": "failed",
+    }
+    out: dict[str, Any] = {
+        "mode": "saas",
+        "transport": "celery",
+        "job_id": (task_result or {}).get("job_id"),
+        "task_id": task_id,
+        "status": status,
+        "phase": phase_map.get(status, status),
+        "worker_queue": worker_queue or {},
+        "signals_found": (task_result or {}).get("signals_found"),
+        "scan_id": ((task_result or {}).get("diagnostics") or {}).get("scan_id")
+        if isinstance((task_result or {}).get("diagnostics"), dict)
+        else None,
+    }
+    if task_result is not None:
+        out["result"] = task_result
+    if last_scan is not None:
+        out["last_scan"] = last_scan
+    return out
 
 
 def _scan_rate_limit(user_id: str) -> None:
@@ -279,6 +394,32 @@ def _celery_queue_estimate() -> dict[str, Any]:
         }
     except Exception:
         return {"inspect_available": False}
+
+
+def _celery_worker_health() -> dict[str, Any]:
+    try:
+        insp = celery_app.control.inspect(timeout=0.75)
+        if not insp:
+            return {"reachable": False, "workers": 0, "queues": []}
+        ping = insp.ping() or {}
+        active_queues = insp.active_queues() or {}
+        queues: set[str] = set()
+        for worker_queues in active_queues.values():
+            if not isinstance(worker_queues, list):
+                continue
+            for queue in worker_queues:
+                if not isinstance(queue, dict):
+                    continue
+                name = str(queue.get("name") or "").strip()
+                if name:
+                    queues.add(name)
+        return {
+            "reachable": bool(ping),
+            "workers": len(ping),
+            "queues": sorted(queues),
+        }
+    except Exception:
+        return {"reachable": False, "workers": 0, "queues": []}
 
 
 def _order_rate_limit(user_id: str) -> None:
@@ -342,6 +483,9 @@ def public_config() -> ApiResponse:
         "schwab_oauth": schwab_oauth,
         "schwab_market_oauth": schwab_market_oauth,
         "saas_mode": True,
+        "scan_transport": "celery",
+        "sse_enabled": False,
+        "manual_jwt_entry_enabled": False,
         "platform_live_trading_kill_switch": plat_kill,
         # Helps hosted dashboards explain “works locally, not on Render” without exposing secrets.
         "auth_setup": {
@@ -362,7 +506,10 @@ def public_config() -> ApiResponse:
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
-def prometheus_metrics() -> PlainTextResponse:
+def prometheus_metrics(
+    request: Request,
+    _auth: None = Depends(_require_metrics_access),
+) -> PlainTextResponse:
     return PlainTextResponse(
         render_prometheus_text(),
         media_type="text/plain; version=0.0.4; charset=utf-8",
@@ -429,7 +576,7 @@ def health_live() -> ApiResponse:
 
 
 @app.get("/api/health/ready", response_model=ApiResponse)
-def health_ready() -> ApiResponse:
+def health_ready(response: Response) -> ApiResponse:
     db_ok = False
     try:
         s = SessionLocal()
@@ -441,13 +588,23 @@ def health_ready() -> ApiResponse:
     except Exception:
         db_ok = False
     redis_ok = redis_ping()
+    worker = _celery_worker_health()
+    worker_ok = bool(worker.get("reachable")) and bool(worker.get("workers", 0))
+    required_queues = {"scan", "orders"}
+    queues_ok = required_queues.issubset({str(q) for q in worker.get("queues", [])})
     require_redis = os.getenv("SAAS_HEALTH_REQUIRE_REDIS", "1").lower() in ("1", "true", "yes")
-    ready = db_ok and (redis_ok if require_redis else True)
+    ready = db_ok and (redis_ok if require_redis else True) and worker_ok and queues_ok
+    if not ready:
+        response.status_code = 503
     return _ok(
         {
             "status": "ready" if ready else "not_ready",
             "database": db_ok,
             "redis": redis_ok,
+            "workers": worker,
+            "required_queues": sorted(required_queues),
+            "worker_ok": worker_ok,
+            "queues_ok": queues_ok,
             "time": datetime.now(timezone.utc).isoformat(),
         }
     )
@@ -457,6 +614,13 @@ def health_ready() -> ApiResponse:
 def me(user: User = Depends(get_current_user), db: Session = Depends(_db)) -> ApiResponse:
     linked = _is_schwab_linked(db, user.id)
     period_end = user.subscription_current_period_end.isoformat() if user.subscription_current_period_end else None
+    next_steps: list[str] = []
+    if not linked:
+        next_steps.append("Connect Schwab account and market OAuth in Setup.")
+    if linked and not bool(getattr(user, "live_execution_enabled", False)):
+        next_steps.append("Review risk acknowledgement and enable live trading when ready.")
+    if bool(getattr(user, "trading_halted", False)):
+        next_steps.append("Trading is paused. Disable account pause in Strategy Presets to approve orders.")
     return _ok(
         {
             "id": user.id,
@@ -471,6 +635,7 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(_db)) -> Ap
             "has_stripe_customer": bool(user.stripe_customer_id),
             "billing_enforced": billing_enforcement_enabled(),
             "subscription_active": user_has_paid_entitlement(user),
+            "next_steps": next_steps,
         }
     )
 
@@ -551,7 +716,12 @@ def billing_checkout_session(
     try:
         url = create_subscription_checkout_session(user, success, cancel)
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        LOG.warning(
+            "billing_checkout_session failed for user %s: %s",
+            user.id,
+            safe_exception_message(exc, fallback="checkout_error"),
+        )
+        raise HTTPException(status_code=503, detail="Checkout session is temporarily unavailable.") from exc
     log_audit(
         db,
         action="billing_checkout_session_created",
@@ -582,7 +752,12 @@ def billing_portal_session(
     try:
         url = create_billing_portal_session(user, return_url)
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        LOG.warning(
+            "billing_portal_session failed for user %s: %s",
+            user.id,
+            safe_exception_message(exc, fallback="portal_error"),
+        )
+        raise HTTPException(status_code=503, detail="Billing portal is temporarily unavailable.") from exc
     log_audit(
         db,
         action="billing_portal_session_created",
@@ -791,6 +966,7 @@ def run_scan(
             detail=f"A scan was started recently; wait up to {cooldown}s before retrying.",
         )
     task = scan_for_user.apply_async(args=[user.id, scan_opts], queue="scan")
+    _save_user_task_binding(db, user.id, "scan", task.id)
     log_audit(
         db,
         action="scan_queued",
@@ -816,9 +992,11 @@ def run_scan(
 @app.get("/api/scan/{task_id}", response_model=ApiResponse)
 def scan_task_status(
     task_id: str,
+    include_recent: bool = Query(default=False),
     user: User = Depends(get_current_user),
     db: Session = Depends(_db),
 ) -> ApiResponse:
+    _require_user_task_binding(db, user.id, "scan", task_id)
     task = AsyncResult(task_id, app=celery_app)
     payload: dict[str, Any] = {
         "task_id": task_id,
@@ -828,25 +1006,74 @@ def scan_task_status(
     if task.ready():
         result = task.result if isinstance(task.result, dict) else {"raw_result": str(task.result)}
         payload["result"] = result
-    recent = (
-        db.query(ScanResult)
-        .filter(ScanResult.user_id == user.id)
-        .order_by(ScanResult.created_at.desc())
-        .limit(25)
-        .all()
-    )
-    payload["recent_results"] = [
-        {
-            "id": row.id,
-            "job_id": row.job_id,
-            "ticker": row.ticker,
-            "signal_score": row.signal_score,
-            "created_at": row.created_at.isoformat() if row.created_at else None,
-            "payload": parse_json(row.payload_json, {}),
-        }
-        for row in recent
-    ]
+    if include_recent:
+        recent = (
+            db.query(ScanResult)
+            .filter(ScanResult.user_id == user.id)
+            .order_by(ScanResult.created_at.desc())
+            .limit(25)
+            .all()
+        )
+        payload["recent_results"] = [
+            {
+                "id": row.id,
+                "job_id": row.job_id,
+                "ticker": row.ticker,
+                "signal_score": row.signal_score,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "payload": parse_json(row.payload_json, {}),
+            }
+            for row in recent
+        ]
     return _ok(payload)
+
+
+@app.get("/api/scan-lifecycle", response_model=ApiResponse)
+def scan_lifecycle(
+    task_id: str | None = Query(default=None, max_length=64),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(_db),
+) -> ApiResponse:
+    worker_queue = _celery_queue_estimate()
+    tid = (task_id or "").strip()
+    if tid:
+        _require_user_task_binding(db, user.id, "scan", tid)
+        task = AsyncResult(tid, app=celery_app)
+        result = None
+        if task.ready():
+            result = task.result if isinstance(task.result, dict) else {"raw_result": str(task.result)}
+        return _ok(
+            _scan_lifecycle_payload(
+                tid,
+                task.status,
+                worker_queue=worker_queue,
+                task_result=result,
+            )
+        )
+    last_scan = _load_state(
+        db,
+        user.id,
+        "last_scan",
+        default={
+            "at": None,
+            "signals_found": None,
+            "job_id": None,
+            "diagnostics": None,
+            "diagnostics_summary": None,
+            "strategy_summary": None,
+        },
+    )
+    out = _scan_lifecycle_payload(
+        "",
+        "idle",
+        worker_queue=worker_queue,
+        task_result=None,
+        last_scan=last_scan,
+    )
+    out["task_id"] = None
+    out["status"] = "idle"
+    out["phase"] = "idle"
+    return _ok(out)
 
 
 @app.get("/api/scan-results", response_model=ApiResponse)
@@ -891,6 +1118,7 @@ def execute_order() -> None:
 
 @app.get("/api/orders/{task_id}", response_model=ApiResponse)
 def order_task_status(task_id: str, user: User = Depends(get_current_user), db: Session = Depends(_db)) -> ApiResponse:
+    _require_user_task_binding(db, user.id, "order", task_id)
     task = AsyncResult(task_id, app=celery_app)
     rows = db.query(Order).filter(Order.user_id == user.id).order_by(Order.created_at.desc()).limit(25).all()
     return _ok(
@@ -953,7 +1181,12 @@ def sync_positions(
         with tenant_skill_dir(db, user.id) as skill_dir:
             status_data = get_account_status(skill_dir=skill_dir)
     except Exception as exc:
-        return _err(str(exc))
+        LOG.warning(
+            "positions sync failed for user %s: %s",
+            user.id,
+            safe_exception_message(exc, fallback="positions_sync_error"),
+        )
+        return _err("Unable to sync positions right now.")
     if isinstance(status_data, str):
         return _err(status_data)
 
@@ -1024,7 +1257,12 @@ def queue_backtest_run(
     try:
         out = create_and_queue_backtest(db, user.id, payload.spec)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        LOG.warning(
+            "backtest queue failed for user %s: %s",
+            user.id,
+            safe_exception_message(exc, fallback="backtest_queue_error"),
+        )
+        raise HTTPException(status_code=400, detail="Unable to queue backtest from the supplied strategy spec.") from exc
     log_audit(
         db,
         action="backtest_queued",
@@ -1092,6 +1330,8 @@ def backtest_run_task_status(
     db: Session = Depends(_db),
 ) -> ApiResponse:
     row = db.query(BacktestRun).filter(BacktestRun.user_id == user.id, BacktestRun.celery_task_id == task_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Task not found for this user.")
     task = AsyncResult(task_id, app=celery_app)
     payload: dict[str, Any] = {"task_id": task_id, "celery_status": task.status.lower()}
     if row:
@@ -1127,9 +1367,15 @@ def strategy_chat_endpoint(
     try:
         out = run_strategy_chat(db, user.id, payload.messages)
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except Exception as exc:
-        return _err(str(exc))
+        LOG.warning(
+            "strategy chat runtime failure for user %s: %s",
+            user.id,
+            safe_exception_message(exc, fallback="strategy_chat_runtime_error"),
+        )
+        raise HTTPException(status_code=503, detail="Strategy chat is temporarily unavailable.") from exc
+    except Exception:
+        LOG.exception("strategy chat failed for user %s", user.id)
+        return _err("Strategy chat request failed.")
     log_audit(
         db,
         action="strategy_chat",

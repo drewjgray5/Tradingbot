@@ -51,6 +51,21 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _slope_per_step(values: pd.Series) -> float:
+    """Return linear-regression slope per step for a numeric series."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    x_mean = (n - 1) / 2.0
+    y_vals = [float(v) for v in values]
+    y_mean = sum(y_vals) / n
+    denom = sum((i - x_mean) ** 2 for i in range(n))
+    if denom <= 0:
+        return 0.0
+    numer = sum((i - x_mean) * (y_vals[i] - y_mean) for i in range(n))
+    return numer / denom
+
+
 def is_stage_2(df: pd.DataFrame, skill_dir: Path | None = None) -> bool:
     """
     True only if ALL conditions hold on most recent trading day:
@@ -76,9 +91,8 @@ def is_stage_2(df: pd.DataFrame, skill_dir: Path | None = None) -> bool:
     if len(sma_200) < n_days:
         return False
     last_n = sma_200.iloc[-n_days:]
-    for i in range(1, len(last_n)):
-        if last_n.iloc[i] <= last_n.iloc[i - 1]:
-            return False
+    if _slope_per_step(last_n) <= 0:
+        return False
 
     pct_min = get_stage2_52w_pct(skill_dir)
     lookback = min(TRADING_DAYS_52W, len(df))
@@ -107,6 +121,7 @@ def compute_signal_score(
     df: pd.DataFrame,
     mirofish_conviction: int | float | None = None,
     mirofish_result: dict | None = None,
+    skill_dir: Path | None = None,
 ) -> float:
     """
     Score 0-100 for ranking signals. Higher = stronger setup.
@@ -117,7 +132,9 @@ def compute_signal_score(
             df,
             mirofish_conviction=mirofish_conviction,
             mirofish_result=mirofish_result,
+            skill_dir=skill_dir,
         )["score"]
+        or 0.0
     )
 
 
@@ -125,6 +142,7 @@ def compute_signal_components(
     df: pd.DataFrame,
     mirofish_conviction: int | float | None = None,
     mirofish_result: dict | None = None,
+    skill_dir: Path | None = None,
 ) -> dict[str, float | int | None]:
     """
     Structured signal score breakdown for diagnostics and quality gates.
@@ -156,11 +174,16 @@ def compute_signal_components(
     continuation_prob: float | None = None
 
     # 52w proximity (0-40): closer to high = higher
+    from config import get_stage2_52w_pct
+
+    stage2_floor = float(get_stage2_52w_pct(skill_dir))
+    stage2_floor = max(0.5, min(0.99, stage2_floor))
+    floor_span = max(0.01, 1.0 - stage2_floor)
     lookback = min(TRADING_DAYS_52W, len(df))
     high_52w = float(df["high"].iloc[-lookback:].max())
     if high_52w > 0:
         pct_from_high = price / high_52w
-        pts_52w = max(0, (pct_from_high - 0.85) / 0.15) * 40  # 0.85->0, 1.0->40
+        pts_52w = max(0, (pct_from_high - stage2_floor) / floor_span) * 40
         score += pts_52w
 
     # SMA alignment strength (0-25): how far price above each SMA

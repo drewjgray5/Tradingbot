@@ -17,6 +17,15 @@ from .db import SessionLocal
 from .models import User
 
 
+def _is_production_like() -> bool:
+    env = (os.getenv("ENV") or os.getenv("APP_ENV") or "").strip().lower()
+    if env in ("prod", "production", "staging"):
+        return True
+    if (os.getenv("RENDER") or "").strip():
+        return True
+    return False
+
+
 def _parse_datetime(raw: str | None) -> datetime | None:
     if not raw:
         return None
@@ -95,6 +104,16 @@ def _jwt_verify_issuer() -> str | None:
     return iss or None
 
 
+def _enforce_production_claim_config(aud: str | None, iss: str | None) -> None:
+    strict_raw = (os.getenv("SUPABASE_JWT_STRICT_CLAIMS") or "").strip().lower()
+    strict = strict_raw in ("1", "true", "yes", "on") or (strict_raw == "" and _is_production_like())
+    if strict and (not aud or not iss):
+        raise HTTPException(
+            status_code=503,
+            detail="Set SUPABASE_JWT_AUDIENCE and SUPABASE_JWT_ISSUER for production JWT validation.",
+        )
+
+
 def _supabase_jwks_url() -> str:
     base = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
     if not base:
@@ -136,6 +155,7 @@ def _decode_supabase_jwt_symmetric(token: str) -> dict[str, Any]:
         )
     aud = _jwt_verify_audience()
     iss = _jwt_verify_issuer()
+    _enforce_production_claim_config(aud, iss)
     leeway = _jwt_leeway_seconds()
     opts: dict[str, Any] = {"verify_aud": bool(aud)}
     last_exc: jwt.PyJWTError | None = None
@@ -162,7 +182,7 @@ def _decode_supabase_jwt_symmetric(token: str) -> dict[str, Any]:
             "not a refresh token or API key."
         )
     else:
-        detail = f"Invalid JWT: {last_exc}"
+        detail = "Invalid JWT."
     raise HTTPException(status_code=401, detail=detail) from last_exc
 
 
@@ -170,6 +190,7 @@ def _decode_supabase_jwt_asymmetric(token: str, alg: str) -> dict[str, Any]:
     jwks_url = _supabase_jwks_url()
     aud = _jwt_verify_audience()
     iss = _jwt_verify_issuer()
+    _enforce_production_claim_config(aud, iss)
     leeway = _jwt_leeway_seconds()
     opts: dict[str, Any] = {"verify_aud": bool(aud)}
     try:
@@ -188,13 +209,12 @@ def _decode_supabase_jwt_asymmetric(token: str, alg: str) -> dict[str, Any]:
     except HTTPException:
         raise
     except jwt.PyJWTError as exc:
-        raise HTTPException(status_code=401, detail=f"Invalid JWT: {exc}") from exc
+        raise HTTPException(status_code=401, detail="Invalid JWT.") from exc
     except Exception as exc:
         raise HTTPException(
             status_code=503,
             detail=(
-                f"Could not verify JWT against Supabase JWKS ({jwks_url}): {exc}. "
-                "Confirm SUPABASE_URL matches your project API URL and the API host can reach the internet."
+                "Could not verify JWT against Supabase JWKS. Confirm SUPABASE_URL and outbound internet access."
             ),
         ) from exc
 
@@ -210,7 +230,7 @@ def decode_supabase_jwt(token: str) -> dict[str, Any]:
                 "not a refresh token or API key."
             )
         else:
-            detail = f"Invalid JWT: {exc}"
+            detail = "Invalid JWT."
         raise HTTPException(status_code=401, detail=detail) from exc
 
     alg = str(header.get("alg") or "").upper()

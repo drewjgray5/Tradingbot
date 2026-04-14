@@ -1,0 +1,68 @@
+---
+description: Python coding patterns for the TradingBot schwab_skill codebase
+globs: schwab_skill/**/*.py
+alwaysApply: false
+---
+
+# Python Patterns
+
+## FastAPI Routes
+
+```python
+@app.post("/api/endpoint", response_model=ApiResponse)
+async def endpoint_name(
+    body: RequestModel,
+    _auth: dict[str, str] = Depends(require_api_key_if_set),
+    db: Session = Depends(get_db),
+):
+    try:
+        result = do_work(db, body)
+        return _ok(result)
+    except Exception as exc:
+        return _err("endpoint_name", exc)
+```
+
+- Use `response_model=ApiResponse` on all API routes
+- `Depends(require_trade_api_key)` for trade-mutating endpoints (approve/reject/clear)
+- `Depends(require_api_key_if_set)` for other mutating endpoints
+- Read-only GET endpoints need no auth dependency
+
+## Database
+
+- SQLAlchemy 2.x ORM with `declarative_base()`
+- `get_db()` generator for session lifecycle
+- Local: SQLite at `webapp/webapp.db`; SaaS: Postgres via `DATABASE_URL`
+- Schema changes via Alembic migrations
+- `Base.metadata.create_all(bind=engine)` at startup for initial tables
+
+## Config Loading
+
+```python
+import os
+val = os.environ.get("ENV_VAR_NAME", "default")
+```
+
+- Every config var has a hardcoded default
+- Booleans: check `.lower() in ("1", "true", "yes", "on")`
+- Plugin modes validate against `("off", "shadow", "live")`
+
+## Scanner Functions
+
+- Return `tuple[list[dict[str, Any]], dict[str, Any]]` for (signals, diagnostics)
+- Diagnostics is a flat dict with counter keys initialized to 0
+- Increment counters as filters reject tickers: `diagnostics["stage2_fail"] += 1`
+
+## Scheduled Tasks
+
+```python
+schedule.every().minute.do(_run_task_if_scheduled)
+```
+
+- Minute-level schedule with NY timezone guards inside the function
+- Dedup with `nonlocal last_key` pattern to prevent double-runs
+
+## Error Handling
+
+- Recoverable: `log.warning("Context: %s", err)` and continue
+- Critical: `log.exception("Context")` + `send_alert(...)` + `raise`
+- Never swallow exceptions silently

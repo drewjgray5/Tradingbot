@@ -143,13 +143,13 @@ def fetch_sec_snapshot(
     cache = _load_cache(skill_dir)
     entry = (cache.get("tickers") or {}).get(tkr)
     if _is_fresh(entry, cache_hours):
-        payload = dict(entry.get("payload") or {})
+        payload: dict[str, Any] = dict((entry or {}).get("payload") or {})
         payload["from_cache"] = True
         return payload
 
     import requests
     ua = _safe_user_agent(user_agent)
-    payload: dict[str, Any] = {
+    payload = {
         "ok": False,
         "ticker": tkr,
         "cik": "",

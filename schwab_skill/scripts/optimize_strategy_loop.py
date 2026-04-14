@@ -262,6 +262,65 @@ def _is_better_candidate(best_wf: dict[str, Any], candidate_wf: dict[str, Any], 
     return float(c["oos_expectancy"]) > float(b["oos_expectancy"])
 
 
+def _split_outperformance_count(best_wf: dict[str, Any], candidate_wf: dict[str, Any]) -> int:
+    best_rows = {str(r.get("name")): r for r in best_wf.get("splits", [])}
+    wins = 0
+    for row in candidate_wf.get("splits", []):
+        name = str(row.get("name"))
+        base = best_rows.get(name)
+        if not base:
+            continue
+        if float(row.get("profit_factor_net", 0) or 0) >= float(base.get("profit_factor_net", 0) or 0):
+            wins += 1
+    return wins
+
+
+def _run_robustness_probes(
+    params: dict[str, str],
+    *,
+    ticker_pool: list[str],
+    skip_mirofish: bool,
+    min_trades: int,
+) -> dict[str, Any]:
+    """
+    Extra guardrails against overfitting:
+    - Alternate ticker subset check
+    - Small parameter perturbation sensitivity check
+    """
+    rotated = ticker_pool[4:] + ticker_pool[:4]
+    alt_count = max(12, int(round(len(ticker_pool) * 0.75)))
+    alt_metrics = _evaluate_single(
+        params,
+        rotated[:alt_count],
+        start_date="2021-01-01",
+        skip_mirofish=skip_mirofish,
+        min_trades=min_trades,
+    )
+
+    perturb_pf: list[float] = []
+    perturb_objectives: list[float] = []
+    for delta in (-2, 2):
+        p = dict(params)
+        base_score = float(p.get("QUALITY_MIN_SIGNAL_SCORE", "50"))
+        p["QUALITY_MIN_SIGNAL_SCORE"] = _clamp("QUALITY_MIN_SIGNAL_SCORE", str(base_score + delta))
+        p = _normalize_params(p)
+        row = _evaluate_single(
+            p,
+            ticker_pool[: max(12, min(24, len(ticker_pool)))],
+            start_date="2022-01-01",
+            skip_mirofish=skip_mirofish,
+            min_trades=min_trades,
+        )
+        perturb_pf.append(float(row.get("profit_factor_net", 0) or 0))
+        perturb_objectives.append(float(row.get("objective", 0) or 0))
+
+    return {
+        "alt_subset": alt_metrics,
+        "perturbed_pf_min": round(min(perturb_pf) if perturb_pf else 0.0, 4),
+        "perturbed_objective_min": round(min(perturb_objectives) if perturb_objectives else 0.0, 4),
+    }
+
+
 def _apply_mutation(params: dict[str, str], key: str, op: str) -> tuple[dict[str, str], str]:
     out = dict(params)
     before = out[key]
@@ -351,6 +410,12 @@ def main() -> int:
         skip_mirofish=not args.include_mirofish,
         min_trades=args.min_trades,
     )
+    baseline_probes = _run_robustness_probes(
+        baseline_params,
+        ticker_pool=ticker_pool,
+        skip_mirofish=not args.include_mirofish,
+        min_trades=args.min_trades,
+    )
     baseline_obj = float(baseline_wf["aggregates"]["objective_mean"])
     best = EvalResult(params=baseline_params, walk_forward=baseline_wf, objective=baseline_obj, reason="baseline")
 
@@ -382,6 +447,35 @@ def main() -> int:
             max_drawdown_degrade=args.max_drawdown_degrade,
             min_oos_pf=args.min_oos_pf,
         )
+        split_wins = _split_outperformance_count(best.walk_forward, cand_wf)
+        if ok and split_wins < 2:
+            ok = False
+            reason = f"rejected: split_outperformance={split_wins}/3 (<2)"
+
+        candidate_probes = None
+        if ok:
+            candidate_probes = _run_robustness_probes(
+                candidate_params,
+                ticker_pool=ticker_pool,
+                skip_mirofish=not args.include_mirofish,
+                min_trades=args.min_trades,
+            )
+            baseline_alt_pf = float((baseline_probes.get("alt_subset") or {}).get("profit_factor_net", 0) or 0)
+            candidate_alt_pf = float((candidate_probes.get("alt_subset") or {}).get("profit_factor_net", 0) or 0)
+            if candidate_alt_pf < (baseline_alt_pf - 0.10):
+                ok = False
+                reason = (
+                    "rejected: alt_subset_pf dropped too much "
+                    f"({candidate_alt_pf:.3f} < {baseline_alt_pf - 0.10:.3f})"
+                )
+            perturbed_pf_min = float(candidate_probes.get("perturbed_pf_min", 0) or 0)
+            if ok and perturbed_pf_min < (args.min_oos_pf - 0.05):
+                ok = False
+                reason = (
+                    "rejected: perturbation sensitivity too high "
+                    f"(perturbed_pf_min={perturbed_pf_min:.3f})"
+                )
+
         accepted = bool(
             ok and _is_better_candidate(
                 best.walk_forward,
@@ -410,6 +504,8 @@ def main() -> int:
                 "reason": best.reason if accepted else (reason if not ok else "rejected: objective_not_improved"),
                 "objective": round(cand_obj, 4),
                 "aggregates": cand_wf["aggregates"],
+                "split_outperformance_count": split_wins,
+                "robustness_probes": candidate_probes,
                 "params": candidate_params,
             }
         )
@@ -425,6 +521,7 @@ def main() -> int:
         "started_with": baseline_params,
         "best_params": best.params,
         "baseline_walk_forward": baseline_wf,
+        "baseline_robustness_probes": baseline_probes,
         "best_walk_forward": best.walk_forward,
         "best_objective": round(best.objective, 4),
         "rounds_executed": len(history) - 1,

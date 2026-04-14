@@ -1,0 +1,47 @@
+---
+description: Core TradingBot project conventions, architecture, and coding standards
+alwaysApply: true
+---
+
+# TradingBot Project Conventions
+
+## Architecture
+
+Two deployment modes:
+- **Local** (`webapp/main.py`): single-user, SQLite, API key auth, `schedule`-based bot loop
+- **SaaS** (`webapp/main_saas.py` + `tenant_dashboard.py`): multi-tenant, Postgres, Supabase JWT auth, Stripe billing, Celery workers, Redis
+
+## Scanner Pipeline
+
+Stage A (parallel, cheap filters: Stage 2 + VCP) → shortlist → Stage B (enrichment: PEAD, forensic, SEC, advisory, quality gates, strategy ensemble). Regime gate (SPY > 200 SMA) can block entire scan.
+
+## Key Patterns
+
+- **Config**: all tunables via env vars loaded through `config.py`; process env overrides `.env` file; defaults hardcoded in getters
+- **Responses**: `ApiResponse(ok, data, error)` from `schemas.py`; use `_ok()` / `_err()` helpers in routes
+- **Plugins**: follow OFF → SHADOW → LIVE rollout; never skip shadow
+- **Diagnostics**: mutable `dict[str, Any]` passed through pipeline, returned alongside signals
+- **Market data**: Schwab primary with retry/backoff/circuit-breaker; yfinance and Polygon as fallbacks
+
+## Code Style
+
+- Python 3.11+; `from __future__ import annotations` in new files
+- Type hints: `str | None`, `dict[str, Any]`, `list[str]`
+- Logging: `from logger_setup import setup_logging, get_logger` in entry points; `LOG = logging.getLogger(__name__)` in library modules
+- Log format: `log.info("Message: %s", var)` — never f-strings in log calls
+- Error handling: `try/except Exception` with `log.warning` for recoverable, `log.exception` + Discord alert for critical
+- Imports: stdlib → third-party → local; heavy imports inside functions when only needed conditionally
+- No bare `except:` clauses
+
+## File Naming
+
+- Python: `snake_case.py`
+- Wiki: `lowercase-hyphenated.md`
+- Env vars: `SCREAMING_SNAKE_CASE`
+
+## Testing
+
+- `python -m pytest -q` for unit tests
+- `python -m ruff check .` for linting
+- `python -m ruff format .` for formatting
+- `python scripts/validate_all.py --profile local --strict` for full validation

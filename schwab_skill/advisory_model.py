@@ -493,7 +493,7 @@ def _apply_calibration_bins(raw_p: float, bins: list[dict[str, float]]) -> float
 def _binary_metrics(y: np.ndarray, p: np.ndarray) -> dict[str, float]:
     eps = 1e-8
     p = np.clip(p, eps, 1.0 - eps)
-    yb = y.astype(np.float64)
+    yb: np.ndarray = y.astype(np.float64)
     brier = float(np.mean((p - yb) ** 2))
     logloss = float(-np.mean(yb * np.log(p) + (1.0 - yb) * np.log(1.0 - p)))
     pred = (p >= 0.5).astype(np.int32)

@@ -24,7 +24,13 @@ STUDY_FILE = SKILL_DIR / ".self_study.json"
 _LOCK = threading.Lock()
 
 # Minimum round trips before suggesting conviction threshold
-MIN_ROUND_TRIPS_FOR_LEARNING = 5
+MIN_ROUND_TRIPS_FOR_LEARNING = 30
+
+# Minimum samples inside a conviction band before it can influence threshold.
+MIN_BAND_SAMPLES_FOR_THRESHOLD = 8
+
+# Empirical-Bayes style shrinkage strength for noisy band averages.
+CONVICTION_BAND_SHRINK_PRIOR_TRIPS = 12
 
 # Conviction bands for aggregation
 CONVICTION_BANDS = [(0, 20), (20, 40), (40, 60), (60, 80), (80, 101)]
@@ -292,14 +298,22 @@ def run_self_study(skill_dir: Path | None = None) -> dict[str, Any]:
             "avg_return_pct": round(sum(r.return_pct for r in trips) / len(trips), 2),
         }
 
-    # Suggest min conviction: find lowest band with positive avg return; require that or higher
+    # Suggest min conviction only when a band clears:
+    # - minimum support
+    # - shrinkage-adjusted positive expectancy
     if result["min_round_trips_met"] and result["by_conviction"]:
+        global_avg = float(result.get("avg_return_pct") or 0.0)
         best_min = 0
         for lo, hi in CONVICTION_BANDS:
             key = f"{lo}-{hi}"
             if key in result["by_conviction"]:
                 band = result["by_conviction"][key]
-                if band["avg_return_pct"] > 0 and band["count"] >= 2:
+                band_count = int(band.get("count", 0) or 0)
+                band_avg = float(band.get("avg_return_pct", 0.0) or 0.0)
+                shrunk_avg = (
+                    (band_avg * band_count) + (global_avg * CONVICTION_BAND_SHRINK_PRIOR_TRIPS)
+                ) / max(1, band_count + CONVICTION_BAND_SHRINK_PRIOR_TRIPS)
+                if band_count >= MIN_BAND_SAMPLES_FOR_THRESHOLD and shrunk_avg > 0:
                     best_min = max(best_min, lo)
         result["suggested_min_conviction"] = best_min if best_min > 0 else None
 

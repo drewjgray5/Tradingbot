@@ -4,9 +4,10 @@ const state = {
   lastWatchlistSize: null,
   approvingTradeId: null,
   approvingChecklist: null,
-  pendingFilter: "all",
+  pendingFilter: "pending",
   pendingSort: "newest",
   config: { auth_mode: "jwt" },
+  allowManualJwt: true,
   publicConfig: {
     supabase: null,
     saas_mode: false,
@@ -15,6 +16,7 @@ const state = {
     platform_live_trading_kill_switch: false,
   },
   accountMe: null,
+  twoFaStatus: null,
   reportRawView: false,
   lastReportData: null,
   activeReportTab: "summary",
@@ -32,6 +34,7 @@ const state = {
   queueScanDraft: null,
   /** Optional scan body: strategy_overrides, universe_mode, tickers (see /api/scan). */
   scanRunOptions: null,
+  sseEnabled: false,
 };
 
 const UI_VIEW_MODE_KEY = "tradingbot.ui.view_mode";
@@ -211,6 +214,70 @@ async function refreshAccountMe() {
   renderLiveTradingSaasPanel();
 }
 
+function renderTwoFaPanel() {
+  const wrap = document.getElementById("twoFaPanel");
+  if (!wrap) return;
+  const st = state.twoFaStatus || {};
+  const enabled = Boolean(st.enabled);
+  const threshold = Number(st.high_value_threshold_usd || 0);
+  const statusText = enabled
+    ? "2FA is enabled for high-value approvals."
+    : "2FA is currently disabled. High-value approvals will be blocked until enabled.";
+  const thresholdText = threshold > 0 ? `Threshold: ${formatMoney(threshold)} notional.` : "Threshold: not configured.";
+  wrap.innerHTML = `
+    <div class="muted small">${safeText(statusText)} ${safeText(thresholdText)}</div>
+    <div class="inline-form compact" style="margin-top: 0.5rem">
+      <button id="twoFaSetupBtn" type="button" class="btn small secondary">Generate 2FA secret</button>
+      <label class="field-label" for="twoFaCodeInput">TOTP code</label>
+      <input id="twoFaCodeInput" type="text" inputmode="numeric" maxlength="8" placeholder="123456" />
+      <button id="twoFaEnableBtn" type="button" class="btn small secondary">Enable 2FA</button>
+    </div>
+    <pre id="twoFaSetupOutput" class="code-block code-block--tight hidden" style="margin-top: 0.5rem"></pre>
+  `;
+  document.getElementById("twoFaSetupBtn")?.addEventListener("click", async () => {
+    const out = await api.post("/api/security/2fa/setup", {});
+    if (!out.ok) {
+      updateActionCenter({ title: "2FA setup failed", message: safeText(out.error), severity: "error" });
+      return;
+    }
+    const pre = document.getElementById("twoFaSetupOutput");
+    if (pre) {
+      pre.classList.remove("hidden");
+      pre.textContent = `Secret: ${safeText(out.data?.secret)}\nAdd this to your authenticator app.\nURI:\n${safeText(out.data?.otpauth_uri)}`;
+    }
+    updateActionCenter({
+      title: "2FA secret generated",
+      message: "Add the secret in your authenticator app, then enter a code and click Enable 2FA.",
+      severity: "info",
+    });
+  });
+  document.getElementById("twoFaEnableBtn")?.addEventListener("click", async () => {
+    const code = document.getElementById("twoFaCodeInput")?.value?.trim() || "";
+    if (!code) {
+      updateActionCenter({ title: "2FA code required", message: "Enter a current authenticator code.", severity: "warn" });
+      return;
+    }
+    const out = await api.post("/api/security/2fa/enable", { otp_code: code });
+    if (!out.ok) {
+      updateActionCenter({ title: "2FA enable failed", message: safeText(out.error), severity: "error" });
+      return;
+    }
+    updateActionCenter({ title: "2FA enabled", message: "High-value approvals now require OTP verification.", severity: "success" });
+    await refreshTwoFaStatus();
+  });
+}
+
+async function refreshTwoFaStatus() {
+  if (!state.publicConfig?.saas_mode) {
+    state.twoFaStatus = null;
+    renderTwoFaPanel();
+    return;
+  }
+  const out = await api.get("/api/security/2fa/status");
+  state.twoFaStatus = out.ok ? out.data || null : null;
+  renderTwoFaPanel();
+}
+
 async function submitEnableLiveTrading() {
   const ack = Boolean(document.getElementById("enableLiveRiskAck")?.checked);
   const phrase = document.getElementById("enableLiveTypedPhrase")?.value?.trim() || "";
@@ -237,7 +304,7 @@ async function submitEnableLiveTrading() {
 }
 
 async function refreshCritical() {
-  await Promise.all([refreshStatus(), refreshAccountMe(), refreshPending()]);
+  await Promise.all([refreshStatus(), refreshAccountMe(), refreshPending(), refreshTwoFaStatus()]);
 }
 
 const AUTH_TOKEN_KEY = "tradingbot.jwt";
@@ -275,16 +342,20 @@ function normalizeUserJwt(raw) {
 }
 
 async function getApiAccessToken() {
-  const manual = normalizeUserJwt(document.getElementById("jwtInput")?.value ?? "");
-  if (manual) {
-    if (!AuthJwt.isProbablyAccessJwt(manual)) {
-      console.warn(AuthJwt.JWT_BAD_SHAPE_HINT);
-      return "";
+  if (state.allowManualJwt) {
+    const manual = normalizeUserJwt(document.getElementById("jwtInput")?.value ?? "");
+    if (manual) {
+      if (!AuthJwt.isProbablyAccessJwt(manual)) {
+        console.warn(AuthJwt.JWT_BAD_SHAPE_HINT);
+        return "";
+      }
+      return manual;
     }
-    return manual;
   }
-  const stored = readStoredApiJwt();
-  if (stored) return stored;
+  if (state.allowManualJwt) {
+    const stored = readStoredApiJwt();
+    if (stored) return stored;
+  }
   if (state.config?.auth_mode === "supabase" && supabaseClient) {
     const { data, error } = await supabaseClient.auth.getSession();
     if (error) console.warn("auth.getSession", error);
@@ -392,8 +463,10 @@ const SUPABASE_ESM = "https://esm.sh/@supabase/supabase-js@2.49.1";
 function persistApiJwtFromSession(session) {
   const at = normalizeUserJwt(session?.access_token ?? "");
   if (at && AuthJwt.isProbablyAccessJwt(at)) {
-    localStorage.setItem(AUTH_TOKEN_KEY, at);
-    clearLegacyApiJwtKeys();
+    if (state.allowManualJwt) {
+      localStorage.setItem(AUTH_TOKEN_KEY, at);
+      clearLegacyApiJwtKeys();
+    }
     void createCookieAuthSession(at);
     const inp = document.getElementById("jwtInput");
     if (inp) inp.value = "";
@@ -535,9 +608,15 @@ const api = {
       "Content-Type": "application/json",
       ...(fetchOptions.headers || {}),
     };
+    if (!headers["X-Request-ID"]) {
+      headers["X-Request-ID"] = `ui-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    }
 
     const token = await getApiAccessToken();
     if (token) headers.Authorization = `Bearer ${token}`;
+
+    const apiKey = state.publicConfig?.api_key_required ? (localStorage.getItem("tradingbot.api_key") || "") : "";
+    if (apiKey) headers["X-API-Key"] = apiKey;
 
     try {
       const res = await fetch(path, {
@@ -763,6 +842,129 @@ function renderPerformancePanel(rootEl, data, { error } = {}) {
     ${outcomesTable || `<p class="muted perf-outcomes-empty">No recent outcome rows yet.</p>`}
   `;
   if (rawDetails && data && !error && getDisplayMode() === "pro") rawDetails.open = true;
+
+  const ch = data && data.challenger && typeof data.challenger === "object" ? data.challenger : null;
+  if (ch && ch.available && ch.latest) {
+    const challengerPanel = document.getElementById("challengerPanel");
+    if (challengerPanel) renderChallengerPanel(challengerPanel, ch);
+  }
+}
+
+function renderChallengerPanel(rootEl, ch) {
+  if (!rootEl || !ch) return;
+  const latest = ch.latest && typeof ch.latest === "object" ? ch.latest : null;
+  const wr = ch.win_rate && typeof ch.win_rate === "object" ? ch.win_rate : {};
+  if (!latest) {
+    rootEl.innerHTML = "";
+    return;
+  }
+  const v = safeText(latest.verdict || "?");
+  const delta = latest.score_delta != null ? Number(latest.score_delta).toFixed(1) : "?";
+  const champ = latest.champion || {};
+  const chall = latest.challenger || {};
+  let verdictClass = "bg-slate-900";
+  if (v === "challenger_better") verdictClass = "bg-green-900";
+  else if (v === "champion_better") verdictClass = "bg-red-900";
+
+  const overrides = latest.env_overrides && typeof latest.env_overrides === "object"
+    ? Object.entries(latest.env_overrides).map(([k, val]) => `<code>${safeText(k)}=${safeText(val)}</code>`).join(", ")
+    : "none";
+
+  let wrLine = "";
+  if (wr.total_runs > 0) {
+    wrLine = `<p class="muted">Overall: ${safeText(wr.total_runs)} runs — Challenger wins ${safeText(wr.challenger_wins)}, Champion wins ${safeText(wr.champion_wins)}, Ties ${safeText(wr.ties)} (${safeText(wr.challenger_win_rate_pct)}% challenger win rate)</p>`;
+  }
+
+  rootEl.innerHTML = `
+    <h3>Champion vs Challenger</h3>
+    <div class="performance-buckets">
+      <div class="perf-bucket">
+        <h3>Champion (current)</h3>
+        <div class="perf-metric"><span class="label">Signals</span><span class="value">${safeText(champ.count)}</span></div>
+        <div class="perf-metric"><span class="label">Avg score</span><span class="value">${safeText(champ.avg_score)}</span></div>
+        <div class="perf-metric"><span class="label">Top ticker</span><span class="value">${safeText(champ.top_ticker || "—")}</span></div>
+      </div>
+      <div class="perf-bucket">
+        <h3>Challenger (suggested)</h3>
+        <div class="perf-metric"><span class="label">Signals</span><span class="value">${safeText(chall.count)}</span></div>
+        <div class="perf-metric"><span class="label">Avg score</span><span class="value">${safeText(chall.avg_score)}</span></div>
+        <div class="perf-metric"><span class="label">Top ticker</span><span class="value">${safeText(chall.top_ticker || "—")}</span></div>
+      </div>
+    </div>
+    <div class="performance-validation">
+      <span class="health-badge ${verdictClass}">${v.replace(/_/g, " ")}</span>
+      <span class="muted">Score delta: <strong>${delta}</strong></span>
+      <span class="muted">Run: ${safeText(latest.run_at || "?")}</span>
+    </div>
+    <p class="muted" style="margin-top:0.5rem">Overrides tested: ${overrides}</p>
+    ${wrLine}
+  `;
+}
+
+function renderEvolvePanel(rootEl, data) {
+  const rawDetails = document.getElementById("learningRawDetails");
+  const rawPre = document.getElementById("learningRaw");
+  if (!rootEl) return;
+  if (rawPre && data) rawPre.textContent = prettyJson(data);
+  if (rawDetails && data) rawDetails.classList.remove("hidden");
+
+  if (!data || typeof data !== "object") {
+    rootEl.innerHTML = `<div class="report-empty">No learning engine results yet.</div>`;
+    return;
+  }
+  if (data.status !== "ok") {
+    rootEl.innerHTML = `<div class="panel-error">${safeText(data.message || data.error || data.status)}</div>`;
+    return;
+  }
+
+  const training = data.training || {};
+  const importance = training.feature_importance || [];
+  const updates = data.updates || [];
+  const r2Train = Number(training.r2_train != null ? training.r2_train : 0);
+  const r2Val = training.r2_validation == null ? null : Number(training.r2_validation);
+  const r2Label = r2Val == null
+    ? `train R² = ${r2Train.toFixed(4)}`
+    : `train R² = ${r2Train.toFixed(4)}, val R² = ${r2Val.toFixed(4)}`;
+
+  const impRows = importance.slice(0, 10).map((f) => {
+    const barW = Math.min(100, Math.round((f.importance || 0) * 200));
+    return `<tr>
+      <td>${safeText(f.feature)}</td>
+      <td>${Number(f.importance).toFixed(4)}</td>
+      <td><div style="background:var(--accent);height:12px;width:${barW}%;border-radius:4px;"></div></td>
+    </tr>`;
+  }).join("");
+
+  const updateRows = updates.map((u) => `<tr>
+    <td><code>${safeText(u.env_key)}</code></td>
+    <td>${safeText(u.current_value)}</td>
+    <td><strong>${safeText(u.suggested_value)}</strong></td>
+    <td>${Number(u.importance).toFixed(3)}</td>
+    <td class="muted">${safeText(u.rationale).substring(0, 120)}</td>
+  </tr>`).join("");
+
+  rootEl.innerHTML = `
+    <div class="perf-bucket" style="margin-bottom:1rem">
+      <h3>Feature Importance (${r2Label}, n = ${safeText(training.n_samples)})</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Feature</th><th>Importance</th><th></th></tr></thead>
+          <tbody>${impRows || '<tr><td colspan="3" class="muted">No features analyzed</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+    ${updates.length ? `
+    <div class="perf-bucket">
+      <h3>Suggested Threshold Adjustments (${updates.length})</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Parameter</th><th>Current</th><th>Suggested</th><th>Importance</th><th>Rationale</th></tr></thead>
+          <tbody>${updateRows}</tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:0.5rem">Run a <strong>Challenger Scan</strong> to test these adjustments before applying.</p>
+    </div>` : '<p class="muted">No threshold adjustments suggested at this time.</p>'}
+  `;
 }
 
 function renderProfilePanel(rootEl, data, { error } = {}) {
@@ -1044,6 +1246,42 @@ function setHealthRibbonTiles(authOk, quoteOk, errRate, validation) {
   setTile("healthTileValidation", vState, vGauge);
 }
 
+function prioritizeActionCenterFromHealth({ authOk, quoteOk, errRate, validation, topBlocker }) {
+  const runStatus = safeText(validation?.run_status || "").toLowerCase();
+  const blocker = safeText(topBlocker || "").trim();
+  if (!authOk) {
+    updateActionCenter({
+      title: "P0: Broker Authentication Blocked",
+      message: "Reconnect Schwab account and market sessions before running scans or approving orders.",
+      severity: "error",
+    });
+    return;
+  }
+  if (!quoteOk || errRate >= 3.0) {
+    updateActionCenter({
+      title: "P1: Market Data Reliability Degraded",
+      message: `Quotes unhealthy or API error rate elevated (${errRate.toFixed(1)}%). Check provider status and fallback readiness.`,
+      severity: "warn",
+    });
+    return;
+  }
+  if (runStatus === "running") {
+    updateActionCenter({
+      title: "P2: Validation In Progress",
+      message: "Validation pipeline is running; monitor progress before trusting new model outputs.",
+      severity: "info",
+    });
+    return;
+  }
+  if (blocker) {
+    updateActionCenter({
+      title: "P2: Scan Blocker Identified",
+      message: blocker,
+      severity: "warn",
+    });
+  }
+}
+
 function updateHeroInfographic() {
   const sigEl = document.getElementById("heroKpiSignals");
   const pendEl = document.getElementById("heroKpiPending");
@@ -1281,17 +1519,58 @@ function meterFromConviction(conviction) {
   return clampPct((safeNum(conviction, 0) + 100) / 2);
 }
 
-async function openQuickViewForTrade(row) {
-  const panel = document.getElementById("quickViewPanel");
-  const output = document.getElementById("quickViewOutput");
-  panel.classList.add("open");
-  output.textContent = "Loading decision card...";
-  const out = await api.get(`/api/decision-card/${encodeURIComponent(row.ticker)}`);
-  if (!out.ok) {
-    output.textContent = `Quick view unavailable: ${out.error}`;
+function renderQuickViewCard(data, error) {
+  const ph = document.getElementById("quickViewPlaceholder");
+  const sum = document.getElementById("quickViewSummary");
+  const det = document.getElementById("quickViewJsonDetails");
+  const pre = document.getElementById("quickViewOutput");
+  if (error) {
+    if (ph) { ph.textContent = error; ph.classList.remove("hidden"); }
+    if (sum) { sum.classList.add("hidden"); sum.innerHTML = ""; }
+    if (det) det.classList.add("hidden");
+    if (pre) pre.textContent = "";
     return;
   }
-  output.textContent = prettyJson(out.data);
+  if (ph) ph.classList.add("hidden");
+  const d = data || {};
+  const ez = d.entry_zone || {};
+  const sz = d.size || {};
+  const conf = d.confidence || {};
+  const blocked = Boolean(d.checklist && d.checklist.blocked);
+  const scoreN = Number(conf.signal_score);
+  const scoreTxt = Number.isFinite(scoreN) ? scoreN.toFixed(1) : "—";
+  const verdict = blocked
+    ? "Blocked by safety checks."
+    : "Passes current safety snapshot.";
+  const verdictClass = blocked ? "bad" : "good";
+  if (sum) {
+    sum.classList.remove("hidden");
+    sum.innerHTML = `
+      <h4 class="tool-summary-title">${safeText(d.ticker)}</h4>
+      <ul class="tool-summary-list">
+        <li><strong>Size:</strong> ${safeNum(sz.qty, 0)} shares (~${formatMoney(sz.usd || 0)})</li>
+        <li><strong>Entry zone:</strong> $${safeText(ez.low)} – $${safeText(ez.high)}</li>
+        <li><strong>Stop idea:</strong> $${safeText(d.stop_invalidation)}</li>
+        <li><strong>Confidence:</strong> ${safeText(conf.bucket)} (score ${scoreTxt})</li>
+        <li><strong>Status:</strong> <span class="pill ${verdictClass} small">${verdict}</span></li>
+      </ul>
+      ${(d.key_reasons || []).length ? `<div class="chip-row" style="margin-top: 8px;">${d.key_reasons.map(r => `<span class="chip">${safeText(r)}</span>`).join("")}</div>` : ""}
+    `;
+  }
+  if (det) det.classList.remove("hidden");
+  if (pre) pre.textContent = prettyJson(data);
+}
+
+async function openQuickViewForTrade(row) {
+  const panel = document.getElementById("quickViewPanel");
+  panel.classList.add("open");
+  renderQuickViewCard(null, "Loading decision card...");
+  const out = await api.get(`/api/decision-card/${encodeURIComponent(row.ticker)}`);
+  if (!out.ok) {
+    renderQuickViewCard(null, `Quick view unavailable: ${out.error}`);
+    return;
+  }
+  renderQuickViewCard(out.data, null);
 }
 
 function renderReportTabs(data) {
@@ -1490,15 +1769,28 @@ function renderSecAnalysisCard(label, analysis) {
   const risks = (analysis.risk_terms || []).slice(0, 5).join(", ") || "None highlighted";
   const guidance = safeText(analysis.guidance_signal || "neutral");
   const takeaway = safeText(analysis.high_level_takeaway || "No takeaway.");
+  const verdict = safeText(analysis.verdict || "neutral");
+  const confidence = Number.isFinite(Number(analysis.confidence)) ? Number(analysis.confidence) : null;
+  const why = (analysis.why || []).slice(0, 3);
+  const evidence = (analysis.evidence || []).slice(0, 2);
+  const limits = (analysis.limits || []).slice(0, 3);
+  const analysisMode = safeText(analysis.analysis_mode || "full_text");
+  const warning = analysisMode !== "full_text" || limits.length
+    ? `<div class="report-callout warn">Mode: ${analysisMode}. ${limits.length ? `Limits: ${safeText(limits.join("; "))}` : "Reduced confidence mode."}</div>`
+    : "";
   return `
     <div class="compare-card">
       <h4>${safeText(label)}</h4>
+      <div class="subtle">Verdict: <span class="${statusClass(verdict === "bullish" ? "good" : verdict === "bearish" ? "bad" : "neutral")}">${verdict}</span>${confidence !== null ? ` | Confidence: ${safeText(confidence)}/100` : ""}</div>
+      ${warning}
       <ul class="report-bullets">
         <li>Form: ${safeText(analysis.form)} | Filed: ${safeText(analysis.filing_date)}</li>
         <li>Guidance: <span class="${statusClass(guidance === "negative" ? "bad" : guidance === "positive" ? "good" : "neutral")}">${guidance}</span></li>
         <li>Risk terms: ${safeText(risks)}</li>
         <li>Takeaway: ${takeaway}</li>
       </ul>
+      ${why.length ? `<div class="subtle">Why this verdict</div><ul class="report-bullets">${why.map((w) => `<li>${safeText(w)}</li>`).join("")}</ul>` : ""}
+      ${evidence.length ? `<div class="subtle">Top evidence</div><ul class="report-bullets">${evidence.map((ev) => `<li>${safeText(ev.claim || "Evidence")}: ${safeText(ev.quote || "")}</li>`).join("")}</ul>` : ""}
       <div class="subtle">Top themes</div>
       <ul class="report-bullets">${themes || "<li>No theme sentences extracted.</li>"}</ul>
     </div>
@@ -1577,13 +1869,20 @@ function renderSecCompareVisual(data) {
   const moat = forensic.margin_moat_check || {};
   const moatBullets = Array.isArray(moat.bullets) ? moat.bullets : [];
   const tldrVerdict = safeText(forensic.tldr_verdict || compare.investor_takeaway || "No clear divergence verdict generated.");
+  const compareConfidence = Number.isFinite(Number(compare.compare_confidence)) ? Number(compare.compare_confidence) : null;
+  const analysisMode = safeText(compare.analysis_mode || data.analysis_mode || "full_text");
+  const compareLimits = (compare.limits || []).slice(0, 3);
+  const rationale = (compare.change_summary?.plain_english_rationale || []).slice(0, 3);
+  const evidenceRanked = (compare.evidence || compare.change_summary?.evidence_ranked || []).slice(0, 4);
+  const warning = analysisMode !== "full_text" || compareLimits.length;
 
   headlineRoot.innerHTML = `
     <div class="report-section compare-headline-card">
       <h4>SEC Compare Verdict</h4>
       <div><span class="${sentimentTagClass(sentimentTag)}">${sentimentTag}</span></div>
       <div class="compare-lead">${headline}</div>
-      <div class="subtle">Mode: ${safeText(data.mode || compare.mode || "N/A")} | Form: ${safeText(data.form_type || "N/A")}</div>
+      <div class="subtle">Mode: ${safeText(data.mode || compare.mode || "N/A")} | Form: ${safeText(data.form_type || "N/A")} | Analysis: ${analysisMode}${compareConfidence !== null ? ` | Confidence: ${safeText(compareConfidence)}/100` : ""}</div>
+      ${warning ? `<div class="report-callout warn">Reduced confidence context. ${compareLimits.length ? `Limits: ${safeText(compareLimits.join("; "))}` : "Metadata fallback or partial evidence mode."}</div>` : ""}
     </div>
   `;
 
@@ -1593,6 +1892,7 @@ function renderSecCompareVisual(data) {
       <ul class="report-bullets">
         ${(redFlags.length ? redFlags : differencesRaw.slice(0, 4)).map((x) => `<li>${safeText(x)}</li>`).join("") || "<li>No newly introduced legal-risk language flagged.</li>"}
       </ul>
+      ${rationale.length ? `<div class="subtle">Why this verdict</div><ul class="report-bullets">${rationale.map((x) => `<li>${safeText(x)}</li>`).join("")}</ul>` : ""}
       <div class="subtle">Focus: new legal/risk language in recent filing that did not appear in comparator.</div>
     </div>
   `;
@@ -1611,6 +1911,7 @@ function renderSecCompareVisual(data) {
       <ul class="report-bullets">${similarities || "<li>No major similarities highlighted.</li>"}</ul>
       <div class="subtle">Divergence context</div>
       <ul class="report-bullets">${material || differences || "<li>No major differences highlighted.</li>"}</ul>
+      ${evidenceRanked.length ? `<div class="subtle">Top evidence snippets</div><ul class="report-bullets">${evidenceRanked.map((ev) => `<li>${safeText(ev.claim || "Evidence")}: ${safeText(ev.quote || "")}</li>`).join("")}</ul>` : ""}
     </div>
   `;
 
@@ -1718,6 +2019,9 @@ async function buildFallbackSecCompare(mode, tickerA, tickerB, formType) {
           ? [`Shared risk notes: ${commonRisks.slice(0, 5).join(", ")}.`]
           : ["Limited overlap from metadata-only filing notes."],
         investor_takeaway: "Fallback compare is based on EDGAR metadata only. Enable SEC compare API for deeper filing-text analysis.",
+        analysis_mode: "metadata_fallback",
+        compare_confidence: 25,
+        limits: ["Metadata-only fallback (full filing text unavailable)"],
       },
     };
   };
@@ -1796,7 +2100,11 @@ async function openApproveDialog(row) {
   if (preflight.ok) {
     state.approvingChecklist = preflight.data?.checklist || null;
     const c = state.approvingChecklist || {};
+    const hv = preflight.data?.high_value_2fa || {};
     checklistText = formatPreflightChecklistHtml(c);
+    if (hv.required) {
+      checklistText += `<p class="muted"><strong>High-value guardrail:</strong> 2FA code required for this approval.</p>`;
+    }
   } else {
     checklistText = `<div class="approve-preflight muted">Checklist unavailable: ${safeText(preflight.error)}</div>`;
   }
@@ -1807,10 +2115,12 @@ async function openApproveDialog(row) {
     ${checklistText}
   `;
   const tickerInput = document.getElementById("approveTickerInput");
+  const otpInput = document.getElementById("approveOtpInput");
   if (tickerInput) {
     tickerInput.value = "";
     tickerInput.placeholder = String(row.ticker || "TICKER");
   }
+  if (otpInput) otpInput.value = "";
   state.approvingTradeId = row.id;
   dialog.showModal();
 }
@@ -1843,6 +2153,12 @@ async function loadConfig() {
     /* offline or boot — fall back to manual JWT only */
   }
   state.publicConfig = publicCfg;
+  state.sseEnabled = publicCfg?.sse_enabled === true;
+  state.allowManualJwt = publicCfg?.manual_jwt_entry_enabled !== false;
+  if (publicCfg.api_key_required && !localStorage.getItem("tradingbot.api_key")) {
+    const key = prompt("This server requires an API key for write operations.\nEnter your WEB_API_KEY:");
+    if (key) localStorage.setItem("tradingbot.api_key", key.trim());
+  }
   applySchwabConnectButtonVisibility();
   renderLiveTradingSaasPanel();
 
@@ -1859,6 +2175,8 @@ async function loadConfig() {
   }
 
   const hasSupabaseUi = Boolean(publicCfg?.supabase?.url && publicCfg?.supabase?.anon_key);
+  const manualJwtAllowed = Boolean(state.allowManualJwt);
+  if (!manualJwtAllowed) clearStoredApiJwt();
   if (hasSupabaseUi && supabaseBlock) {
     supabaseBlock.classList.remove("hidden");
     if (manualDetails) {
@@ -1869,7 +2187,7 @@ async function loadConfig() {
   } else {
     if (supabaseBlock) supabaseBlock.classList.add("hidden");
     if (manualDetails) {
-      manualDetails.classList.remove("hidden");
+      manualDetails.classList.toggle("hidden", !manualJwtAllowed);
       manualDetails.open = false;
     }
     if (manualSummary) {
@@ -1880,10 +2198,13 @@ async function loadConfig() {
   }
 
   if (tokenInput) {
-    tokenInput.value = readStoredApiJwt();
+    tokenInput.value = manualJwtAllowed ? readStoredApiJwt() : "";
+    tokenInput.disabled = !manualJwtAllowed;
   }
   if (saveBtn) {
+    saveBtn.disabled = !manualJwtAllowed;
     saveBtn.addEventListener("click", () => {
+      if (!manualJwtAllowed) return;
       const val = normalizeUserJwt(tokenInput?.value);
       if (val) {
         if (!AuthJwt.isProbablyAccessJwt(val)) {
@@ -1920,7 +2241,7 @@ async function loadConfig() {
       title: "Hosted sign-in not configured",
       message: hasSupabaseUi
         ? "Sign in with Supabase to access protected APIs. Your session token is used automatically."
-        : `This server did not expose Supabase browser sign-in (set SUPABASE_URL and SUPABASE_ANON_KEY in Render to match your local .env). Until then: paste your Supabase access token under Session token → Save. In Supabase → Authentication → URL configuration, add ${originHint} to Site URL and Redirect URLs.`,
+        : `This server did not expose Supabase browser sign-in (set SUPABASE_URL and SUPABASE_ANON_KEY in Render to match your local .env). In Supabase → Authentication → URL configuration, add ${originHint} to Site URL and Redirect URLs.`,
       severity: "warn",
     });
   } else {
@@ -1928,7 +2249,7 @@ async function loadConfig() {
       title: "Authentication Required",
       message: hasSupabaseUi
         ? "Sign in with Supabase to access protected APIs. Your session token is used automatically."
-        : "Paste a valid Supabase JWT and click Save Token to access protected APIs.",
+        : "Sign in with Supabase to access protected APIs.",
       severity: "warn",
     });
   }
@@ -2035,10 +2356,11 @@ async function hydrateScanTableFromStatus(status) {
 }
 
 async function refreshStatus() {
-  const [statusRes, deepRes] = await Promise.all([
-    api.get("/api/status"),
-    api.get("/api/health/deep", { timeoutMs: 30000 }),
-  ]);
+  const statusReq = api.get("/api/status");
+  const deepReq = state.publicConfig?.saas_mode
+    ? Promise.resolve({ ok: false, error: "deep health disabled for SaaS" })
+    : api.get("/api/health/deep", { timeoutMs: 30000 });
+  const [statusRes, deepRes] = await Promise.all([statusReq, deepReq]);
   if (!statusRes.ok) {
     logEvent({ kind: "system", severity: "error", message: `Status failed: ${statusRes.error}` });
     return;
@@ -2167,6 +2489,11 @@ async function refreshStatus() {
     ribbonValidation.textContent = validOk ? "Pass" : safeText(validation.run_status || "Unknown");
   }
   setHealthRibbonTiles(authOk, quoteOk, errRate, validation);
+  const topBlocker =
+    status?.last_scan?.diagnostics_summary?.top_blockers?.[0]?.key ||
+    status?.last_scan?.diagnostics_summary?.headline ||
+    "";
+  prioritizeActionCenterFromHealth({ authOk, quoteOk, errRate, validation, topBlocker });
   updateHeroInfographic();
 }
 
@@ -2262,7 +2589,7 @@ async function waitForSaaScanCompletion(taskId) {
   let workerHintShown = false;
   setJobProgress("scanJobProgress", "scanJobProgressLabel", 0.05, "Queued…");
   for (let i = 0; i < maxPolls; i++) {
-    const status = await api.get(`/api/scan/${encodeURIComponent(taskId)}`);
+    const status = await api.get(`/api/scan-lifecycle?task_id=${encodeURIComponent(taskId)}`);
     if (!status.ok) {
       metaEl.textContent = "Scan failed.";
       updateTopStrategyChip(null);
@@ -2484,7 +2811,7 @@ async function waitForScanCompletion() {
   const maxPolls = 360;
   const metaEl = document.getElementById("scanMeta");
   for (let i = 0; i < maxPolls; i++) {
-    const status = await api.get("/api/scan/status");
+    const status = await api.get("/api/scan-lifecycle");
     if (!status.ok) {
       metaEl.textContent = "Scan failed.";
       updateTopStrategyChip(null);
@@ -2634,6 +2961,7 @@ async function refreshPending() {
           <button class="btn small secondary" data-quick="${row.id}">Quick View</button>
           <button class="btn small approve-btn" data-approve="${row.id}" title="${escapeHtml(approveTitle)}" ${row.status !== "pending" || liveBlocked ? "disabled" : ""}>Approve</button>
           <button class="btn small reject-btn" data-reject="${row.id}" ${row.status !== "pending" ? "disabled" : ""}>Reject</button>
+          <button class="btn small bad" data-delete="${row.id}" title="Permanently delete this trade">Delete</button>
         </div>
       `;
       section.appendChild(card);
@@ -2675,6 +3003,21 @@ async function refreshPending() {
     });
   });
 
+  board.querySelectorAll("button[data-delete]").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      const clicked = e.currentTarget;
+      clicked.disabled = true;
+      const id = clicked.getAttribute("data-delete");
+      const out = await api.post(`/api/trades/${id}/delete`, {});
+      if (!out.ok) {
+        logEvent({ kind: "trade", severity: "error", message: `Delete ${id} failed: ${out.error}` });
+      } else {
+        logEvent({ kind: "trade", severity: "info", message: `Deleted ${id}.` });
+      }
+      await refreshPending();
+    });
+  });
+
   const strip = document.getElementById("pendingSummaryStrip");
   const stripText = document.getElementById("pendingSummaryText");
   if (strip && stripText) {
@@ -2689,6 +3032,7 @@ async function refreshPending() {
 
 async function approveTradeById(id) {
   const typed = document.getElementById("approveTickerInput")?.value?.trim() || "";
+  const otpCode = document.getElementById("approveOtpInput")?.value?.trim() || "";
   if (!typed) {
     updateActionCenter({
       title: "Confirm ticker",
@@ -2697,7 +3041,7 @@ async function approveTradeById(id) {
     });
     return;
   }
-  const out = await api.post(`/api/trades/${id}/approve?confirm_live=true`, { typed_ticker: typed });
+  const out = await api.post(`/api/trades/${id}/approve?confirm_live=true`, { typed_ticker: typed, otp_code: otpCode });
   if (!out.ok) {
     logEvent({ kind: "trade", severity: "error", message: `Approve ${id} failed: ${out.error}` });
     updateActionCenter({ title: "Approval Failed", message: out.error, severity: "error" });
@@ -2708,35 +3052,69 @@ async function approveTradeById(id) {
   await refreshPending();
 }
 
+function renderOnboardingCards(data) {
+  const cards = document.getElementById("onboardingCards");
+  const det = document.getElementById("onboardingJsonDetails");
+  const pre = document.getElementById("onboardingOutput");
+  if (!cards) return;
+  if (!data) {
+    cards.innerHTML = `<p class="muted">Run the wizard or click individual steps above.</p>`;
+    if (det) det.classList.add("hidden");
+    return;
+  }
+  const steps = data.steps || {};
+  const stepNames = { connect: "Link Schwab", verify_token_health: "Verify Tokens", test_scan: "Test Scan", test_paper_order: "Paper Order" };
+  const stepDescs = { connect: "Token files exist for market & account sessions.", verify_token_health: "Live API check: market token, account token, and quote probe.", test_scan: "Run the signal scanner and confirm no fatal errors.", test_paper_order: "Shadow-mode order to verify execution path." };
+  let html = '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px;">';
+  for (const [key, label] of Object.entries(stepNames)) {
+    const step = steps[key] || {};
+    const ok = Boolean(step.ok);
+    const borderColor = ok ? "rgba(52, 211, 153, 0.45)" : step.at ? "rgba(251, 113, 133, 0.45)" : "rgba(100, 116, 139, 0.35)";
+    const bgColor = ok ? "rgba(6, 78, 59, 0.2)" : step.at ? "rgba(127, 29, 29, 0.15)" : "rgba(10, 16, 34, 0.6)";
+    const statusPill = ok
+      ? '<span class="pill good small">Pass</span>'
+      : step.at ? '<span class="pill bad small">Fail</span>' : '<span class="pill neutral small">Not run</span>';
+    const fixPath = step.fix_path ? `<p class="muted" style="font-size: 0.78rem; margin: 6px 0 0;">${safeText(step.fix_path)}</p>` : "";
+    html += `<div style="border-radius: 12px; border: 1px solid ${borderColor}; background: ${bgColor}; padding: 12px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <strong style="font-size: 0.88rem;">${label}</strong>
+        ${statusPill}
+      </div>
+      <p class="muted" style="font-size: 0.8rem; margin: 0;">${stepDescs[key]}</p>
+      ${fixPath}
+    </div>`;
+  }
+  html += "</div>";
+  const elapsed = data.elapsed_minutes;
+  const done = data.completed_under_target;
+  if (elapsed != null) {
+    html += `<p class="muted" style="margin-top: 10px;">Elapsed: ${elapsed} min${done ? ' · <span class="pill good small">Under target</span>' : ""}</p>`;
+  }
+  cards.innerHTML = html;
+  if (det) det.classList.remove("hidden");
+  if (pre) pre.textContent = prettyJson(data);
+}
+
 async function refreshOnboarding() {
   const out = await api.get("/api/onboarding/status");
   const meta = document.getElementById("onboardingMeta");
-  const output = document.getElementById("onboardingOutput");
   const section = document.getElementById("onboardingSection");
-  if (!meta || !output) return;
+  if (!meta) return;
   if (!out.ok) {
-    output.textContent = `Onboarding status failed: ${out.error}`;
+    renderOnboardingCards(null);
+    meta.textContent = `Onboarding status failed: ${out.error}`;
     return;
   }
   state.onboarding = out.data;
-  if (section) {
-    section.style.display = "block";
-  }
+  if (section) section.style.display = "block";
   const conn = out.data?.connection_status || (out.data?.schwab_linked ? "connected" : "disconnected");
   const ah = out.data?.api_health || {};
   const apiLine = ah.schwab_linked
     ? `API: market ${ah.market_token_ok ? "ok" : "—"} · account ${ah.account_token_ok ? "ok" : "—"} · quotes ${ah.quote_ok ? "ok" : "—"}`
     : "API: connect Schwab to probe tokens and quotes.";
   const haltLine = state.publicConfig.platform_live_trading_kill_switch ? " · Global operator halt: ON" : "";
-  if (!out.data?.onboarding_required) {
-    meta.textContent = `Connection: ${conn} · ${apiLine}${haltLine}`;
-    output.textContent = prettyJson(out.data);
-    return;
-  }
-  const elapsed = out.data?.elapsed_minutes;
-  const done = out.data?.completed_under_target;
-  meta.textContent = `Connection: ${conn} · ${apiLine}${haltLine} · Elapsed: ${elapsed ?? "n/a"} min | ${done ? "PASS" : "IN PROGRESS"}`;
-  output.textContent = prettyJson(out.data);
+  meta.textContent = `Connection: ${conn} · ${apiLine}${haltLine}`;
+  renderOnboardingCards(out.data);
 }
 
 async function startOnboarding() {
@@ -2744,8 +3122,7 @@ async function startOnboarding() {
   const out = await api.post("/api/onboarding/start", {});
   if (!out.ok) {
     logEvent({ kind: "system", severity: "error", message: `Onboarding start failed: ${out.error}` });
-    const pre = document.getElementById("onboardingOutput");
-    if (pre) pre.textContent = `Start failed: ${out.error}`;
+    renderOnboardingCards(null);
     updateActionCenter({ title: "Schwab setup", message: out.error || "Could not start onboarding.", severity: "error" });
     return;
   }
@@ -2758,8 +3135,6 @@ async function runOnboardingStep(step) {
   const out = await api.post(`/api/onboarding/step/${step}`, {});
   if (!out.ok) {
     logEvent({ kind: "system", severity: "error", message: `Onboarding step failed: ${out.error}` });
-    const pre = document.getElementById("onboardingOutput");
-    if (pre) pre.textContent = `Step failed (${step}): ${out.error}`;
     updateActionCenter({ title: "Schwab setup", message: out.error || `Step ${step} failed.`, severity: "error" });
     return;
   }
@@ -2920,13 +3295,38 @@ async function mapRecovery() {
 async function refreshPerformance() {
   const out = await api.get("/api/performance");
   const panel = document.getElementById("performancePanel");
+  const evolveBtn = document.getElementById("evolveBtn");
+  const challengerBtn = document.getElementById("challengerBtn");
   if (!panel) return;
   if (!out.ok) {
     renderPerformancePanel(panel, null, { error: `Performance load failed: ${out.error}` });
+    if (evolveBtn) {
+      evolveBtn.disabled = true;
+      evolveBtn.title = "Performance data unavailable.";
+    }
+    if (challengerBtn) {
+      challengerBtn.disabled = true;
+      challengerBtn.title = "Performance data unavailable.";
+    }
     return;
   }
   state.performance = out.data;
   renderPerformancePanel(panel, out.data);
+  const outcomeCount = Number(out.data?.live?.recorded_outcomes || 0);
+  if (evolveBtn) {
+    const canRunEvolve = outcomeCount > 0;
+    evolveBtn.disabled = !canRunEvolve;
+    evolveBtn.title = canRunEvolve
+      ? ""
+      : "No persisted trade outcomes yet. Execute trades first, then run analysis.";
+  }
+  const canRunChallenger = Boolean(out.data?.challenger?.can_run);
+  if (challengerBtn) {
+    challengerBtn.disabled = !canRunChallenger;
+    challengerBtn.title = canRunChallenger
+      ? ""
+      : "Run Post-Mortem Analysis first to generate strategy overrides.";
+  }
 }
 
 function renderCalibrationPanel(panel, data, error) {
@@ -2945,25 +3345,44 @@ function renderCalibrationPanel(panel, data, error) {
   }
   const parts = [];
   if (data.self_study) {
-    parts.push(
-      `<h3 class="field-label">Self-study</h3><pre class="code-block code-block--tight">${escapeHtml(
-        prettyJson(data.self_study)
-      )}</pre>`
-    );
+    const ss = data.self_study;
+    let ssHtml = '<div class="preset-subsection"><h3>Self-study</h3>';
+    if (ss.min_conviction_threshold != null) {
+      ssHtml += `<div class="perf-metric"><span class="label">Min conviction threshold</span><span class="value">${safeNum(ss.min_conviction_threshold, 1)}</span></div>`;
+    }
+    if (ss.round_trips != null) {
+      ssHtml += `<div class="perf-metric"><span class="label">Round trips</span><span class="value">${safeNum(ss.round_trips, 0)}</span></div>`;
+    }
+    if (ss.win_rate != null) {
+      ssHtml += `<div class="perf-metric"><span class="label">Win rate</span><span class="value">${(safeNum(ss.win_rate, 2) * 100).toFixed(1)}%</span></div>`;
+    }
+    if (ss.avg_return_pct != null) {
+      ssHtml += `<div class="perf-metric"><span class="label">Avg return</span><span class="value">${safeNum(ss.avg_return_pct, 2).toFixed(2)}%</span></div>`;
+    }
+    ssHtml += `<details class="tool-json-details" style="margin-top: 8px;"><summary>Raw data</summary><pre class="code-block code-block--tight">${escapeHtml(prettyJson(ss))}</pre></details>`;
+    ssHtml += "</div>";
+    parts.push(ssHtml);
   }
   if (data.hypothesis_ledger) {
-    parts.push(
-      `<h3 class="field-label">Hypothesis ledger</h3><pre class="code-block code-block--tight">${escapeHtml(
-        prettyJson(data.hypothesis_ledger)
-      )}</pre>`
-    );
+    const hl = data.hypothesis_ledger;
+    let hlHtml = '<div class="preset-subsection"><h3>Hypothesis ledger</h3>';
+    if (hl.total_hypotheses != null) {
+      hlHtml += `<div class="perf-metric"><span class="label">Total hypotheses</span><span class="value">${safeNum(hl.total_hypotheses, 0)}</span></div>`;
+    }
+    if (hl.scored != null) {
+      hlHtml += `<div class="perf-metric"><span class="label">Scored</span><span class="value">${safeNum(hl.scored, 0)}</span></div>`;
+    }
+    if (hl.hit_rate != null) {
+      hlHtml += `<div class="perf-metric"><span class="label">Hit rate</span><span class="value">${(safeNum(hl.hit_rate, 2) * 100).toFixed(1)}%</span></div>`;
+    }
+    hlHtml += `<details class="tool-json-details" style="margin-top: 8px;"><summary>Raw data</summary><pre class="code-block code-block--tight">${escapeHtml(prettyJson(hl))}</pre></details>`;
+    hlHtml += "</div>";
+    parts.push(hlHtml);
   }
   panel.innerHTML =
     parts.length > 0
       ? parts.join("")
-      : `<div class="muted">Unrecognized snapshot shape.</div><pre class="code-block code-block--tight">${escapeHtml(
-          prettyJson(data)
-        )}</pre>`;
+      : `<div class="muted">No calibration data available yet.</div>`;
 }
 
 async function refreshCalibration() {
@@ -3669,6 +4088,106 @@ async function refreshPortfolio() {
   });
 }
 
+async function loadPortfolioRisk() {
+  const panel = document.getElementById("portfolioRiskContent");
+  if (!panel) return;
+  panel.innerHTML = `<div class="muted">Loading risk analytics...</div>`;
+  const out = await api.get("/api/portfolio/risk");
+  if (!out.ok) {
+    panel.innerHTML = `<div class="muted">Risk analytics unavailable: ${safeText(out.error)}</div>`;
+    return;
+  }
+  const d = out.data;
+  if (!d.position_count) {
+    panel.innerHTML = `<div class="muted">No positions to analyze.</div>`;
+    return;
+  }
+
+  const conc = d.concentration || {};
+  const concColor = conc.hhi > 2500 ? "var(--bad)" : conc.hhi > 1500 ? "var(--warn)" : "var(--good)";
+  const dayColor = d.day_pl_total >= 0 ? "var(--good)" : "var(--bad)";
+
+  let html = `
+    <div class="risk-kpi-row">
+      <div class="risk-kpi">
+        <div class="risk-kpi-value">${formatMoney(d.total_value)}</div>
+        <div class="risk-kpi-label">Total Value</div>
+      </div>
+      <div class="risk-kpi">
+        <div class="risk-kpi-value" style="color:${dayColor}">${d.day_pl_total >= 0 ? "+" : ""}${formatMoney(d.day_pl_total)}</div>
+        <div class="risk-kpi-label">Day P/L</div>
+      </div>
+      <div class="risk-kpi">
+        <div class="risk-kpi-value" style="color:${concColor}">${safeText(conc.hhi_label || "N/A")}</div>
+        <div class="risk-kpi-label">Concentration (HHI ${safeText(conc.hhi)})</div>
+      </div>
+      <div class="risk-kpi">
+        <div class="risk-kpi-value">${safeText(conc.top_position_pct)}%</div>
+        <div class="risk-kpi-label">Largest Position</div>
+      </div>
+      <div class="risk-kpi">
+        <div class="risk-kpi-value">${safeText(conc.top_5_pct)}%</div>
+        <div class="risk-kpi-label">Top 5 Weight</div>
+      </div>
+      <div class="risk-kpi">
+        <div class="risk-kpi-value">${safeText(conc.sector_count)}</div>
+        <div class="risk-kpi-label">Sectors</div>
+      </div>
+    </div>`;
+
+  if (d.sector_allocation && d.sector_allocation.length) {
+    const maxSector = Math.max(1, ...d.sector_allocation.map((s) => s.weight_pct));
+    html += `<div class="risk-section-title">Sector Allocation</div><div class="risk-sector-bars">`;
+    d.sector_allocation.forEach((s) => {
+      const barW = Math.max(2, Math.round((s.weight_pct / maxSector) * 100));
+      html += `
+        <div class="risk-sector-row">
+          <span class="risk-sector-name">${safeText(s.sector)}</span>
+          <div class="risk-sector-bar-track">
+            <div class="risk-sector-bar-fill" style="width:${barW}%"></div>
+          </div>
+          <span class="risk-sector-pct mono-nums">${safeText(s.weight_pct)}%</span>
+          <span class="risk-sector-val muted mono-nums">${formatMoney(s.value)}</span>
+        </div>`;
+    });
+    html += `</div>`;
+  }
+
+  if (d.positions_weighted && d.positions_weighted.length) {
+    const maxW = Math.max(1, ...d.positions_weighted.map((p) => p.weight_pct));
+    html += `<div class="risk-section-title">Position Weights</div><div class="risk-weight-grid">`;
+    d.positions_weighted.slice(0, 15).forEach((p) => {
+      const barW = Math.max(2, Math.round((p.weight_pct / maxW) * 100));
+      const plColor = p.pl_pct >= 0 ? "var(--good)" : "var(--bad)";
+      html += `
+        <div class="risk-weight-row">
+          <span class="risk-weight-sym">${safeText(p.symbol)}</span>
+          <div class="risk-sector-bar-track">
+            <div class="risk-weight-bar-fill" style="width:${barW}%"></div>
+          </div>
+          <span class="risk-sector-pct mono-nums">${safeText(p.weight_pct)}%</span>
+          <span class="mono-nums" style="color:${plColor};min-width:52px;text-align:right">${p.pl_pct >= 0 ? "+" : ""}${safeText(p.pl_pct)}%</span>
+        </div>`;
+    });
+    html += `</div>`;
+  }
+
+  if (d.day_pl_breakdown && d.day_pl_breakdown.length) {
+    html += `<div class="risk-section-title">Day P/L Movers</div><div class="risk-pl-list">`;
+    d.day_pl_breakdown.slice(0, 8).forEach((p) => {
+      const color = p.day_pl >= 0 ? "var(--good)" : "var(--bad)";
+      html += `
+        <div class="risk-pl-row">
+          <span class="risk-weight-sym">${safeText(p.symbol)}</span>
+          <span class="mono-nums" style="color:${color}">${p.day_pl >= 0 ? "+" : ""}${formatMoney(p.day_pl)}</span>
+        </div>`;
+    });
+    html += `</div>`;
+  }
+
+  panel.innerHTML = html;
+}
+
 async function refreshSectors() {
   const out = await api.get("/api/sectors");
   const grid = document.getElementById("sectorGrid");
@@ -3701,18 +4220,79 @@ async function refreshSectors() {
   });
 }
 
+function renderQuickCheckCard(data, error) {
+  const ph = document.getElementById("checkPlaceholder");
+  const sum = document.getElementById("checkSummary");
+  const det = document.getElementById("checkJsonDetails");
+  const pre = document.getElementById("checkOutput");
+  if (!sum) return;
+  if (error) {
+    if (ph) { ph.textContent = error; ph.classList.remove("hidden"); }
+    sum.classList.add("hidden"); sum.innerHTML = "";
+    if (det) det.classList.add("hidden");
+    if (pre) pre.textContent = "";
+    return;
+  }
+  if (ph) ph.classList.add("hidden");
+  const d = data || {};
+
+  const title = d.title || d.ticker || "Quick Check";
+  const desc = (d.description || "").replace(/\*\*/g, "");
+  const fields = d.fields || [];
+
+  let fieldsHtml = "";
+  if (fields.length) {
+    fieldsHtml = '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; margin-top: 10px;">';
+    for (const f of fields) {
+      const val = (f.value || "").replace(/\*\*/g, "").replace(/\n/g, "<br>");
+      fieldsHtml += `<div class="preset-subsection" style="padding: 10px;">
+        <h3 style="margin: 0 0 6px; font-size: 0.82rem;">${safeText(f.name)}</h3>
+        <div style="font-size: 0.84rem; color: #dbe6ff; line-height: 1.5;">${val}</div>
+      </div>`;
+    }
+    fieldsHtml += "</div>";
+  } else {
+    const items = [];
+    const price = d.price ?? d.current_price ?? d.last_price;
+    const stage2 = d.stage_2 ?? d.is_stage_2;
+    const vcp = d.vcp ?? d.vcp_detected;
+    const score = d.signal_score ?? d.score;
+    const sector = d.sector ?? d.sector_etf;
+    if (price != null) items.push(`<li><strong>Price:</strong> $${Number(price).toFixed(2)}</li>`);
+    if (stage2 != null) items.push(`<li><strong>Stage 2:</strong> <span class="pill ${stage2 ? 'good' : 'bad'} small">${stage2 ? 'Yes' : 'No'}</span></li>`);
+    if (vcp != null) items.push(`<li><strong>VCP:</strong> <span class="pill ${vcp ? 'good' : 'bad'} small">${vcp ? 'Detected' : 'None'}</span></li>`);
+    if (score != null) items.push(`<li><strong>Signal Score:</strong> ${Number(score).toFixed(1)}/100</li>`);
+    if (sector) items.push(`<li><strong>Sector:</strong> ${safeText(sector)}</li>`);
+    Object.entries(d).forEach(([k, v]) => {
+      if (v != null && typeof v !== "object" && !["title", "description", "color", "timestamp", "ticker"].includes(k)) {
+        items.push(`<li><strong>${safeText(k)}:</strong> ${safeText(String(v))}</li>`);
+      }
+    });
+    if (items.length) fieldsHtml = `<ul class="tool-summary-list">${items.join("")}</ul>`;
+  }
+
+  sum.classList.remove("hidden");
+  sum.innerHTML = `
+    <h4 class="tool-summary-title">${safeText(title)}</h4>
+    ${desc ? `<p class="tool-summary-p" style="margin-bottom: 4px;">${safeText(desc)}</p>` : ""}
+    ${fieldsHtml}
+  `;
+  if (det) det.classList.remove("hidden");
+  if (pre) pre.textContent = prettyJson(data);
+}
+
 async function quickCheck() {
   const ticker = document.getElementById("tickerInput").value.trim().toUpperCase();
   if (!ticker) return;
-  const outEl = document.getElementById("checkOutput");
-  outEl.textContent = "Loading...";
+  renderQuickCheckCard(null, "Loading...");
   const out = await api.get(`/api/check/${ticker}`);
   if (!out.ok) {
-    outEl.textContent = out.error;
+    renderQuickCheckCard(null, `Check failed: ${out.error}`);
     logEvent({ kind: "system", severity: "error", message: `Check ${ticker} failed: ${out.error}` });
     return;
   }
-  outEl.textContent = JSON.stringify(out.data, null, 2);
+  renderQuickCheckCard(out.data, null);
+  renderTickerChart(ticker);
   logEvent({ kind: "system", severity: "info", message: `Check complete for ${ticker}.` });
 }
 
@@ -3920,12 +4500,49 @@ function wireEvents() {
   document.getElementById("enableLiveTradingBtn")?.addEventListener("click", () => void submitEnableLiveTrading());
   document.getElementById("saveTradingHaltBtn")?.addEventListener("click", () => void submitTradingHaltSave());
   document.getElementById("calibrationRefreshBtn")?.addEventListener("click", () => void refreshCalibration());
+  document.getElementById("portfolioRiskPanel")?.addEventListener("toggle", (e) => {
+    if (e.target.open) void loadPortfolioRisk();
+  });
   document.getElementById("settingsModeSelect").addEventListener("change", loadProfiles);
   document.getElementById("profileSelect")?.addEventListener("change", renderPresetApplyPreview);
   document.getElementById("automationOptIn")?.addEventListener("change", renderPresetApplyPreview);
   document.getElementById("decisionBtn").addEventListener("click", loadDecisionCard);
   document.getElementById("recoveryBtn").addEventListener("click", mapRecovery);
   document.getElementById("performanceRefreshBtn").addEventListener("click", refreshPerformance);
+  document.getElementById("evolveBtn")?.addEventListener("click", async () => {
+    const btn = document.getElementById("evolveBtn");
+    const panel = document.getElementById("learningPanel");
+    if (btn) { btn.disabled = true; btn.textContent = "Analyzing..."; }
+    try {
+      const out = await api.post("/api/evolve/run");
+      if (out.ok) {
+        renderEvolvePanel(panel, out.data);
+      } else {
+        if (panel) panel.innerHTML = `<div class="panel-error">${safeText(out.error || "Analysis failed")}</div>`;
+      }
+    } catch (e) {
+      if (panel) panel.innerHTML = `<div class="panel-error">Error: ${safeText(String(e))}</div>`;
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = "Run Post-Mortem Analysis"; }
+    }
+  });
+  document.getElementById("challengerBtn")?.addEventListener("click", async () => {
+    const btn = document.getElementById("challengerBtn");
+    const panel = document.getElementById("challengerPanel");
+    if (btn) { btn.disabled = true; btn.textContent = "Running scans..."; }
+    try {
+      const out = await api.post("/api/challenger/run");
+      if (out.ok && out.data && out.data.comparison) {
+        renderChallengerPanel(panel, { available: true, latest: out.data.comparison, win_rate: out.data.win_rate || {} });
+      } else {
+        if (panel) panel.innerHTML = `<div class="panel-error">${safeText((out.data && out.data.message) || out.error || "Challenger scan failed")}</div>`;
+      }
+    } catch (e) {
+      if (panel) panel.innerHTML = `<div class="panel-error">Error: ${safeText(String(e))}</div>`;
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = "Run Challenger Scan"; }
+    }
+  });
   document.getElementById("closeQuickViewBtn").addEventListener("click", () => {
     document.getElementById("quickViewPanel").classList.remove("open");
   });
@@ -3991,6 +4608,23 @@ function wireEvents() {
     await refreshPending();
   });
 
+  document.getElementById("deleteAllTradesBtn")?.addEventListener("click", async () => {
+    if (!confirm("Permanently delete ALL trades from history? This cannot be undone.")) return;
+    const btn = document.getElementById("deleteAllTradesBtn");
+    if (btn) btn.disabled = true;
+    const out = await api.post("/api/pending-trades/delete-all", {});
+    if (!out.ok) {
+      logEvent({ kind: "trade", severity: "error", message: `Delete all failed: ${out.error}` });
+      updateActionCenter({ title: "Delete failed", message: out.error, severity: "error" });
+    } else {
+      const n = typeof out.data?.deleted === "number" ? out.data.deleted : 0;
+      logEvent({ kind: "trade", severity: "info", message: `Deleted ${n} trade(s) from history.` });
+      updateActionCenter({ title: "History cleared", message: `Permanently deleted ${n} trade(s).`, severity: "success" });
+    }
+    if (btn) btn.disabled = false;
+    await refreshPending();
+  });
+
   const dialog = document.getElementById("approveDialog");
   document.getElementById("confirmApproveBtn").addEventListener("click", async (e) => {
     e.preventDefault();
@@ -4035,12 +4669,444 @@ function wireEvents() {
   });
 }
 
+/* ── Scroll-to-top button ─────────────────────── */
+function setupScrollToTop() {
+  const btn = document.getElementById("scrollTopBtn");
+  if (!btn) return;
+  let ticking = false;
+  const toggle = () => {
+    btn.classList.toggle("visible", window.scrollY > 400);
+    ticking = false;
+  };
+  window.addEventListener("scroll", () => {
+    if (!ticking) {
+      requestAnimationFrame(toggle);
+      ticking = true;
+    }
+  }, { passive: true });
+  btn.addEventListener("click", () => {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
+}
+
+/* ── Toast notification system ────────────────── */
+function showToast(message, type = "info", duration = 4000) {
+  const container = document.getElementById("toastContainer");
+  if (!container) return;
+  const toast = document.createElement("div");
+  toast.className = `toast toast-${type}`;
+  toast.innerHTML = `<span class="toast-dot"></span><span>${message}</span>`;
+  container.appendChild(toast);
+  const dismiss = () => {
+    toast.classList.add("exiting");
+    toast.addEventListener("animationend", () => toast.remove(), { once: true });
+  };
+  toast.addEventListener("click", dismiss);
+  if (duration > 0) setTimeout(dismiss, duration);
+}
+
+/* ── Lightweight Charts (price chart for ticker check) ─── */
+let _activeChart = null;
+async function renderTickerChart(ticker) {
+  const container = document.getElementById("tickerChartContainer");
+  if (!container || typeof LightweightCharts === "undefined") return;
+  container.classList.remove("hidden");
+  container.innerHTML = "";
+
+  const out = await api.get(`/api/chart/${encodeURIComponent(ticker)}`);
+  if (!out.ok || !out.data?.candles?.length) {
+    container.innerHTML = `<div class="muted" style="padding:12px">No chart data available for ${safeText(ticker)}.</div>`;
+    return;
+  }
+
+  const chart = LightweightCharts.createChart(container, {
+    width: container.clientWidth,
+    height: 280,
+    layout: { background: { type: "solid", color: "transparent" }, textColor: "#9ca3b8" },
+    grid: { vertLines: { color: "rgba(99,120,200,0.06)" }, horzLines: { color: "rgba(99,120,200,0.06)" } },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: "rgba(99,120,200,0.15)" },
+    timeScale: { borderColor: "rgba(99,120,200,0.15)", timeVisible: false },
+  });
+  const candleSeries = chart.addCandlestickSeries({
+    upColor: "#34d399", downColor: "#fb7185",
+    borderUpColor: "#34d399", borderDownColor: "#fb7185",
+    wickUpColor: "#34d399", wickDownColor: "#fb7185",
+  });
+  candleSeries.setData(out.data.candles);
+
+  const volSeries = chart.addHistogramSeries({
+    priceFormat: { type: "volume" },
+    priceScaleId: "",
+    scaleMargins: { top: 0.85, bottom: 0 },
+  });
+  volSeries.setData(out.data.candles.map((c) => ({
+    time: c.time,
+    value: c.volume,
+    color: c.close >= c.open ? "rgba(52,211,153,0.25)" : "rgba(251,113,133,0.25)",
+  })));
+
+  chart.timeScale().fitContent();
+  _activeChart = chart;
+
+  const ro = new ResizeObserver(() => {
+    if (_activeChart) _activeChart.applyOptions({ width: container.clientWidth });
+  });
+  ro.observe(container);
+}
+
+/* ── Notification Center ─────────────────────── */
+const _notifications = [];
+const NOTIF_STORAGE_KEY = "tradingbot.notifications";
+
+function loadStoredNotifications() {
+  try {
+    const raw = localStorage.getItem(NOTIF_STORAGE_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) _notifications.push(...arr.slice(-50));
+    }
+  } catch { /* ignore */ }
+}
+
+function saveNotifications() {
+  try {
+    localStorage.setItem(NOTIF_STORAGE_KEY, JSON.stringify(_notifications.slice(-50)));
+  } catch { /* ignore */ }
+}
+
+function addNotification(message, severity = "info") {
+  _notifications.push({
+    message,
+    severity,
+    time: new Date().toISOString(),
+    read: false,
+  });
+  if (_notifications.length > 100) _notifications.splice(0, _notifications.length - 100);
+  saveNotifications();
+  renderNotifications();
+}
+
+function renderNotifications() {
+  const badge = document.getElementById("notifBadge");
+  const list = document.getElementById("notifList");
+  if (!badge || !list) return;
+
+  const unread = _notifications.filter((n) => !n.read).length;
+  if (unread > 0) {
+    badge.textContent = unread > 99 ? "99+" : String(unread);
+    badge.classList.remove("hidden");
+  } else {
+    badge.classList.add("hidden");
+  }
+
+  if (!_notifications.length) {
+    list.innerHTML = `<li class="muted">No notifications yet.</li>`;
+    return;
+  }
+
+  list.innerHTML = _notifications
+    .slice()
+    .reverse()
+    .slice(0, 30)
+    .map((n) => {
+      const dotClass = n.severity === "error" ? "notif-dot--bad" : n.severity === "success" ? "notif-dot--good" : "notif-dot--info";
+      const timeStr = new Date(n.time).toLocaleTimeString();
+      return `<li class="notif-item${n.read ? "" : " notif-unread"}">
+        <span class="notif-dot ${dotClass}"></span>
+        <span class="notif-msg">${safeText(n.message)}</span>
+        <span class="notif-time muted">${safeText(timeStr)}</span>
+      </li>`;
+    })
+    .join("");
+}
+
+function clearNotifications() {
+  _notifications.length = 0;
+  saveNotifications();
+  renderNotifications();
+  const panel = document.getElementById("notifPanel");
+  if (panel) panel.classList.add("hidden");
+}
+
+function setupNotifications() {
+  loadStoredNotifications();
+  renderNotifications();
+
+  document.getElementById("notifBellBtn")?.addEventListener("click", () => {
+    const panel = document.getElementById("notifPanel");
+    if (!panel) return;
+    panel.classList.toggle("hidden");
+    if (!panel.classList.contains("hidden")) {
+      _notifications.forEach((n) => { n.read = true; });
+      saveNotifications();
+      renderNotifications();
+    }
+  });
+
+  document.getElementById("notifClearBtn")?.addEventListener("click", clearNotifications);
+
+  document.addEventListener("click", (e) => {
+    const panel = document.getElementById("notifPanel");
+    const bell = document.getElementById("notifBellBtn");
+    if (panel && !panel.classList.contains("hidden") && !panel.contains(e.target) && !bell?.contains(e.target)) {
+      panel.classList.add("hidden");
+    }
+  });
+}
+
+/* ── Server-Sent Events ───────────────────────── */
+let _sseSource = null;
+function connectSSE() {
+  if (!state.sseEnabled) return;
+  if (_sseSource) return;
+  _sseSource = new EventSource("/api/events");
+  _sseSource.addEventListener("connected", () => {
+    logEvent({ kind: "system", severity: "info", message: "Live connection established." });
+  });
+  _sseSource.addEventListener("message", (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      const event = msg.event;
+      if (event === "scan_started") {
+        const btn = document.getElementById("scanBtn");
+        if (btn) { btn.disabled = true; btn.textContent = "Scanning..."; }
+        updateActionCenter({ title: "Scan Running", message: "Market scan started. Results will appear automatically.", severity: "info" });
+      } else if (event === "scan_completed") {
+        const btn = document.getElementById("scanBtn");
+        if (btn) { btn.disabled = false; btn.textContent = "Run Scan"; }
+        const count = msg.signals_found ?? 0;
+        showToast(`Scan complete: ${count} signal(s) found`, "success", 4000);
+        addNotification(`Scan complete: ${count} signal(s) found`, "success");
+        updateActionCenter({ title: "Scan Complete", message: `Found ${count} signal(s). Refreshing data...`, severity: "success" });
+        refreshStatus();
+        refreshPending();
+      } else if (event === "scan_failed") {
+        const btn = document.getElementById("scanBtn");
+        if (btn) { btn.disabled = false; btn.textContent = "Run Scan"; }
+        showToast("Scan failed: " + (msg.error || "unknown error"), "error", 6000);
+        addNotification(`Scan failed: ${msg.error || "unknown"}`, "error");
+        updateActionCenter({ title: "Scan Failed", message: msg.error || "Unknown error", severity: "error" });
+      } else if (event === "trade_created") {
+        showToast(`Trade queued: ${msg.ticker || "?"} (${msg.qty || "?"} shares)`, "info", 3000);
+        addNotification(`Trade queued: ${msg.ticker || "?"} (${msg.qty || "?"} shares)`, "info");
+        refreshPending();
+      } else if (event === "trade_approved") {
+        showToast(`Trade executed: ${msg.ticker || "?"}`, "success", 4000);
+        addNotification(`Trade executed: ${msg.ticker || "?"}`, "success");
+        refreshPending();
+      } else if (event === "trade_rejected") {
+        showToast(`Trade rejected: ${msg.ticker || "?"}`, "warn", 3000);
+        addNotification(`Trade rejected: ${msg.ticker || "?"}`, "info");
+        refreshPending();
+      } else if (event === "trade_failed") {
+        showToast(`Trade failed: ${msg.ticker || "?"} — ${msg.error || ""}`, "error", 5000);
+        addNotification(`Trade failed: ${msg.ticker || "?"} — ${msg.error || ""}`, "error");
+        refreshPending();
+      }
+    } catch { /* ignore malformed events */ }
+  });
+  _sseSource.onerror = () => {
+    _sseSource.close();
+    _sseSource = null;
+    if (state.sseEnabled) setTimeout(connectSSE, 5000);
+  };
+}
+
+/* ── Command Palette ─────────────────────────── */
+const CMD_PALETTE_ACTIONS = [
+  { id: "scan", label: "Run Scan", shortcut: "S", icon: "search", action: () => document.getElementById("scanBtn")?.click() },
+  { id: "refresh", label: "Refresh All", shortcut: "R", icon: "refresh", action: () => document.getElementById("refreshBtn")?.click() },
+  { id: "ticker", label: "Quick Ticker Check", shortcut: "T", icon: "chart", action: () => { document.getElementById("tickerInput")?.focus(); document.getElementById("quickCheckSection")?.scrollIntoView({ behavior: "smooth" }); } },
+  { id: "pending", label: "Go to Pending Trades", icon: "list", action: () => document.getElementById("pendingSection")?.scrollIntoView({ behavior: "smooth" }) },
+  { id: "portfolio", label: "Go to Portfolio", icon: "wallet", action: () => { runLazyApi("portfolio"); document.getElementById("portfolioSection")?.scrollIntoView({ behavior: "smooth" }); } },
+  { id: "sectors", label: "Go to Sectors", icon: "grid", action: () => { runLazyApi("sectors"); document.getElementById("sectorsSection")?.scrollIntoView({ behavior: "smooth" }); } },
+  { id: "backtest", label: "Go to Backtests", icon: "clock", action: () => { runLazyApi("backtest"); document.getElementById("backtestSection")?.scrollIntoView({ behavior: "smooth" }); } },
+  { id: "performance", label: "Go to Performance", icon: "trending", action: () => { runLazyApi("performance"); document.getElementById("performanceSection")?.scrollIntoView({ behavior: "smooth" }); } },
+  { id: "onboarding", label: "Go to Setup / Onboarding", icon: "settings", action: () => { runLazyApi("onboarding"); document.getElementById("onboardingSection")?.scrollIntoView({ behavior: "smooth" }); } },
+  { id: "calibration", label: "Go to Calibration", icon: "tune", action: () => { runLazyApi("calibration"); document.getElementById("calibrationSection")?.scrollIntoView({ behavior: "smooth" }); } },
+  { id: "sec", label: "SEC Filing Compare", icon: "file", action: () => document.getElementById("secCompareSection")?.scrollIntoView({ behavior: "smooth" }) },
+  { id: "report", label: "Full Report", icon: "doc", action: () => document.getElementById("fullReportSection")?.scrollIntoView({ behavior: "smooth" }) },
+  { id: "decision", label: "Decision Card", icon: "card", action: () => document.getElementById("decisionSection")?.scrollIntoView({ behavior: "smooth" }) },
+  { id: "profiles", label: "Strategy Presets", icon: "sliders", action: () => { runLazyApi("profiles"); document.getElementById("presetsSection")?.scrollIntoView({ behavior: "smooth" }); } },
+  { id: "simple-view", label: "Switch to Simple view", icon: "eye", action: () => { applyDisplayMode("simple"); document.getElementById("displayModeSelect").value = "simple"; } },
+  { id: "standard-view", label: "Switch to Standard view", icon: "eye", action: () => { applyDisplayMode("standard"); document.getElementById("displayModeSelect").value = "standard"; } },
+  { id: "pro-view", label: "Switch to Pro view", icon: "eye", action: () => { applyDisplayMode("pro"); document.getElementById("displayModeSelect").value = "pro"; } },
+  { id: "simple-page", label: "Open Simple Scan Page", icon: "external", action: () => { window.location.href = "/simple"; } },
+  { id: "login", label: "Open Sign In Page", icon: "key", action: () => { window.location.href = "/login"; } },
+  { id: "top", label: "Scroll to Top", icon: "arrow-up", action: () => window.scrollTo({ top: 0, behavior: "smooth" }) },
+];
+
+function openCommandPalette() {
+  let dialog = document.getElementById("cmdPaletteDialog");
+  if (!dialog) return;
+  dialog.classList.add("open");
+  const input = document.getElementById("cmdPaletteInput");
+  if (input) { input.value = ""; input.focus(); }
+  renderCommandResults("");
+}
+
+function closeCommandPalette() {
+  const dialog = document.getElementById("cmdPaletteDialog");
+  if (dialog) dialog.classList.remove("open");
+}
+
+function renderCommandResults(query) {
+  const list = document.getElementById("cmdPaletteList");
+  if (!list) return;
+  const q = query.trim().toLowerCase();
+  const filtered = q
+    ? CMD_PALETTE_ACTIONS.filter((a) => a.label.toLowerCase().includes(q) || a.id.includes(q))
+    : CMD_PALETTE_ACTIONS;
+  list.innerHTML = filtered
+    .map(
+      (a, i) =>
+        `<button class="cmd-palette-item${i === 0 ? " selected" : ""}" data-idx="${i}" type="button">
+          <span class="cmd-palette-label">${safeText(a.label)}</span>
+          ${a.shortcut ? `<kbd class="cmd-palette-kbd">${safeText(a.shortcut)}</kbd>` : ""}
+        </button>`
+    )
+    .join("");
+  list.querySelectorAll(".cmd-palette-item").forEach((btn, idx) => {
+    btn.addEventListener("click", () => {
+      closeCommandPalette();
+      filtered[idx]?.action();
+    });
+    btn.addEventListener("mouseenter", () => {
+      list.querySelectorAll(".cmd-palette-item").forEach((b) => b.classList.remove("selected"));
+      btn.classList.add("selected");
+    });
+  });
+}
+
+function setupCommandPalette() {
+  const input = document.getElementById("cmdPaletteInput");
+  if (!input) return;
+  input.addEventListener("input", () => renderCommandResults(input.value));
+  input.addEventListener("keydown", (e) => {
+    const list = document.getElementById("cmdPaletteList");
+    const items = list ? Array.from(list.querySelectorAll(".cmd-palette-item")) : [];
+    const cur = items.findIndex((b) => b.classList.contains("selected"));
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      const next = Math.min(cur + 1, items.length - 1);
+      items.forEach((b) => b.classList.remove("selected"));
+      items[next]?.classList.add("selected");
+      items[next]?.scrollIntoView({ block: "nearest" });
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      const prev = Math.max(cur - 1, 0);
+      items.forEach((b) => b.classList.remove("selected"));
+      items[prev]?.classList.add("selected");
+      items[prev]?.scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const sel = items[cur >= 0 ? cur : 0];
+      if (sel) sel.click();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeCommandPalette();
+    }
+  });
+  document.getElementById("cmdPaletteDialog")?.addEventListener("click", (e) => {
+    if (e.target.id === "cmdPaletteDialog") closeCommandPalette();
+  });
+}
+
+/* ── Keyboard shortcuts ───────────────────────── */
+function setupKeyboardShortcuts() {
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+      e.preventDefault();
+      const dialog = document.getElementById("cmdPaletteDialog");
+      if (dialog?.classList.contains("open")) closeCommandPalette();
+      else openCommandPalette();
+      return;
+    }
+
+    if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+    switch (e.key) {
+      case "r":
+      case "R":
+        e.preventDefault();
+        document.getElementById("refreshBtn")?.click();
+        showToast("Refreshing all data...", "info", 2000);
+        break;
+      case "s":
+      case "S":
+        e.preventDefault();
+        document.getElementById("scanBtn")?.click();
+        break;
+      case "t":
+      case "T":
+        e.preventDefault();
+        document.getElementById("tickerInput")?.focus();
+        document.getElementById("quickCheckSection")?.scrollIntoView({ behavior: "smooth" });
+        break;
+      case "?":
+        e.preventDefault();
+        showToast("Shortcuts: Ctrl+K = Command palette, R = Refresh, S = Scan, T = Ticker, 1-3 = View", "info", 5000);
+        break;
+      case "1":
+        e.preventDefault();
+        applyDisplayMode("simple");
+        document.getElementById("displayModeSelect").value = "simple";
+        showToast("Switched to Simple view", "info", 2000);
+        break;
+      case "2":
+        e.preventDefault();
+        applyDisplayMode("standard");
+        document.getElementById("displayModeSelect").value = "standard";
+        showToast("Switched to Standard view", "info", 2000);
+        break;
+      case "3":
+        e.preventDefault();
+        applyDisplayMode("pro");
+        document.getElementById("displayModeSelect").value = "pro";
+        showToast("Switched to Pro view", "info", 2000);
+        break;
+    }
+  });
+}
+
+/* ── Activity drawer badge counter ────────────── */
+function updateActivityBadge() {
+  const toggle = document.getElementById("activityDrawerToggle");
+  const list = document.getElementById("logList");
+  if (!toggle || !list) return;
+  const count = list.children.length;
+  let badge = toggle.querySelector(".activity-badge");
+  if (count > 0) {
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "activity-badge";
+      toggle.appendChild(badge);
+    }
+    badge.textContent = count > 99 ? "99+" : String(count);
+  } else if (badge) {
+    badge.remove();
+  }
+}
+
+const _origLogEvent = logEvent;
+logEvent = function (opts) {
+  _origLogEvent(opts);
+  updateActivityBadge();
+};
+
 (async () => {
   wireEvents();
+  setupScrollToTop();
+  setupKeyboardShortcuts();
+  setupCommandPalette();
+  setupNotifications();
   applyDisplayMode(getDisplayMode());
   applyReportViewMode();
   applySecCompareMode();
   await loadConfig();
+  if (state.sseEnabled) connectSSE();
   await authSessionReady;
   const token = await getApiAccessToken();
   if (token) {
@@ -4060,6 +5126,7 @@ function wireEvents() {
   }
   applyQuerySectionDeepLink();
   handleRouteHash();
+  updateActivityBadge();
   logEvent({ kind: "system", severity: "info", message: "Dashboard loaded." });
 })();
 

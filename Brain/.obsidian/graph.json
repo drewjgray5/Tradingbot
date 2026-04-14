@@ -1,0 +1,47 @@
+{
+  "collapse-filter": false,
+  "search": "",
+  "showTags": true,
+  "showAttachments": false,
+  "hideUnresolved": false,
+  "showOrphans": true,
+  "collapse-color-groups": false,
+  "colorGroups": [
+    {
+      "query": "tag:#moc",
+      "color": { "a": 1, "rgb": 3368601 }
+    },
+    {
+      "query": "tag:#architecture",
+      "color": { "a": 1, "rgb": 5431378 }
+    },
+    {
+      "query": "tag:#strategy",
+      "color": { "a": 1, "rgb": 16744192 }
+    },
+    {
+      "query": "tag:#runbook",
+      "color": { "a": 1, "rgb": 16776960 }
+    },
+    {
+      "query": "tag:#config",
+      "color": { "a": 1, "rgb": 10066329 }
+    },
+    {
+      "query": "tag:#api",
+      "color": { "a": 1, "rgb": 16711935 }
+    }
+  ],
+  "collapse-display": false,
+  "showArrow": true,
+  "textFadeMultiplier": 0,
+  "nodeSizeMultiplier": 1.2,
+  "lineSizeMultiplier": 1,
+  "collapse-forces": false,
+  "centerStrength": 0.5,
+  "repelStrength": 10,
+  "linkStrength": 1,
+  "linkDistance": 200,
+  "scale": 0.7,
+  "close": false
+}

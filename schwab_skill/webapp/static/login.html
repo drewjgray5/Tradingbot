@@ -3,7 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Sign in to TradingBot Dashboard." />
+    <meta name="theme-color" content="#07080d" />
     <title>Sign in — TradingBot</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect rx='20' width='100' height='100' fill='%230c0e14'/><path d='M20 65 L35 45 L50 55 L65 30 L80 40' stroke='%2338bdf8' stroke-width='6' fill='none' stroke-linecap='round' stroke-linejoin='round'/><circle cx='80' cy='40' r='5' fill='%23818cf8'/></svg>" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -16,18 +19,19 @@
     <a class="skip-link" href="#loginMain">Skip to main content</a>
     <div class="bg-blur bg1"></div>
     <div class="bg-blur bg2"></div>
+    <div class="bg-grid" aria-hidden="true"></div>
 
-    <main id="loginMain" class="container" style="max-width: 520px; padding-top: 2rem">
-      <header class="card">
+    <main id="loginMain" class="container login-container">
+      <header class="card login-card-header">
         <p class="eyebrow">TradingBot</p>
         <h1>Sign in</h1>
-        <p class="muted">
+        <p class="muted hero-lead">
           Same session as the <a href="/">full dashboard</a>. After signing in, open the dashboard to run scans, backtests, and
           approvals.
         </p>
       </header>
 
-      <section class="card" aria-label="Sign in options">
+      <section class="card login-body" aria-label="Sign in options">
         <div id="loginSupabase" class="hidden">
           <div id="loginSbOut" class="inline-form compact">
             <label class="field-label" for="loginSbEmail">Email</label>
@@ -50,8 +54,8 @@
             <button id="loginJwtSave" class="btn small secondary" type="button">Save</button>
           </div>
         </details>
-        <p id="loginMessage" class="muted" style="margin-top: 12px" role="status" aria-live="polite"></p>
-        <div class="inline-form" style="margin-top: 16px">
+        <p id="loginMessage" class="muted login-message" role="status" aria-live="polite"></p>
+        <div class="inline-form login-actions">
           <a class="btn primary" href="/">Open dashboard</a>
           <a class="btn secondary" href="/simple">Simple scan</a>
         </div>

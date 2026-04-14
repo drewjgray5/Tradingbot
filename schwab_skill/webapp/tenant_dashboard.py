@@ -6,18 +6,26 @@ Registered only from main_saas to avoid widening the local single-user attack su
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
+import secrets
+import struct
+import time
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session as OrmSession
 
+from challenger_mode import ChallengerRunner
+from evolve_logic import LearningEngine
 from execution import get_account_status, get_position_size_usd, place_order
 from full_report import REPORT_SECTION_MAP, generate_full_report, quick_check, report_to_json
 from market_data import extract_schwab_last_price, get_current_quote, get_current_quote_with_status
@@ -29,6 +37,17 @@ from signal_scanner import scan_for_signals_detailed
 from .audit import log_audit
 from .billing_stripe import user_has_paid_entitlement
 from .checklist_language import with_plain_language
+from .learning_state import (
+    LEARNING_LAST_RUN_KEY,
+    append_challenger_result,
+    load_challenger_history,
+    load_state_json,
+    load_strategy_update,
+    load_trade_outcomes,
+    save_learning_last_run,
+    save_strategy_update,
+    upsert_trade_outcome,
+)
 from .models import AppState, BacktestRun, Order, PendingTrade, ScanResult, User, UserCredential
 from .oauth_schwab import (
     SCHWAB_OAUTH_KIND_ACCOUNT,
@@ -40,8 +59,10 @@ from .oauth_schwab import (
 )
 from .preset_catalog import PRESET_PROFILES, build_preset_catalog_payload
 from .recovery_map import map_failure
+from .redaction import safe_exception_message
 from .schemas import ApiResponse, ApproveTradeRequest, CreatePendingTrade
 from .security import (
+    decrypt_secret,
     encrypt_secret,
     get_current_user,
     parse_json,
@@ -57,6 +78,7 @@ ONBOARDING_TARGET_MINUTES = 20
 DEFAULT_AUTOMATION_OPT_IN = False
 DEFAULT_UI_MODE = "standard"
 DEFAULT_PROFILE = "balanced"
+_TWO_FA_STATE_KEY = "security_2fa"
 
 
 def _db() -> OrmSession:
@@ -83,6 +105,12 @@ def _err(message: str, data: Any = None) -> ApiResponse:
     return ApiResponse(ok=False, error=message, data=data)
 
 
+def _saas_error_response(exc: Exception, *, source: str, fallback: str) -> ApiResponse:
+    safe = safe_exception_message(exc, fallback=fallback)
+    mapped = map_failure(safe, source=source)
+    return _err(fallback, {"recovery": mapped, "error_excerpt": mapped.get("raw_error")})
+
+
 def _save_state(db: OrmSession, user_id: str, key: str, payload: dict[str, Any]) -> None:
     row = db.query(AppState).filter(AppState.user_id == user_id, AppState.key == key).first()
     if not row:
@@ -99,6 +127,118 @@ def _load_state(db: OrmSession, user_id: str, key: str, default: dict[str, Any])
         return default
     parsed = parse_json(row.value_json, default)
     return parsed if isinstance(parsed, dict) else default
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_trade_outcome_payload(
+    *,
+    user_id: str,
+    ticker: str,
+    side: str,
+    qty: int,
+    price: float | None,
+    result: dict[str, Any] | None,
+    signal: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    safe_result = result if isinstance(result, dict) else {}
+    safe_signal = signal if isinstance(signal, dict) else {}
+    fill = (
+        safe_result.get("fill_price")
+        or safe_result.get("average_price")
+        or safe_result.get("avg_fill_price")
+        or price
+    )
+    return {
+        "source": "saas_trade_approval",
+        "user_id": user_id,
+        "order_id": str(safe_result.get("orderId") or safe_result.get("order_id") or ""),
+        "ticker": ticker.upper(),
+        "side": side.upper(),
+        "qty": int(qty),
+        "fill_price": _safe_float(fill),
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "return_pct": safe_result.get("return_pct"),
+        "pnl_pct": safe_result.get("pnl_pct"),
+        "mirofish_conviction": safe_signal.get("mirofish_conviction"),
+        "sector_etf": safe_signal.get("sector_etf"),
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _learning_outcomes_for_user(db: OrmSession, user_id: str) -> list[dict[str, Any]]:
+    outcomes = load_trade_outcomes(db, user_id)
+    if outcomes:
+        return outcomes
+
+    rows = (
+        db.query(Order)
+        .filter(Order.user_id == user_id, Order.status == "executed")
+        .order_by(Order.created_at.asc())
+        .limit(500)
+        .all()
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        payload = parse_json(row.result_json, {})
+        payload = payload if isinstance(payload, dict) else {}
+        out.append(
+            {
+                "source": "saas_order_table_fallback",
+                "order_id": str(payload.get("orderId") or payload.get("order_id") or row.id),
+                "ticker": str(row.ticker or "").upper(),
+                "side": str(row.side or "BUY").upper(),
+                "qty": int(row.qty or 0),
+                "fill_price": _safe_float(
+                    payload.get("fill_price")
+                    or payload.get("average_price")
+                    or payload.get("avg_fill_price")
+                    or row.price
+                ),
+                "date": (row.created_at.isoformat()[:10] if row.created_at else datetime.now(timezone.utc).date().isoformat()),
+                "return_pct": payload.get("return_pct"),
+                "pnl_pct": payload.get("pnl_pct"),
+            }
+        )
+    return out
+
+
+def _challenger_win_rate(history: list[dict[str, Any]]) -> dict[str, Any]:
+    if not history:
+        return {"total_runs": 0}
+    verdicts = [h.get("verdict") for h in history if isinstance(h, dict)]
+    total = len(verdicts)
+    if total <= 0:
+        return {"total_runs": 0}
+    return {
+        "total_runs": total,
+        "challenger_wins": verdicts.count("challenger_better"),
+        "champion_wins": verdicts.count("champion_better"),
+        "ties": verdicts.count("tie"),
+        "challenger_win_rate_pct": round((verdicts.count("challenger_better") / total) * 100, 1),
+        "avg_score_delta": round(
+            sum(float(h.get("score_delta", 0) or 0) for h in history if isinstance(h, dict)) / total,
+            2,
+        ),
+    }
+
+
+def _challenger_summary(db: OrmSession, user_id: str) -> dict[str, Any]:
+    history = load_challenger_history(db, user_id)
+    update = load_strategy_update(db, user_id)
+    return {
+        "available": True,
+        "latest": history[-1] if history else None,
+        "win_rate": _challenger_win_rate(history),
+        "can_run": bool(update and update.get("env_overrides")),
+    }
 
 
 def _trade_to_dict(row: PendingTrade) -> dict[str, Any]:
@@ -182,9 +322,12 @@ def _saas_pretrade_checklist(trade: PendingTrade, signal: dict[str, Any]) -> dic
     est_risk_pct = (
         round((est_value / max_total_account) * 100.0, 2) if max_total_account > 0 and est_value > 0 else None
     )
+    high_value_threshold = _high_value_2fa_threshold_usd()
     event_risk = signal.get("event_risk") if isinstance(signal, dict) else {}
     regime = signal.get("regime_v2") if isinstance(signal, dict) else {}
     blocked: list[str] = []
+    if _global_live_trading_kill_switch_on():
+        blocked.append("platform_kill_switch")
     if isinstance(event_risk, dict) and event_risk.get("mode") == "live" and event_risk.get("flagged") and event_risk.get("action") == "block":
         blocked.append("event_risk_block")
     if isinstance(regime, dict) and str(regime.get("mode", "off")) == "live":
@@ -196,6 +339,10 @@ def _saas_pretrade_checklist(trade: PendingTrade, signal: dict[str, Any]) -> dic
     return with_plain_language(
         {
             "risk_percent_estimate": est_risk_pct,
+            "estimated_notional_usd": round(est_value, 2),
+            "high_value_2fa_threshold_usd": high_value_threshold,
+            "requires_high_value_2fa": bool(est_value >= high_value_threshold if high_value_threshold > 0 else False),
+            "daily_loss_limit_usd": _daily_loss_limit_usd(),
             "max_daily_trades": max_trades,
             "live_trades_today": 0,
             "shadow_trades_today": 0,
@@ -225,7 +372,7 @@ def _tenant_api_health_snapshot(db: OrmSession, user_id: str) -> dict[str, Any]:
                 "market_token_ok": False,
                 "account_token_ok": False,
                 "quote_ok": False,
-                "error": str(exc)[:200],
+                "error": safe_exception_message(exc, fallback="token_probe_failed")[:200],
             }
     return {
         "schwab_linked": linked,
@@ -237,6 +384,121 @@ def _tenant_api_health_snapshot(db: OrmSession, user_id: str) -> dict[str, Any]:
 
 def _request_id(request: Request) -> str | None:
     return getattr(request.state, "request_id", None)
+
+
+def _global_live_trading_kill_switch_on() -> bool:
+    return (os.getenv("LIVE_TRADING_KILL_SWITCH") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _daily_loss_limit_usd() -> float:
+    raw = (os.getenv("DAILY_LOSS_LIMIT_USD") or "1500").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 1500.0
+
+
+def _high_value_2fa_threshold_usd() -> float:
+    raw = (os.getenv("HIGH_VALUE_2FA_THRESHOLD_USD") or "10000").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 10000.0
+
+
+def _totp_step_seconds() -> int:
+    raw = (os.getenv("TWO_FA_TOTP_STEP_SECONDS") or "30").strip()
+    try:
+        return max(15, min(120, int(raw)))
+    except ValueError:
+        return 30
+
+
+def _totp_digits() -> int:
+    raw = (os.getenv("TWO_FA_TOTP_DIGITS") or "6").strip()
+    try:
+        return 8 if int(raw) >= 7 else 6
+    except ValueError:
+        return 6
+
+
+def _totp_drift_windows() -> int:
+    raw = (os.getenv("TWO_FA_TOTP_DRIFT_WINDOWS") or "1").strip()
+    try:
+        return max(0, min(3, int(raw)))
+    except ValueError:
+        return 1
+
+
+def _normalize_base32_secret(secret: str) -> str:
+    cleaned = "".join(ch for ch in (secret or "").upper() if ch.isalnum())
+    if not cleaned:
+        raise ValueError("Missing TOTP secret.")
+    pad = "=" * ((8 - (len(cleaned) % 8)) % 8)
+    base64.b32decode(cleaned + pad, casefold=True)
+    return cleaned
+
+
+def _generate_totp_secret() -> str:
+    return base64.b32encode(secrets.token_bytes(20)).decode("utf-8").rstrip("=")
+
+
+def _totp_code(secret_b32: str, counter: int, digits: int) -> str:
+    normalized = _normalize_base32_secret(secret_b32)
+    pad = "=" * ((8 - (len(normalized) % 8)) % 8)
+    key = base64.b32decode(normalized + pad, casefold=True)
+    msg = struct.pack(">Q", int(counter))
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    off = digest[-1] & 0x0F
+    dbc = struct.unpack(">I", digest[off : off + 4])[0] & 0x7FFFFFFF
+    mod = 10**digits
+    return str(dbc % mod).zfill(digits)
+
+
+def _verify_totp_code(secret_b32: str, code: str) -> bool:
+    normalized_code = "".join(ch for ch in str(code or "") if ch.isdigit())
+    if len(normalized_code) not in (6, 8):
+        return False
+    step = _totp_step_seconds()
+    digits = _totp_digits()
+    window = _totp_drift_windows()
+    now_counter = int(time.time() // step)
+    for delta in range(-window, window + 1):
+        candidate = _totp_code(secret_b32, now_counter + delta, digits)
+        if hmac.compare_digest(candidate, normalized_code.zfill(digits)):
+            return True
+    return False
+
+
+def _two_fa_state(db: OrmSession, user_id: str) -> dict[str, Any]:
+    return _load_state(
+        db,
+        user_id,
+        _TWO_FA_STATE_KEY,
+        default={
+            "enabled": False,
+            "totp_secret_enc": None,
+            "enabled_at": None,
+            "pending_secret_enc": None,
+            "pending_created_at": None,
+        },
+    )
+
+
+def _save_two_fa_state(db: OrmSession, user_id: str, state: dict[str, Any]) -> None:
+    _save_state(db, user_id, _TWO_FA_STATE_KEY, state)
+
+
+def _sum_intraday_pnl(account_status: dict[str, Any]) -> float:
+    total = 0.0
+    for acc in account_status.get("accounts", []):
+        sec = acc.get("securitiesAccount", acc)
+        for pos in sec.get("positions", []):
+            try:
+                total += float(pos.get("currentDayProfitLoss", 0) or 0)
+            except Exception:
+                continue
+    return round(total, 2)
 
 
 def _build_report_verdicts(report: dict[str, Any]) -> dict[str, Any]:
@@ -304,6 +566,79 @@ def _sec_analysis_settings_sd(skill_dir: Path) -> dict[str, Any]:
     }
 
 
+def _normalize_sec_analysis_payload_sd(payload: dict[str, Any], *, analysis_mode: str = "full_text") -> dict[str, Any]:
+    data = dict(payload or {})
+    confidence = int(data.get("confidence", 0) or 0)
+    why = list(data.get("why") or [])
+    limits = list(data.get("limits") or [])
+    evidence = list(data.get("evidence") or [])
+    summary_headline = str(data.get("summary_headline") or "").strip()
+    if not summary_headline:
+        verdict = str(data.get("verdict") or "neutral")
+        summary_headline = (
+            f"{data.get('ticker', '')} {data.get('form', '')} filing reads {verdict} "
+            f"with confidence {confidence}/100."
+        ).strip()
+    narrative_summary = str(data.get("narrative_summary") or "").strip()
+    if not narrative_summary:
+        narrative_summary = " ".join(why[:2]).strip() or str(data.get("high_level_takeaway") or "").strip()
+    data["summary_headline"] = summary_headline
+    data["narrative_summary"] = narrative_summary
+    data["confidence"] = confidence
+    data["limits"] = limits
+    data["evidence"] = evidence
+    data["analysis_mode"] = analysis_mode
+    data["data_freshness"] = {
+        "from_cache": bool(data.get("from_cache", False)),
+        "source": str(data.get("source") or ""),
+    }
+    return data
+
+
+def _normalize_sec_compare_payload_sd(payload: dict[str, Any], *, analysis_mode: str = "full_text") -> dict[str, Any]:
+    data = dict(payload or {})
+    compare_data = dict(data.get("compare") or {})
+    similarities = compare_data.get("similarities") or []
+    differences = compare_data.get("differences") or []
+    investor_takeaway = str(compare_data.get("investor_takeaway") or "").strip()
+    compare_data.setdefault(
+        "summary_headline",
+        "SEC compare completed with meaningful differences." if differences else "SEC compare completed with broad alignment.",
+    )
+    compare_data.setdefault(
+        "narrative_summary",
+        (
+            f"{investor_takeaway} "
+            f"Shared signal: {(similarities[0] if similarities else 'limited overlap noted.')} "
+            f"Key difference: {(differences[0] if differences else 'no major contrast highlighted.')}."
+        ).strip(),
+    )
+    compare_data.setdefault("top_differences", differences[:3])
+    compare_data.setdefault("top_commonalities", similarities[:3])
+    if "change_summary" not in compare_data:
+        compare_data["change_summary"] = {
+            "new_risks": [],
+            "resolved_risks": [],
+            "guidance_shift": "unchanged",
+            "evidence_ranked": [],
+            "plain_english_rationale": [],
+        }
+    compare_data["analysis_mode"] = analysis_mode
+    compare_data.setdefault("compare_confidence", 0)
+    compare_data.setdefault("limits", [])
+    compare_data.setdefault("evidence", compare_data.get("change_summary", {}).get("evidence_ranked", []))
+    left = data.get("left") or data.get("latest") or {}
+    right = data.get("right") or data.get("prior") or {}
+    compare_data["data_freshness"] = {
+        "left_from_cache": bool((left or {}).get("from_cache", False)),
+        "right_from_cache": bool((right or {}).get("from_cache", False)),
+        "left_source": str((left or {}).get("source") or ""),
+        "right_source": str((right or {}).get("source") or ""),
+    }
+    data["compare"] = compare_data
+    return data
+
+
 @router.get("/api/status", response_model=ApiResponse)
 def tenant_status(user: User = Depends(get_current_user), db: OrmSession = Depends(_db)) -> ApiResponse:
     try:
@@ -337,7 +672,7 @@ def tenant_status(user: User = Depends(get_current_user), db: OrmSession = Depen
             }
         )
     except Exception as exc:
-        return _err(str(exc))
+        return _saas_error_response(exc, source="status", fallback="Unable to load tenant status.")
 
 
 @router.get("/api/health/deep", response_model=ApiResponse)
@@ -374,7 +709,7 @@ def tenant_health_deep(user: User = Depends(get_current_user), db: OrmSession = 
             }
         )
     except Exception as exc:
-        return _err(str(exc))
+        return _saas_error_response(exc, source="health_deep", fallback="Deep health check is temporarily unavailable.")
 
 
 @router.get("/api/recovery/map", response_model=ApiResponse)
@@ -393,7 +728,7 @@ def tenant_portfolio(user: User = Depends(get_current_user), db: OrmSession = De
             return _err(status_data)
         return _ok(_build_portfolio_summary(status_data))
     except Exception as exc:
-        return _err(str(exc))
+        return _saas_error_response(exc, source="portfolio", fallback="Unable to load portfolio right now.")
 
 
 @router.get("/api/sectors", response_model=ApiResponse)
@@ -405,7 +740,7 @@ def tenant_sectors(user: User = Depends(get_current_user), db: OrmSession = Depe
             heatmap = get_sector_heatmap(auth=DualSchwabAuth(skill_dir=skill_dir), skill_dir=skill_dir)
         return _ok(heatmap)
     except Exception as exc:
-        return _err(str(exc))
+        return _saas_error_response(exc, source="sectors", fallback="Unable to load sector heatmap right now.")
 
 
 @router.get("/api/pending-trades", response_model=ApiResponse)
@@ -467,7 +802,7 @@ def tenant_create_pending(
         db.refresh(row)
         return _ok(_trade_to_dict(row))
     except Exception as exc:
-        return _err(str(exc))
+        return _saas_error_response(exc, source="pending_trade_create", fallback="Unable to stage trade right now.")
 
 
 @router.post("/api/pending-trades/clear-pending", response_model=ApiResponse)
@@ -502,6 +837,106 @@ def tenant_calibration_summary(
         )
     data = parse_json(row.value_json, {})
     return _ok(data if isinstance(data, dict) else {"raw": data})
+
+
+@router.post("/api/evolve/run", response_model=ApiResponse)
+def tenant_evolve_run(
+    user: User = Depends(require_paid_entitlement),
+    db: OrmSession = Depends(_db),
+) -> ApiResponse:
+    outcomes = _learning_outcomes_for_user(db, user.id)
+    if not outcomes:
+        payload = {"status": "no_outcomes", "message": "No persisted trade outcomes found for this tenant."}
+        save_learning_last_run(
+            db, user.id, component="evolve", status=payload["status"], message=payload["message"], data=payload
+        )
+        return _ok(payload)
+    try:
+        with tenant_skill_dir(db, user.id) as skill_dir:
+            engine = LearningEngine(
+                skill_dir=skill_dir,
+                outcomes_records=outcomes,
+                write_strategy_file=False,
+            )
+            result = engine.run(apply=False)
+        if result.get("status") == "ok":
+            strategy_update = result.get("strategy_update")
+            if isinstance(strategy_update, dict) and strategy_update.get("env_overrides"):
+                save_strategy_update(db, user.id, strategy_update)
+        save_learning_last_run(
+            db,
+            user.id,
+            component="evolve",
+            status=str(result.get("status") or "unknown"),
+            message=str(result.get("message") or ""),
+            data=result if isinstance(result, dict) else {},
+        )
+        return _ok(result)
+    except Exception as exc:
+        message = safe_exception_message(exc, fallback="Learning run failed.")
+        save_learning_last_run(db, user.id, component="evolve", status="failed", message=message, data={})
+        return _saas_error_response(exc, source="learning_evolve", fallback="Post-mortem analysis failed.")
+
+
+@router.get("/api/challenger/latest", response_model=ApiResponse)
+def tenant_challenger_latest(
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(_db),
+) -> ApiResponse:
+    history = load_challenger_history(db, user.id)
+    if not history:
+        return _ok({"status": "no_data", "message": "No challenger runs yet."})
+    return _ok(history[-1])
+
+
+@router.get("/api/challenger/history", response_model=ApiResponse)
+def tenant_challenger_history(
+    n: int = 10,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(_db),
+) -> ApiResponse:
+    history = load_challenger_history(db, user.id)
+    tail = history[-max(1, int(n)) :]
+    return _ok({"history": tail, "win_rate": _challenger_win_rate(history)})
+
+
+@router.post("/api/challenger/run", response_model=ApiResponse)
+def tenant_challenger_run(
+    user: User = Depends(require_paid_entitlement),
+    db: OrmSession = Depends(_db),
+) -> ApiResponse:
+    update = load_strategy_update(db, user.id)
+    if not update:
+        payload = {
+            "status": "no_update",
+            "message": "No learning strategy update found. Run /api/evolve/run first.",
+        }
+        save_learning_last_run(
+            db, user.id, component="challenger", status=payload["status"], message=payload["message"], data=payload
+        )
+        return _ok(payload)
+    try:
+        with tenant_skill_dir(db, user.id) as skill_dir:
+            runner = ChallengerRunner(
+                skill_dir=skill_dir,
+                strategy_update_data=update,
+                history_loader=lambda: load_challenger_history(db, user.id),
+                history_saver=lambda comp: append_challenger_result(db, user.id, comp),
+            )
+            result = runner.run()
+        save_learning_last_run(
+            db,
+            user.id,
+            component="challenger",
+            status=str(result.get("status") or "unknown"),
+            message=str(result.get("message") or ""),
+            data=result if isinstance(result, dict) else {},
+        )
+        return _ok(result)
+    except Exception as exc:
+        message = safe_exception_message(exc, fallback="Challenger run failed.")
+        save_learning_last_run(db, user.id, component="challenger", status="failed", message=message, data={})
+        return _saas_error_response(exc, source="challenger", fallback="Challenger scan failed.")
 
 
 @router.get("/api/scan/status", response_model=ApiResponse)
@@ -613,7 +1048,7 @@ def tenant_check_ticker(
             data = quick_check(ticker.upper().strip(), auth=auth, skill_dir=skill_dir)
         return _ok(data)
     except Exception as exc:
-        return _err(str(exc))
+        return _saas_error_response(exc, source="quick_check", fallback="Quick ticker check failed.")
 
 
 @router.get("/api/report/{ticker}", response_model=ApiResponse)
@@ -664,7 +1099,7 @@ def tenant_report_ticker(
             data["section_verdicts"] = section_verdicts
             return _ok(data)
     except Exception as exc:
-        return _err(str(exc))
+        return _saas_error_response(exc, source="report", fallback="Full report generation failed.")
 
 
 @router.get("/api/sec/compare", response_model=ApiResponse)
@@ -725,30 +1160,9 @@ def tenant_sec_compare(
 
             if not out.get("ok"):
                 return ApiResponse(ok=False, error=str(out.get("error", "SEC compare failed")))
-            compare_data = out.get("compare")
-            if isinstance(compare_data, dict):
-                similarities = compare_data.get("similarities") or []
-                differences = compare_data.get("differences") or []
-                investor_takeaway = str(compare_data.get("investor_takeaway") or "").strip()
-                compare_data.setdefault(
-                    "summary_headline",
-                    "SEC compare completed with meaningful differences."
-                    if differences
-                    else "SEC compare completed with broad alignment.",
-                )
-                compare_data.setdefault(
-                    "narrative_summary",
-                    (
-                        f"{investor_takeaway} "
-                        f"Shared signal: {(similarities[0] if similarities else 'limited overlap noted.')} "
-                        f"Key difference: {(differences[0] if differences else 'no major contrast highlighted.')}."
-                    ).strip(),
-                )
-                compare_data.setdefault("top_differences", differences[:3])
-                compare_data.setdefault("top_commonalities", similarities[:3])
-            return _ok(out)
+            return _ok(_normalize_sec_compare_payload_sd(out))
     except Exception as exc:
-        return _err(str(exc))
+        return _saas_error_response(exc, source="sec_compare", fallback="SEC compare failed.")
 
 
 @router.get("/api/performance", response_model=ApiResponse)
@@ -827,6 +1241,8 @@ def tenant_performance(user: User = Depends(get_current_user), db: OrmSession = 
                 "commingled_metric_allowed": False,
                 "message": "Backtest, shadow/paper, and live are reported as separate buckets only.",
             },
+            "challenger": _challenger_summary(db, user.id),
+            "learning_status": load_state_json(db, user.id, LEARNING_LAST_RUN_KEY, {}),
         }
     )
 
@@ -845,6 +1261,11 @@ def tenant_approve_trade(
     db_user = db.query(User).filter(User.id == user.id).first()
     if not db_user:
         return _err("User not found.")
+    if _global_live_trading_kill_switch_on():
+        raise HTTPException(
+            status_code=403,
+            detail="Platform kill switch is enabled. New live orders are blocked by policy.",
+        )
     if getattr(db_user, "trading_halted", False):
         raise HTTPException(
             status_code=403,
@@ -867,6 +1288,42 @@ def tenant_approve_trade(
             ok=False,
             error="typed_ticker must exactly match the staged trade ticker (re-type to confirm the live order).",
         )
+
+    order_notional = float((row.price or 0) * (row.qty or 0))
+    day_pnl_usd = 0.0
+    with tenant_skill_dir(db, user.id) as skill_dir:
+        account_status = get_account_status(skill_dir=skill_dir)
+    if isinstance(account_status, str):
+        raise HTTPException(
+            status_code=503,
+            detail="Could not evaluate daily loss guardrail because account status lookup failed.",
+        )
+    if isinstance(account_status, dict):
+        day_pnl_usd = _sum_intraday_pnl(account_status)
+    day_loss_limit = _daily_loss_limit_usd()
+    if day_loss_limit > 0 and day_pnl_usd <= -abs(day_loss_limit):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Daily loss limit hit (${day_loss_limit:,.2f}). "
+                f"Current intraday P/L is ${day_pnl_usd:,.2f}; live approvals are blocked."
+            ),
+        )
+
+    two_fa = _two_fa_state(db, user.id)
+    needs_high_value_2fa = order_notional >= _high_value_2fa_threshold_usd()
+    if needs_high_value_2fa:
+        if not bool(two_fa.get("enabled")):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "High-value execution requires 2FA. "
+                    "Enable TOTP under /api/security/2fa/setup before approving this order."
+                ),
+            )
+        secret = decrypt_secret(str(two_fa.get("totp_secret_enc") or "")) or ""
+        if not _verify_totp_code(secret, str(payload.otp_code or "")):
+            raise HTTPException(status_code=401, detail="High-value execution requires a valid 2FA code.")
 
     signal = json.loads(row.signal_json or "{}")
     settings = _load_state(db, user.id, "ui_settings", {})
@@ -919,6 +1376,22 @@ def tenant_approve_trade(
     row.status = "executed"
     db.commit()
     db.refresh(row)
+    try:
+        upsert_trade_outcome(
+            db,
+            user.id,
+            _build_trade_outcome_payload(
+                user_id=user.id,
+                ticker=row.ticker,
+                side="BUY",
+                qty=int(row.qty or 0),
+                price=_safe_float(row.price),
+                result=result if isinstance(result, dict) else {},
+                signal=signal if isinstance(signal, dict) else {},
+            ),
+        )
+    except Exception:
+        pass
     log_audit(
         db,
         action="trade_approved_executed",
@@ -956,10 +1429,17 @@ def tenant_preflight_trade(
     if not row:
         return ApiResponse(ok=False, error="Trade not found.")
     signal = json.loads(row.signal_json or "{}")
+    checklist = _saas_pretrade_checklist(row, signal if isinstance(signal, dict) else {})
+    two_fa = _two_fa_state(db, user.id)
     return _ok(
         {
             "trade": _trade_to_dict(row),
-            "checklist": _saas_pretrade_checklist(row, signal if isinstance(signal, dict) else {}),
+            "checklist": checklist,
+            "high_value_2fa": {
+                "enabled": bool(two_fa.get("enabled")),
+                "required": bool(checklist.get("requires_high_value_2fa")),
+                "threshold_usd": _high_value_2fa_threshold_usd(),
+            },
         }
     )
 
@@ -1006,6 +1486,83 @@ def tenant_set_profile(
     }
     _save_state(db, user.id, "ui_settings", settings)
     return _ok({"settings": settings, "runtime_overrides": runtime})
+
+
+@router.get("/api/security/2fa/status", response_model=ApiResponse)
+def tenant_two_fa_status(user: User = Depends(get_current_user), db: OrmSession = Depends(_db)) -> ApiResponse:
+    state = _two_fa_state(db, user.id)
+    return _ok(
+        {
+            "enabled": bool(state.get("enabled")),
+            "high_value_threshold_usd": _high_value_2fa_threshold_usd(),
+        }
+    )
+
+
+@router.post("/api/security/2fa/setup", response_model=ApiResponse)
+def tenant_two_fa_setup(user: User = Depends(get_current_user), db: OrmSession = Depends(_db)) -> ApiResponse:
+    secret = _generate_totp_secret()
+    state = _two_fa_state(db, user.id)
+    state["pending_secret_enc"] = encrypt_secret(secret)
+    state["pending_created_at"] = utcnow_iso()
+    _save_two_fa_state(db, user.id, state)
+    issuer = (os.getenv("TWO_FA_ISSUER") or "TradingBot").strip() or "TradingBot"
+    label = urllib.parse.quote(f"{issuer}:{user.email or user.id}")
+    issuer_q = urllib.parse.quote(issuer)
+    otp_uri = f"otpauth://totp/{label}?secret={secret}&issuer={issuer_q}&digits={_totp_digits()}&period={_totp_step_seconds()}"
+    return _ok(
+        {
+            "secret": secret,
+            "otpauth_uri": otp_uri,
+            "digits": _totp_digits(),
+            "period_seconds": _totp_step_seconds(),
+        }
+    )
+
+
+@router.post("/api/security/2fa/enable", response_model=ApiResponse)
+def tenant_two_fa_enable(
+    payload: dict[str, Any] | None = Body(default=None),
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(_db),
+) -> ApiResponse:
+    code = str((payload or {}).get("otp_code") or "").strip()
+    state = _two_fa_state(db, user.id)
+    pending_enc = str(state.get("pending_secret_enc") or "").strip()
+    if not pending_enc:
+        raise HTTPException(status_code=409, detail="Run 2FA setup first.")
+    secret = decrypt_secret(pending_enc) or ""
+    if not _verify_totp_code(secret, code):
+        raise HTTPException(status_code=401, detail="Invalid 2FA code.")
+    state["enabled"] = True
+    state["enabled_at"] = utcnow_iso()
+    state["totp_secret_enc"] = encrypt_secret(secret)
+    state["pending_secret_enc"] = None
+    state["pending_created_at"] = None
+    _save_two_fa_state(db, user.id, state)
+    return _ok({"enabled": True})
+
+
+@router.post("/api/security/2fa/disable", response_model=ApiResponse)
+def tenant_two_fa_disable(
+    payload: dict[str, Any] | None = Body(default=None),
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(_db),
+) -> ApiResponse:
+    code = str((payload or {}).get("otp_code") or "").strip()
+    state = _two_fa_state(db, user.id)
+    if not bool(state.get("enabled")):
+        return _ok({"enabled": False})
+    secret = decrypt_secret(str(state.get("totp_secret_enc") or "")) or ""
+    if not _verify_totp_code(secret, code):
+        raise HTTPException(status_code=401, detail="Invalid 2FA code.")
+    state["enabled"] = False
+    state["enabled_at"] = None
+    state["totp_secret_enc"] = None
+    state["pending_secret_enc"] = None
+    state["pending_created_at"] = None
+    _save_two_fa_state(db, user.id, state)
+    return _ok({"enabled": False})
 
 
 @router.post("/api/onboarding/start", response_model=ApiResponse)
@@ -1144,7 +1701,10 @@ def schwab_authorize_url_endpoint(user: User = Depends(get_current_user)) -> Api
     try:
         state = sign_schwab_oauth_state(user.id, SCHWAB_OAUTH_KIND_ACCOUNT)
     except (RuntimeError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=503,
+            detail=safe_exception_message(exc, fallback="OAuth state signing is unavailable."),
+        ) from exc
     url = schwab_authorize_url(client_id, redirect_uri, state)
     return _ok({"url": url, "state": state})
 
@@ -1161,7 +1721,10 @@ def schwab_market_authorize_url_endpoint(user: User = Depends(get_current_user))
     try:
         state = sign_schwab_oauth_state(user.id, SCHWAB_OAUTH_KIND_MARKET)
     except (RuntimeError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=503,
+            detail=safe_exception_message(exc, fallback="OAuth state signing is unavailable."),
+        ) from exc
     url = schwab_authorize_url(client_id, redirect_uri, state)
     return _ok({"url": url, "state": state})
 
@@ -1200,7 +1763,8 @@ def schwab_oauth_callback(
     try:
         tok = exchange_schwab_code_for_tokens(client_id, client_secret, code, redirect_uri)
     except Exception as exc:
-        return red("schwab_oauth=error&message=" + urllib.parse.quote(str(exc)[:180]))
+        safe_error = safe_exception_message(exc, fallback="oauth_exchange_failed")
+        return red("schwab_oauth=error&message=" + urllib.parse.quote(safe_error[:180]))
 
     access = str(tok.get("access_token") or "").strip()
     refresh = str(tok.get("refresh_token") or "").strip()
@@ -1291,8 +1855,9 @@ def schwab_market_oauth_callback(
     try:
         tok = exchange_schwab_code_for_tokens(client_id, client_secret, code, redirect_uri)
     except Exception as exc:
+        safe_error = safe_exception_message(exc, fallback="oauth_exchange_failed")
         return red(
-            "schwab_market_oauth=error&message=" + urllib.parse.quote(str(exc)[:180])
+            "schwab_market_oauth=error&message=" + urllib.parse.quote(safe_error[:180])
         )
 
     access = str(tok.get("access_token") or "").strip()

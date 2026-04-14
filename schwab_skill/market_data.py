@@ -6,6 +6,7 @@ When PREFER_SCHWAB_DATA=true (default), logs warning when yfinance fallback is u
 """
 
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -20,12 +21,17 @@ from schwab_auth import DualSchwabAuth
 LOG = logging.getLogger(__name__)
 
 SCHWAB_BASE = "https://api.schwabapi.com"
+POLYGON_BASE = "https://api.polygon.io"
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 60.0
 BACKOFF_MULTIPLIER = 2.0
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 SKILL_DIR = Path(__file__).resolve().parent
+
+
+def _empty_ohlcv() -> pd.DataFrame:
+    return pd.DataFrame(columns=OHLCV_COLUMNS).rename_axis("date")
 
 
 def _get_headers(access_token: str) -> dict:
@@ -73,6 +79,44 @@ def _request_with_backoff(
     return resp
 
 
+def _polygon_api_key() -> str:
+    return (os.getenv("POLYGON_API_KEY") or "").strip()
+
+
+def _get_polygon_quote_fallback(ticker: str) -> tuple[dict | None, dict[str, Any]]:
+    key = _polygon_api_key()
+    meta: dict[str, Any] = {"provider": "polygon", "reason": None, "http_status": None}
+    if not key:
+        meta["reason"] = "polygon_api_key_missing"
+        return None, meta
+    symbol = ticker.upper().strip()
+    try:
+        trade_url = f"{POLYGON_BASE}/v2/last/trade/{symbol}"
+        resp = requests.get(trade_url, params={"apiKey": key}, timeout=8)
+        meta["http_status"] = resp.status_code
+        if resp.ok:
+            body = resp.json()
+            px = body.get("results", {}).get("p")
+            if px is not None:
+                return {"symbol": symbol, "lastPrice": float(px), "source": "polygon"}, meta
+        prev_url = f"{POLYGON_BASE}/v2/aggs/ticker/{symbol}/prev"
+        prev = requests.get(prev_url, params={"adjusted": "true", "apiKey": key}, timeout=8)
+        meta["http_status"] = prev.status_code
+        if prev.ok:
+            body = prev.json()
+            rows = body.get("results") or []
+            if rows:
+                close_px = rows[0].get("c")
+                if close_px is not None:
+                    return {"symbol": symbol, "lastPrice": float(close_px), "source": "polygon_prev_close"}, meta
+        meta["reason"] = "polygon_no_price"
+        return None, meta
+    except Exception as exc:
+        meta["reason"] = f"polygon_error:{type(exc).__name__}"
+        meta["error_detail"] = str(exc)[:220]
+        return None, meta
+
+
 def _get_daily_history_yfinance(ticker: str, days: int) -> pd.DataFrame:
     """Fallback when Schwab fails (401, etc.). Returns same format as get_daily_history."""
     try:
@@ -81,26 +125,30 @@ def _get_daily_history_yfinance(ticker: str, days: int) -> pd.DataFrame:
         period = "2y" if days > 365 else "1y"
         df = t.history(period=period, auto_adjust=True)
         if df.empty or len(df) < 2:
-            return pd.DataFrame(columns=OHLCV_COLUMNS).rename_axis("date")
+            return _empty_ohlcv()
         df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
         df = df[OHLCV_COLUMNS].sort_index().drop_duplicates()
         df.index = df.index.tz_localize(None).normalize()
         df.index.name = "date"
         return df
     except Exception:
-        return pd.DataFrame(columns=OHLCV_COLUMNS).rename_axis("date")
+        return _empty_ohlcv()
 
 
-def get_daily_history(
+def get_daily_history_with_meta(
     ticker: str,
     days: int = 300,
     auth: DualSchwabAuth | None = None,
     skill_dir: Path | str | None = None,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
-    Fetch daily OHLCV using Schwab Market Session. Falls back to yfinance on 401/errors.
-    When PREFER_SCHWAB_DATA=true, logs warning when fallback is used.
-    Returns DataFrame with DatetimeIndex and columns: open, high, low, close, volume.
+    Fetch daily OHLCV and return provider lineage metadata.
+
+    Metadata fields:
+    - provider: "schwab" or "yfinance"
+    - used_fallback: bool
+    - fallback_reason: short reason when fallback is used
+    - rows: number of rows returned
     """
     auth = auth or DualSchwabAuth(skill_dir=skill_dir or SKILL_DIR)
     ticker = ticker.upper().strip()
@@ -118,6 +166,12 @@ def get_daily_history(
         "startDate": start_ms,
         "endDate": end_ms,
     }
+    meta: dict[str, Any] = {
+        "provider": "schwab",
+        "used_fallback": False,
+        "fallback_reason": None,
+        "rows": 0,
+    }
 
     try:
         resp = _request_with_backoff(auth, "GET", url, params=params)
@@ -125,7 +179,9 @@ def get_daily_history(
         data = resp.json()
         candles = data.get("candles")
         if not candles:
-            return pd.DataFrame(columns=OHLCV_COLUMNS).rename_axis("date")
+            out = _empty_ohlcv()
+            meta["rows"] = 0
+            return out, meta
 
         df = pd.DataFrame(candles)
         dt_series = pd.to_datetime(df["datetime"], unit="ms", utc=True) if "datetime" in df.columns else pd.NaT
@@ -136,9 +192,13 @@ def get_daily_history(
         df = df[required].copy().astype({c: float for c in required})
         df.index = pd.DatetimeIndex(dt_series).tz_localize(None).normalize()
         df.index.name = "date"
-        df = df[OHLCV_COLUMNS].sort_index().drop_duplicates()
-        return df
+        out = df[OHLCV_COLUMNS].sort_index().drop_duplicates()
+        meta["rows"] = int(len(out))
+        return out, meta
     except Exception as e:
+        meta["provider"] = "yfinance"
+        meta["used_fallback"] = True
+        meta["fallback_reason"] = f"{type(e).__name__}"
         # If the circuit breaker is unstable, we'll very likely hit this path.
         # Keep the fallback behavior safe and non-crashing.
         try:
@@ -147,7 +207,29 @@ def get_daily_history(
                 LOG.warning("Schwab data failed for %s (%s), using yfinance fallback", ticker, e)
         except ImportError:
             pass
-        return _get_daily_history_yfinance(ticker, days)
+        out = _get_daily_history_yfinance(ticker, days)
+        meta["rows"] = int(len(out))
+        return out, meta
+
+
+def get_daily_history(
+    ticker: str,
+    days: int = 300,
+    auth: DualSchwabAuth | None = None,
+    skill_dir: Path | str | None = None,
+) -> pd.DataFrame:
+    """
+    Fetch daily OHLCV using Schwab Market Session. Falls back to yfinance on 401/errors.
+    When PREFER_SCHWAB_DATA=true, logs warning when fallback is used.
+    Returns DataFrame with DatetimeIndex and columns: open, high, low, close, volume.
+    """
+    df, _meta = get_daily_history_with_meta(
+        ticker=ticker,
+        days=days,
+        auth=auth,
+        skill_dir=skill_dir,
+    )
+    return df
 
 
 def extract_schwab_last_price(quote: dict[str, Any] | None) -> float | None:
@@ -242,6 +324,14 @@ def get_current_quote_with_status(
                 ticker_u,
                 meta["error_detail"],
             )
+            fallback_quote, fallback_meta = _get_polygon_quote_fallback(ticker_u)
+            if fallback_quote is not None:
+                meta["fallback_provider"] = fallback_meta.get("provider")
+                meta["reason"] = "schwab_fallback_polygon"
+                px = extract_schwab_last_price(fallback_quote)
+                if px is not None:
+                    meta["last_price"] = round(px, 6)
+                return fallback_quote, meta
             return None, meta
         data = resp.json()
         if isinstance(data, dict):
@@ -249,11 +339,27 @@ def get_current_quote_with_status(
         quote = _select_schwab_quote_payload(data, ticker_u)
         if quote is None:
             meta["reason"] = "no_matching_symbol_in_response"
+            fallback_quote, fallback_meta = _get_polygon_quote_fallback(ticker_u)
+            if fallback_quote is not None:
+                meta["fallback_provider"] = fallback_meta.get("provider")
+                meta["reason"] = "schwab_fallback_polygon"
+                px = extract_schwab_last_price(fallback_quote)
+                if px is not None:
+                    meta["last_price"] = round(px, 6)
+                return fallback_quote, meta
             return None, meta
         meta["quote_keys"] = sorted(str(k) for k in quote.keys())[:32]
         price = extract_schwab_last_price(quote)
         if price is None:
             meta["reason"] = "last_price_not_parseable"
+            fallback_quote, fallback_meta = _get_polygon_quote_fallback(ticker_u)
+            if fallback_quote is not None:
+                meta["fallback_provider"] = fallback_meta.get("provider")
+                meta["reason"] = "schwab_fallback_polygon"
+                fpx = extract_schwab_last_price(fallback_quote)
+                if fpx is not None:
+                    meta["last_price"] = round(fpx, 6)
+                return fallback_quote, meta
         else:
             meta["last_price"] = round(price, 6)
         return quote, meta
@@ -261,7 +367,15 @@ def get_current_quote_with_status(
         meta["reason"] = type(e).__name__
         meta["error_detail"] = str(e)[:400]
         LOG.warning("get_current_quote failed for %s: %s", ticker_u, e)
-        return None, meta
+    fallback_quote, fallback_meta = _get_polygon_quote_fallback(ticker_u)
+    if fallback_quote is not None:
+        meta["fallback_provider"] = fallback_meta.get("provider")
+        meta["reason"] = "schwab_fallback_polygon"
+        px = extract_schwab_last_price(fallback_quote)
+        if px is not None:
+            meta["last_price"] = round(px, 6)
+        return fallback_quote, meta
+    return None, meta
 
 
 def get_current_quote(
