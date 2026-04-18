@@ -144,3 +144,48 @@ def test_materialize_appends_user_trading_halted(
     materialize_tenant_skill_dir(db, "u4", skill_dir)
     env_text = (skill_dir / ".env").read_text(encoding="utf-8")
     assert "USER_TRADING_HALTED=1" in env_text
+
+
+def test_user_can_materialize_requires_market_source(
+    db_session: Session,
+    cred_key: None,
+    schwab_platform_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SAAS_PLATFORM_MARKET_SKILL_DIR", raising=False)
+    db = db_session
+    db.add(User(id="u5", email="no-market@example.com", auth_provider="supabase"))
+    account_json = json.dumps({"access_token": "a3", "refresh_token": "ar3"})
+    db.add(
+        UserCredential(
+            user_id="u5",
+            account_token_payload_enc=encrypt_secret(account_json),
+        )
+    )
+    db.commit()
+
+    ok, reason = user_can_materialize_for_scan(db, "u5")
+    assert ok is False
+    assert "Market session missing" in reason
+
+
+def test_materialize_errors_when_platform_fallback_missing_market_token_file(
+    tmp_path: Path,
+    db_session: Session,
+    cred_key: None,
+    schwab_platform_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    empty_platform_dir = tmp_path / "platform-empty"
+    empty_platform_dir.mkdir()
+    monkeypatch.setenv("SAAS_PLATFORM_MARKET_SKILL_DIR", str(empty_platform_dir))
+
+    db = db_session
+    db.add(User(id="u6", email="fallback-missing@example.com", auth_provider="supabase"))
+    account_json = json.dumps({"access_token": "a4", "refresh_token": "ar4"})
+    db.add(UserCredential(user_id="u6", account_token_payload_enc=encrypt_secret(account_json)))
+    db.commit()
+
+    with pytest.raises(RuntimeError) as exc:
+        materialize_tenant_skill_dir(db, "u6", tmp_path / "tenant-u6")
+    assert "tokens_market.enc missing" in str(exc.value)

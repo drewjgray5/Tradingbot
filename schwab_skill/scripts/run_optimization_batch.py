@@ -72,13 +72,14 @@ def _run_one(
         str(min_oos_pf_margin),
     ]
     started = datetime.now(timezone.utc)
+    timeout_value: int | None = None if int(timeout_seconds) <= 0 else int(timeout_seconds)
     try:
         proc = subprocess.run(
             cmd,
             cwd=str(SKILL_DIR.parent),
             capture_output=True,
             text=True,
-            timeout=max(60, int(timeout_seconds)),
+            timeout=timeout_value,
         )
         stdout = (proc.stdout or "").strip()
         return {
@@ -134,7 +135,12 @@ def main() -> int:
     parser.add_argument("--max-drawdown-degrade", type=float, default=1.5, help="Drawdown degradation cap vs baseline")
     parser.add_argument("--min-oos-pf", type=float, default=1.15, help="Minimum OOS PF gate")
     parser.add_argument("--min-oos-pf-margin", type=float, default=0.01, help="Required OOS PF improvement margin")
-    parser.add_argument("--timeout-seconds", type=int, default=3600, help="Per-run hard timeout")
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=3600,
+        help="Per-run hard timeout (0 disables timeout).",
+    )
     parser.add_argument("--retry-on-fail", type=int, default=1, help="Extra attempts for failed runs")
     args = parser.parse_args()
 
@@ -149,6 +155,7 @@ def main() -> int:
         best_record: dict[str, Any] | None = None
         while attempts <= max(0, args.retry_on_fail):
             attempts += 1
+            effective_timeout = 0 if int(args.timeout_seconds) <= 0 else int(args.timeout_seconds)
             rec = _run_one(
                 seed=seed,
                 start_date=start_date,
@@ -159,7 +166,7 @@ def main() -> int:
                 max_drawdown_degrade=args.max_drawdown_degrade,
                 min_oos_pf=args.min_oos_pf,
                 min_oos_pf_margin=args.min_oos_pf_margin,
-                timeout_seconds=min(max(300, int(args.timeout_seconds)), timeout_seconds),
+                timeout_seconds=effective_timeout,
             )
             rec["attempt"] = attempts
             best_record = rec

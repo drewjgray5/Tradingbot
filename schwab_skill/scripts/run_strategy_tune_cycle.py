@@ -16,7 +16,7 @@ SKILL_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = SKILL_DIR / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from promotion_guard import ensure_manual_promotion_approval
+from promotion_guard import ensure_signed_approval
 
 
 def _run(cmd: list[str]) -> int:
@@ -38,9 +38,12 @@ def main() -> int:
     parser.add_argument("--min-pf-delta", type=float, default=0.02)
     parser.add_argument("--min-expectancy-delta", type=float, default=0.0)
     parser.add_argument("--max-drawdown-degrade-cap", type=float, default=2.0)
+    parser.add_argument("--timeout-seconds", type=int, default=3600)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
-    if not ensure_manual_promotion_approval(args.apply):
+    if not ensure_signed_approval(
+        "strategy_tune_cycle", apply_requested=args.apply
+    ):
         return 2
 
     optimize_cmd = [
@@ -62,6 +65,8 @@ def main() -> int:
         str(args.min_trades),
         "--max-drawdown-degrade",
         str(args.max_drawdown_degrade_cap),
+        "--timeout-seconds",
+        str(args.timeout_seconds),
     ]
     rc = _run(optimize_cmd)
     if rc != 0:

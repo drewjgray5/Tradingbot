@@ -1318,32 +1318,95 @@ select:focus-visible,
 .status-dot.bad { background: #ef4444; }
 .status-dot.warn { background: #f59e0b; }
 
-.quick-view-panel {
+/* Trade drawer (unified Decision + Recovery slide-in) ------------------ */
+.trade-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.55);
+  backdrop-filter: blur(2px);
+  z-index: 29;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+body.trade-drawer-open .trade-drawer-backdrop {
+  opacity: 1;
+  pointer-events: auto;
+}
+.trade-drawer {
   position: fixed;
   top: 0;
   right: 0;
-  width: min(460px, 92vw);
+  width: min(480px, 96vw);
   height: 100vh;
-  background: rgba(9, 9, 11, 0.96);
+  background: rgba(9, 9, 11, 0.97);
   border-left: 1px solid rgba(82, 82, 91, 0.9);
   transform: translateX(100%);
   transition: transform 0.2s ease;
   z-index: 30;
   display: grid;
-  grid-template-rows: auto 1fr;
-  gap: 8px;
-  padding: 12px;
+  grid-template-rows: auto auto 1fr;
+  gap: 10px;
+  padding: 14px;
+  overflow-y: auto;
 }
-.quick-view-panel.open { transform: translateX(0); }
-.quick-view-header {
+.trade-drawer.open { transform: translateX(0); }
+.trade-drawer-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 8px;
 }
-.quick-view-header h3 {
+.trade-drawer-header h3 {
   margin: 0;
-  font-size: 0.95rem;
+  font-size: 1rem;
+  color: #e2e8f0;
+}
+.trade-drawer-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid rgba(100, 116, 139, 0.35);
+  padding-bottom: 4px;
+}
+.trade-drawer-tab {
+  flex: 1 1 auto;
+  background: transparent;
+  border: 1px solid transparent;
+  color: #94a3b8;
+  font-size: 0.88rem;
+  font-weight: 600;
+  padding: 8px 12px;
+  border-radius: 8px 8px 0 0;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.trade-drawer-tab:hover { color: #cbd5f5; }
+.trade-drawer-tab.active {
+  color: #e2e8f0;
+  background: rgba(56, 189, 248, 0.12);
+  border-color: rgba(56, 189, 248, 0.35);
+  border-bottom-color: rgba(9, 9, 11, 0.97);
+}
+.trade-drawer-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.trade-drawer-panel.hidden { display: none; }
+.trade-drawer-panel .inline-form {
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.trade-drawer-panel .inline-form input,
+.trade-drawer-panel .inline-form select {
+  flex: 1 1 120px;
+  min-width: 0;
+}
+.trade-drawer-launcher input,
+.trade-drawer-launcher select {
+  flex: 1 1 140px;
+  min-width: 0;
 }
 
 .activity-drawer {
@@ -2321,6 +2384,162 @@ body.ui-simple #onboardingSection {
 .onboarding-connect-row {
   flex-wrap: wrap;
   align-items: center;
+}
+
+/* Schwab onboarding stepper -------------------------------------------- */
+.onboarding-stepper {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+  counter-reset: ob-step;
+}
+.onboarding-stepper li {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(100, 116, 139, 0.35);
+  background: rgba(10, 16, 34, 0.5);
+  font-size: 0.85rem;
+  line-height: 1.25;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.onboarding-stepper li .step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  background: rgba(100, 116, 139, 0.25);
+  color: #cbd5f5;
+  font-size: 0.78rem;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.onboarding-stepper li .step-label {
+  font-weight: 600;
+  color: #e2e8f0;
+}
+.onboarding-stepper li .step-state {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.onboarding-stepper li.done {
+  border-color: rgba(52, 211, 153, 0.55);
+  background: rgba(6, 78, 59, 0.22);
+}
+.onboarding-stepper li.done .step-num {
+  background: rgba(52, 211, 153, 0.85);
+  color: #022c22;
+}
+.onboarding-stepper li.done .step-state {
+  color: #6ee7b7;
+}
+.onboarding-stepper li.failed {
+  border-color: rgba(251, 113, 133, 0.6);
+  background: rgba(127, 29, 29, 0.18);
+}
+.onboarding-stepper li.failed .step-num {
+  background: rgba(251, 113, 133, 0.85);
+  color: #4c0519;
+}
+.onboarding-stepper li.failed .step-state {
+  color: #fda4af;
+}
+.onboarding-stepper li.current {
+  border-color: rgba(56, 189, 248, 0.7);
+  background: rgba(8, 47, 73, 0.45);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.35);
+}
+.onboarding-stepper li.current .step-num {
+  background: rgba(56, 189, 248, 0.9);
+  color: #082f49;
+}
+.onboarding-stepper li.current .step-state {
+  color: #7dd3fc;
+}
+.onboarding-stepper.complete li.done .step-state {
+  opacity: 0.7;
+}
+
+.onboarding-next-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  margin-bottom: 12px;
+}
+.onboarding-next-copy {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+.onboarding-next-title {
+  margin: 0 0 4px;
+  font-weight: 600;
+  font-size: 1rem;
+  color: #e2e8f0;
+}
+.onboarding-next-desc {
+  margin: 0;
+  font-size: 0.88rem;
+  line-height: 1.4;
+}
+.onboarding-next-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.onboarding-help,
+.onboarding-advanced {
+  margin-bottom: 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(100, 116, 139, 0.25);
+  background: rgba(10, 16, 34, 0.4);
+  padding: 0 12px;
+}
+.onboarding-help summary,
+.onboarding-advanced summary {
+  cursor: pointer;
+  padding: 10px 0;
+  font-weight: 600;
+  color: #cbd5f5;
+}
+.onboarding-help[open],
+.onboarding-advanced[open] {
+  padding-bottom: 12px;
+}
+.onboarding-help-body h3 {
+  margin: 14px 0 6px;
+  font-size: 0.92rem;
+  color: #e2e8f0;
+}
+.onboarding-help-body p {
+  margin: 0 0 8px;
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+.onboarding-help-list {
+  margin: 0 0 8px 18px;
+  padding: 0;
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+.onboarding-help-list li {
+  margin-bottom: 4px;
 }
 body.ui-simple #scanDiagnosticsPanel {
   display: none !important;

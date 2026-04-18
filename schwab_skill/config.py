@@ -5,15 +5,20 @@ Load configurable parameters from .env for Stage 2, VCP, signal scoring, and dat
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent
 
+# Cache parsed `.env` files keyed by absolute path. Each entry stores the file's
+# mtime_ns alongside the parsed values so we can invalidate when the file
+# changes on disk. Previously every call to a getter (e.g. `_get_float`) would
+# re-open and re-parse `.env`, which became a hot path during scans.
+_ENV_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+_ENV_CACHE_LOCK = threading.Lock()
 
-def _load_env(skill_dir: Path | None = None) -> dict[str, str]:
-    path = (skill_dir or SKILL_DIR) / ".env"
-    if not path.exists():
-        return {}
+
+def _parse_env_file(path: Path) -> dict[str, str]:
     vals: dict[str, str] = {}
     for line in path.read_text().splitlines():
         line = line.strip()
@@ -23,6 +28,38 @@ def _load_env(skill_dir: Path | None = None) -> dict[str, str]:
             k, _, v = line.partition("=")
             vals[k.strip()] = v.strip().strip('"\'')
     return vals
+
+
+def _load_env(skill_dir: Path | None = None) -> dict[str, str]:
+    path = (skill_dir or SKILL_DIR) / ".env"
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return {}
+    cache_key = str(path)
+    mtime = int(getattr(st, "st_mtime_ns", 0) or int(st.st_mtime * 1e9))
+    with _ENV_CACHE_LOCK:
+        cached = _ENV_CACHE.get(cache_key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+    try:
+        parsed = _parse_env_file(path)
+    except OSError:
+        return {}
+    with _ENV_CACHE_LOCK:
+        _ENV_CACHE[cache_key] = (mtime, parsed)
+    return parsed
+
+
+def clear_env_cache() -> None:
+    """Force a full reload of `.env` on the next getter call.
+
+    Useful in tests and after `_apply_temporary_env` patches the file.
+    """
+    with _ENV_CACHE_LOCK:
+        _ENV_CACHE.clear()
 
 
 def _env_value(key: str, env: dict[str, str]) -> str:
@@ -84,6 +121,94 @@ def _get_mode(
 
 
 PLUGIN_MODE_VALUES = {"off", "shadow", "live"}
+
+
+def get_pred_market_enabled(skill_dir: Path | None = None) -> bool:
+    """Enable prediction-market metadata enrichment."""
+    return _get_bool("PRED_MARKET_ENABLED", False, skill_dir)
+
+
+def get_pred_market_mode(skill_dir: Path | None = None) -> str:
+    """Prediction-market rollout mode (OFF|SHADOW|LIVE)."""
+    return _get_mode("PRED_MARKET_MODE", PLUGIN_MODE_VALUES, "off", skill_dir)
+
+
+def get_pred_market_provider(skill_dir: Path | None = None) -> str:
+    """
+    Prediction-market provider id.
+    Allowed: stub, polymarket.
+    """
+    env = _load_env(skill_dir)
+    raw = _env_value("PRED_MARKET_PROVIDER", env).strip().lower()
+    if raw in {"stub", "polymarket"}:
+        return raw
+    return "stub"
+
+
+def get_pred_market_timeout_ms(skill_dir: Path | None = None) -> int:
+    """Per-request timeout in milliseconds for prediction-market provider calls."""
+    val = _get_int("PRED_MARKET_TIMEOUT_MS", 1200, skill_dir)
+    return max(100, min(15000, val))
+
+
+def get_pred_market_cache_ttl_sec(skill_dir: Path | None = None) -> int:
+    """Cache TTL in seconds for provider responses."""
+    val = _get_int("PRED_MARKET_CACHE_TTL_SEC", 300, skill_dir)
+    return max(10, min(86400, val))
+
+
+def get_pred_market_max_event_age_hours(skill_dir: Path | None = None) -> float:
+    """Maximum age for event metadata before considered stale."""
+    val = _get_float("PRED_MARKET_MAX_EVENT_AGE_HOURS", 24.0, skill_dir)
+    return max(0.25, min(240.0, val))
+
+
+def get_pred_market_min_liquidity(skill_dir: Path | None = None) -> float:
+    """Minimum acceptable market liquidity for overlay usage."""
+    val = _get_float("PRED_MARKET_MIN_LIQUIDITY", 1000.0, skill_dir)
+    return max(0.0, val)
+
+
+def get_pred_market_max_spread(skill_dir: Path | None = None) -> float:
+    """Maximum acceptable spread (0..1) before ignoring metadata."""
+    val = _get_float("PRED_MARKET_MAX_SPREAD", 0.08, skill_dir)
+    return max(0.0, min(1.0, val))
+
+
+def get_pred_market_min_match_confidence(skill_dir: Path | None = None) -> float:
+    """Minimum acceptable PM event-ticker match confidence (0..1)."""
+    val = _get_float("PRED_MARKET_MIN_MATCH_CONFIDENCE", 0.55, skill_dir)
+    return max(0.0, min(1.0, val))
+
+
+def get_pred_market_score_delta_clamp(skill_dir: Path | None = None) -> float:
+    """Clamp (absolute) applied to PM score delta when overlay is live."""
+    val = _get_float("PRED_MARKET_SCORE_DELTA_CLAMP", 2.0, skill_dir)
+    return max(0.0, min(10.0, val))
+
+
+def get_pred_market_size_mult_min(skill_dir: Path | None = None) -> float:
+    """Lower bound for PM position-size multiplier."""
+    val = _get_float("PRED_MARKET_SIZE_MULT_MIN", 0.9, skill_dir)
+    return max(0.1, min(1.0, val))
+
+
+def get_pred_market_size_mult_max(skill_dir: Path | None = None) -> float:
+    """Upper bound for PM position-size multiplier."""
+    val = _get_float("PRED_MARKET_SIZE_MULT_MAX", 1.1, skill_dir)
+    return max(1.0, min(3.0, val))
+
+
+def get_pred_market_advisory_delta_clamp(skill_dir: Path | None = None) -> float:
+    """Clamp (absolute) applied to advisory probability delta."""
+    val = _get_float("PRED_MARKET_ADVISORY_DELTA_CLAMP", 0.02, skill_dir)
+    return max(0.0, min(0.25, val))
+
+
+def get_pred_market_min_baseline_score(skill_dir: Path | None = None) -> float:
+    """Minimum baseline signal score required before PM overlay can apply."""
+    val = _get_float("PRED_MARKET_MIN_BASELINE_SCORE", 55.0, skill_dir)
+    return max(0.0, min(100.0, val))
 
 
 # Stage 2: price must be within this fraction of 52-week high (0.85 = within 15%)
@@ -209,6 +334,41 @@ def get_volatility_sizing_enabled(skill_dir: Path | None = None) -> bool:
     return _get_bool("VOLATILITY_SIZING_ENABLED", False, skill_dir)
 
 
+# Position sizing mode (forward-looking knob)
+#
+# ``fixed``        — current default; ``POSITION_SIZE_USD`` * conviction multiplier.
+# ``vol_target``   — size each entry to a target portfolio volatility contribution
+#                    (uses ATR / realised vol; not yet wired into ``execution.py``
+#                    end-to-end, but exposed so backtest variants can opt in).
+# ``kelly_capped`` — fractional Kelly using advisory model edge & realised vol,
+#                    clamped to ``KELLY_MAX_FRACTION``. Also forward-looking.
+#
+# The runtime continues to honour ``VOLATILITY_SIZING_ENABLED`` until each new
+# mode is fully validated. This getter exists so callers (including the new
+# advisory model and the planned backtest parity layer) can branch on intent.
+def get_position_size_mode(skill_dir: Path | None = None) -> str:
+    env = _load_env(skill_dir)
+    raw = _env_value("POSITION_SIZE_MODE", env).strip().lower()
+    if raw in ("fixed", "vol_target", "kelly_capped"):
+        return raw
+    if raw:
+        # Unknown override: log via stderr is intentionally avoided here
+        # (config.py is import-time critical). Return safe default.
+        return "fixed"
+    # Backwards-compat: if vol sizing was already on, treat as vol_target intent.
+    return "vol_target" if get_volatility_sizing_enabled(skill_dir) else "fixed"
+
+
+def get_kelly_max_fraction(skill_dir: Path | None = None) -> float:
+    """Cap on fractional-Kelly position size (default 0.25 = quarter-Kelly)."""
+    return _get_float("KELLY_MAX_FRACTION", 0.25, skill_dir)
+
+
+def get_vol_target_annualized(skill_dir: Path | None = None) -> float:
+    """Per-position annualised vol target for ``vol_target`` sizing mode."""
+    return _get_float("VOL_TARGET_ANNUALIZED", 0.20, skill_dir)
+
+
 def get_alert_min_conviction(skill_dir: Path | None = None) -> int:
     """Minimum conviction to send any alert (below = suppressed)."""
     return _get_int("ALERT_MIN_CONVICTION", 20, skill_dir)
@@ -304,8 +464,15 @@ def get_max_sector_account_fraction(skill_dir: Path | None = None) -> float:
 
 
 def get_exec_quality_mode(skill_dir: Path | None = None) -> str:
-    """Execution quality plugin mode (OFF|SHADOW|LIVE)."""
-    return _get_mode("EXEC_QUALITY_MODE", PLUGIN_MODE_VALUES, "off", skill_dir)
+    """Execution quality plugin mode (OFF|SHADOW|LIVE).
+
+    Default promoted to ``live`` (2026-Q2 promotion) — see
+    ``docs/RELEASE_NOTES_PLUGIN_PROMOTIONS.md`` and
+    ``scripts/promotion_ledger.jsonl``. Invalid values still fall back to
+    the operational default (``live``) rather than silently disabling
+    the gate; explicit ``EXEC_QUALITY_MODE=off`` is required to opt out.
+    """
+    return _get_mode("EXEC_QUALITY_MODE", PLUGIN_MODE_VALUES, "live", skill_dir)
 
 
 def get_exit_manager_mode(skill_dir: Path | None = None) -> str:
@@ -314,8 +481,15 @@ def get_exit_manager_mode(skill_dir: Path | None = None) -> str:
 
 
 def get_event_risk_mode(skill_dir: Path | None = None) -> str:
-    """Event-risk plugin mode (OFF|SHADOW|LIVE)."""
-    return _get_mode("EVENT_RISK_MODE", PLUGIN_MODE_VALUES, "off", skill_dir)
+    """Event-risk plugin mode (OFF|SHADOW|LIVE).
+
+    Default promoted to ``live`` (2026-Q2 promotion) — see
+    ``docs/RELEASE_NOTES_PLUGIN_PROMOTIONS.md`` and
+    ``scripts/promotion_ledger.jsonl``. Invalid values still fall back to
+    the operational default (``live``); explicit ``EVENT_RISK_MODE=off``
+    is required to opt out.
+    """
+    return _get_mode("EVENT_RISK_MODE", PLUGIN_MODE_VALUES, "live", skill_dir)
 
 
 def get_correlation_guard_mode(skill_dir: Path | None = None) -> str:
@@ -606,8 +780,19 @@ def get_pead_score_boost_large(skill_dir: Path | None = None) -> float:
 
 
 def get_pead_score_penalty(skill_dir: Path | None = None) -> float:
-    """Score penalty for negative earnings surprise."""
+    """Score penalty for a small/medium negative earnings surprise."""
     return _get_float("PEAD_SCORE_PENALTY", 3.0, skill_dir)
+
+
+def get_pead_score_penalty_large(skill_dir: Path | None = None) -> float:
+    """Score penalty for a large negative earnings surprise (default mirrors PEAD_SCORE_BOOST_LARGE).
+
+    Symmetric counterpart to ``PEAD_SCORE_BOOST_LARGE``; applied when the
+    surprise magnitude is at or below ``-15%``. Falls back to the small-miss
+    penalty when unset to preserve historical behaviour.
+    """
+    fallback = _get_float("PEAD_SCORE_PENALTY", 3.0, skill_dir)
+    return _get_float("PEAD_SCORE_PENALTY_LARGE", max(fallback, 5.0), skill_dir)
 
 
 def get_guidance_score_enabled(skill_dir: Path | None = None) -> bool:
@@ -788,6 +973,33 @@ def get_data_crosscheck_max_rel_diff(skill_dir: Path | None = None) -> float:
     return _get_float("DATA_CROSSCHECK_MAX_REL_DIFF", 0.012, skill_dir)
 
 
+def get_data_integrity_min_history_coverage_pct(skill_dir: Path | None = None) -> float:
+    """Minimum symbol history coverage percent required by pre-run integrity gate."""
+    val = _get_float("DATA_INTEGRITY_MIN_HISTORY_COVERAGE_PCT", 95.0, skill_dir)
+    return max(0.0, min(100.0, val))
+
+
+def get_data_integrity_min_history_bars(skill_dir: Path | None = None) -> int:
+    """Minimum bars required for a symbol to count as history-covered."""
+    return _get_int("DATA_INTEGRITY_MIN_HISTORY_BARS", 260, skill_dir)
+
+
+def get_data_integrity_min_pm_coverage_pct(skill_dir: Path | None = None) -> float:
+    """Minimum PM PIT coverage percent required by pre-run integrity gate."""
+    val = _get_float("DATA_INTEGRITY_MIN_PM_COVERAGE_PCT", 25.0, skill_dir)
+    return max(0.0, min(100.0, val))
+
+
+def get_data_integrity_fail_on_silent_fallback(skill_dir: Path | None = None) -> bool:
+    """Fail integrity gate when unclassified/unknown provider rows are detected."""
+    return _get_bool("DATA_INTEGRITY_FAIL_ON_SILENT_FALLBACK", True, skill_dir)
+
+
+def get_data_integrity_max_fallback_unknown_count(skill_dir: Path | None = None) -> int:
+    """Maximum allowed unknown fallback classifications before failing gate."""
+    return _get_int("DATA_INTEGRITY_MAX_FALLBACK_UNKNOWN_COUNT", 0, skill_dir)
+
+
 # --- Hypothesis ledger (default off) ---
 
 
@@ -829,3 +1041,128 @@ def get_hypothesis_promotion_min_n(skill_dir: Path | None = None) -> int:
 
 def get_hypothesis_promotion_min_hit_rate(skill_dir: Path | None = None) -> float:
     return _get_float("HYPOTHESIS_PROMOTION_MIN_HIT_RATE", 0.45, skill_dir)
+
+
+# --- Agent intelligence controls (default off / safe) ---
+
+
+def get_mirofish_weighting_mode(skill_dir: Path | None = None) -> str:
+    """Dynamic persona weighting mode (OFF|SHADOW|LIVE)."""
+    return _get_mode("MIROFISH_WEIGHTING_MODE", PLUGIN_MODE_VALUES, "off", skill_dir)
+
+
+def get_mirofish_weighting_window_days(skill_dir: Path | None = None) -> int:
+    """Historical window used to compute persona reliability."""
+    val = _get_int("MIROFISH_WEIGHTING_WINDOW_DAYS", 60, skill_dir)
+    return max(7, min(365, val))
+
+
+def get_mirofish_weighting_min_samples(skill_dir: Path | None = None) -> int:
+    """Minimum labeled outcomes before reliability reweighting engages."""
+    val = _get_int("MIROFISH_WEIGHTING_MIN_SAMPLES", 30, skill_dir)
+    return max(5, min(1000, val))
+
+
+def get_mirofish_weighting_decay_half_life_days(skill_dir: Path | None = None) -> float:
+    """Time-decay half-life for reliability history weighting."""
+    val = _get_float("MIROFISH_WEIGHTING_DECAY_HALF_LIFE_DAYS", 20.0, skill_dir)
+    return max(1.0, min(365.0, val))
+
+
+def get_mirofish_weighting_max_multiplier(skill_dir: Path | None = None) -> float:
+    """Upper cap for persona multiplier derived from reliability."""
+    val = _get_float("MIROFISH_WEIGHTING_MAX_MULTIPLIER", 1.8, skill_dir)
+    return max(1.0, min(4.0, val))
+
+
+def get_mirofish_weighting_min_multiplier(skill_dir: Path | None = None) -> float:
+    """Lower cap for persona multiplier derived from reliability."""
+    val = _get_float("MIROFISH_WEIGHTING_MIN_MULTIPLIER", 0.5, skill_dir)
+    return max(0.1, min(1.0, val))
+
+
+def get_meta_policy_mode(skill_dir: Path | None = None) -> str:
+    """Meta-policy rollout mode (OFF|SHADOW|LIVE)."""
+    return _get_mode("META_POLICY_MODE", PLUGIN_MODE_VALUES, "off", skill_dir)
+
+
+def get_meta_policy_min_base_score(skill_dir: Path | None = None) -> float:
+    """Minimum baseline score required before meta-policy can increase size."""
+    val = _get_float("META_POLICY_MIN_BASE_SCORE", 40.0, skill_dir)
+    return max(0.0, min(100.0, val))
+
+
+def get_meta_policy_max_score_delta(skill_dir: Path | None = None) -> float:
+    """Absolute clamp for meta-policy score adjustments."""
+    val = _get_float("META_POLICY_MAX_SCORE_DELTA", 4.0, skill_dir)
+    return max(0.0, min(20.0, val))
+
+
+def get_meta_policy_size_mult_min(skill_dir: Path | None = None) -> float:
+    """Lower bound for meta-policy size multipliers."""
+    val = _get_float("META_POLICY_SIZE_MULT_MIN", 0.70, skill_dir)
+    return max(0.1, min(1.0, val))
+
+
+def get_meta_policy_size_mult_max(skill_dir: Path | None = None) -> float:
+    """Upper bound for meta-policy size multipliers."""
+    val = _get_float("META_POLICY_SIZE_MULT_MAX", 1.10, skill_dir)
+    return max(1.0, min(3.0, val))
+
+
+def get_meta_policy_suppress_threshold(skill_dir: Path | None = None) -> float:
+    """Uncertainty threshold above which signals are suppressed."""
+    val = _get_float("META_POLICY_SUPPRESS_THRESHOLD", 0.25, skill_dir)
+    return max(0.0, min(1.0, val))
+
+
+def get_meta_policy_downsize_threshold(skill_dir: Path | None = None) -> float:
+    """Uncertainty threshold above which size is reduced."""
+    val = _get_float("META_POLICY_DOWNSIZE_THRESHOLD", 0.45, skill_dir)
+    return max(0.0, min(1.0, val))
+
+
+def get_uncertainty_mode(skill_dir: Path | None = None) -> str:
+    """Uncertainty plugin rollout mode (OFF|SHADOW|LIVE)."""
+    return _get_mode("UNCERTAINTY_MODE", PLUGIN_MODE_VALUES, "off", skill_dir)
+
+
+def get_uncertainty_high_threshold(skill_dir: Path | None = None) -> float:
+    """High uncertainty threshold."""
+    val = _get_float("UNCERTAINTY_HIGH_THRESHOLD", 0.65, skill_dir)
+    return max(0.0, min(1.0, val))
+
+
+def get_uncertainty_med_threshold(skill_dir: Path | None = None) -> float:
+    """Medium uncertainty threshold."""
+    val = _get_float("UNCERTAINTY_MED_THRESHOLD", 0.45, skill_dir)
+    return max(0.0, min(1.0, val))
+
+
+def get_uncertainty_score_delta_penalty(skill_dir: Path | None = None) -> float:
+    """Absolute score penalty applied when uncertainty is elevated."""
+    val = _get_float("UNCERTAINTY_SCORE_DELTA_PENALTY", 2.0, skill_dir)
+    return max(0.0, min(10.0, val))
+
+
+def get_uncertainty_size_mult_floor(skill_dir: Path | None = None) -> float:
+    """Minimum size multiplier allowed after uncertainty penalty."""
+    val = _get_float("UNCERTAINTY_SIZE_MULT_FLOOR", 0.75, skill_dir)
+    return max(0.1, min(1.0, val))
+
+
+def get_counterfactual_logging_enabled(skill_dir: Path | None = None) -> bool:
+    """Enable counterfactual logging for filtered/suppressed opportunities."""
+    return _get_bool("COUNTERFACTUAL_LOGGING_ENABLED", False, skill_dir)
+
+
+def get_counterfactual_max_horizon_days(skill_dir: Path | None = None) -> int:
+    """Maximum outcome horizon tracked for counterfactual scoring."""
+    val = _get_int("COUNTERFACTUAL_MAX_HORIZON_DAYS", 20, skill_dir)
+    return max(1, min(252, val))
+
+
+def get_counterfactual_min_labeled_samples(skill_dir: Path | None = None) -> int:
+    """Minimum labeled samples before counterfactual stats are trusted."""
+    val = _get_int("COUNTERFACTUAL_MIN_LABELED_SAMPLES", 100, skill_dir)
+    return max(10, min(20000, val))

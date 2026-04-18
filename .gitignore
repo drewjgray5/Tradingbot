@@ -19,6 +19,47 @@ guardrail_trades.json
 .self_study.json
 .signal_alert_history.json
 .positions_tracker.json
+.signal_quality_metrics.json
+.sec_cache.json
+.sec_filing_cache.json
+.sector_map_cache.json
+.forensic_cache.json
+.prediction_market_*.json
+.pm_*.json
+.hypothesis_ledger*.json
+.counterfactual_*.json
+.scan_outcomes.json
+.token_cache.json
+strategy_state.json
+strategy_chat_log.jsonl
+execution_safety_metrics.json
+schwab_skill/.env
+
+# Per-tenant SaaS runtime sandboxes (created on demand).
+schwab_skill/tenants/
+schwab_skill/.tenant_runtime_cache/
+
+# Tooling caches that shouldn't be committed.
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+schwab_skill/.ruff_cache/
+schwab_skill/.pytest_cache/
+schwab_skill/.mypy_cache/
+
+# Local sqlite databases
+*.sqlite
+*.db
+*.db-journal
+
+# Validation/backtest artifacts
+artifacts/
+schwab_skill/artifacts/
+schwab_skill/validation_artifacts/
+schwab_skill/experiments/
+
+# Generated tokens
+schwab_skill/tokens_*.enc
 
 # Python
 __pycache__/

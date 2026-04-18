@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import statistics
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,11 @@ SECTOR_ETFS = list(set(SECTOR_TO_ETF.values()))
 LOOKBACK_DAYS = 21  # ~1 month
 LOG = logging.getLogger(__name__)
 SECTOR_CACHE_FILE = ".sector_map_cache.json"
+
+
+def _schwab_only_data() -> bool:
+    raw = (os.getenv("SCHWAB_ONLY_DATA") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _sector_cache_path(skill_dir: Path | None = None) -> Path:
@@ -84,6 +90,8 @@ def get_unresolved_sector_symbols(skill_dir: Path | None = None) -> list[str]:
 
 def _fetch_perf_yfinance(symbol: str, days: int) -> float | None:
     """Fallback: get return via yfinance when Schwab fails."""
+    if _schwab_only_data():
+        return None
     try:
         import yfinance as yf
         t = yf.Ticker(symbol)
@@ -188,6 +196,9 @@ def get_ticker_sector_etf(ticker: str, skill_dir: Path | None = None) -> str | N
     if tkr in mapping:
         val = mapping.get(tkr)
         return val if isinstance(val, str) and val else None
+    if _schwab_only_data():
+        _cache_sector_mapping(tkr, None, skill_dir)
+        return None
     try:
         import yfinance as yf
         t = yf.Ticker(tkr)

@@ -14,10 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -26,13 +26,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
+      # Restore the previous run's stable summary so we can diff against
+      # it. Cache miss is fine — validate_all silently no-ops when the
+      # baseline file isn't present.
+      - name: Restore previous validation baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: schwab_skill/validation_artifacts/latest_validation_report.json
+          key: validate-all-baseline-${{ github.workflow }}-${{ github.ref_name }}
+          restore-keys: |
+            validate-all-baseline-${{ github.workflow }}-
+
       - name: Run fast CI validation profile
         run: |
-          python scripts/validate_all.py --profile ci --skip-backtest --strict
+          python scripts/validate_all.py \
+            --profile ci --skip-backtest --strict \
+            --max-parallel 4 \
+            --baseline latest --fail-on-regression
+
+      # Persist this run's summary for the next run's baseline diff.
+      - name: Save validation baseline
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: schwab_skill/validation_artifacts/latest_validation_report.json
+          key: validate-all-baseline-${{ github.workflow }}-${{ github.ref_name }}-${{ github.run_id }}
 
       - name: Upload validation artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: strategy-scheduled-validation-artifacts
           path: |

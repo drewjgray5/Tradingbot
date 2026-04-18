@@ -5,16 +5,16 @@ Validate Exit Manager v1 idempotent behavior.
 
 from __future__ import annotations
 
-import os
 import sys
 import tempfile
-from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL_DIR))
+
+from env_overrides import temporary_env  # noqa: E402
 
 
 class _FakeSession:
@@ -55,20 +55,8 @@ class _FakeCancelResponse:
     ok = True
 
 
-@contextmanager
 def _temporary_env(overrides: dict[str, str]):
-    old: dict[str, str | None] = {}
-    try:
-        for key, value in overrides.items():
-            old[key] = os.environ.get(key)
-            os.environ[key] = str(value)
-        yield
-    finally:
-        for key, prev in old.items():
-            if prev is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = prev
+    return temporary_env(overrides)
 
 
 def _check_partial_once_and_restart_safe(tmp_skill_dir: Path) -> tuple[bool, str]:

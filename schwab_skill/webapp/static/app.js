@@ -1,43 +1,192 @@
-const state = {
-  latestSignals: [],
-  /** Last watchlist size from scan diagnostics (for hero KPI). */
-  lastWatchlistSize: null,
-  approvingTradeId: null,
-  approvingChecklist: null,
-  pendingFilter: "pending",
-  pendingSort: "newest",
-  config: { auth_mode: "jwt" },
-  allowManualJwt: true,
-  publicConfig: {
-    supabase: null,
-    saas_mode: false,
-    schwab_oauth: false,
-    schwab_market_oauth: false,
-    platform_live_trading_kill_switch: false,
-  },
-  accountMe: null,
-  twoFaStatus: null,
-  reportRawView: false,
-  lastReportData: null,
-  activeReportTab: "summary",
-  secCompareResult: null,
-  onboarding: null,
-  profile: null,
-  presetCatalog: null,
-  savedUiSettings: null,
-  performance: null,
-  calibration: null,
-  strategyChatMessages: [],
-  strategyChatBusy: false,
-  backtestQueueBusy: false,
-  lastQuoteHealthLogSig: null,
-  queueScanDraft: null,
-  /** Optional scan body: strategy_overrides, universe_mode, tickers (see /api/scan). */
-  scanRunOptions: null,
-  sseEnabled: false,
-};
+/**
+ * Dashboard orchestrator. The big render functions, panel-specific helpers,
+ * and the bootstrap IIFE live here. Cleanly-separable concerns have been
+ * pulled into ./modules/*.js — see [[static-module-layout]] in the wiki for
+ * the map of what lives where.
+ */
 
-const UI_VIEW_MODE_KEY = "tradingbot.ui.view_mode";
+import {
+  state,
+  UI_VIEW_MODE_KEY,
+  AUTH_TOKEN_KEY,
+  LEGACY_AUTH_TOKEN_KEYS,
+  BACKTEST_PREFS_KEY,
+} from "./modules/state.js";
+import {
+  safeText,
+  escapeHtml,
+  safeNum,
+  prettyJson,
+  formatMoney,
+  pct,
+  formatPercentPoints,
+  clampPct,
+  verdictFromScore,
+  timeAgo,
+  durationSec,
+} from "./modules/format.js";
+import { api } from "./modules/api.js";
+import {
+  authSessionReady,
+  markAuthReady,
+  normalizeUserJwt,
+  getApiAccessToken,
+  clearLegacyApiJwtKeys,
+  readStoredApiJwt,
+  clearStoredApiJwt,
+  ensureCookieAuthSession,
+  createCookieAuthSession,
+  clearCookieAuthSession,
+  persistApiJwtFromSession,
+  updateSupabaseAuthUI,
+  setSupabaseClient,
+  SUPABASE_ESM,
+  isProbablyAccessJwt,
+  JWT_BAD_SHAPE_HINT,
+} from "./modules/auth.js";
+import { showToast, addNotification, setupNotifications } from "./modules/notifications.js";
+import { setupScrollToTop } from "./modules/scrollToTop.js";
+import {
+  clearOAuthQueryParams,
+  installRouter,
+} from "./modules/router.js";
+import {
+  setupCommandPalette,
+  openCommandPalette,
+  closeCommandPalette,
+} from "./modules/commandPalette.js";
+import { setupKeyboardShortcuts } from "./modules/shortcuts.js";
+import {
+  logEvent,
+  updateActionCenter,
+  updateActivityBadge,
+  statusClass,
+  sentimentTagClass,
+  healthBadgeClass,
+  setStatusPill,
+  DIAG_LABELS,
+} from "./modules/logger.js";
+import {
+  renderTwoFaPanel,
+  refreshTwoFaStatus,
+  submitEnableLiveTrading as _submitEnableLiveTradingPanel,
+} from "./panels/twoFa.js";
+import {
+  renderOnboardingCards,
+  refreshOnboarding as _refreshOnboardingPanel,
+  startOnboarding as _startOnboardingPanel,
+  runOnboardingStep as _runOnboardingStepPanel,
+  triggerSchwabAccountOAuth,
+  triggerSchwabMarketOAuth,
+} from "./panels/onboarding.js";
+import {
+  renderCalibrationPanel,
+  refreshCalibration,
+  submitTradingHaltSave as _submitTradingHaltSavePanel,
+} from "./panels/calibration.js";
+import {
+  loadDecisionCard,
+  mapRecovery,
+  openTradeDrawer,
+  openTradeDrawerForTrade,
+} from "./panels/tradeDrawer.js";
+import { refreshSectors } from "./panels/sectors.js";
+import {
+  renderQuickCheckCard,
+  quickCheck,
+  renderTickerChart,
+} from "./panels/quickCheck.js";
+// Quick-view, decision-card, and recovery have been merged into the
+// unified slide-in trade drawer (see imports above).
+import {
+  refreshPortfolio as _refreshPortfolioPanel,
+  loadPortfolioRisk,
+} from "./panels/portfolio.js";
+import {
+  applySecCompareMode,
+  renderSecAnalysisCard,
+  toReadableDeltaLabel,
+  buildNarrativeSummary,
+  renderSecCompareEmpty,
+  renderSecCompareVisual as _renderSecCompareVisualPanel,
+  buildFallbackSecCompare,
+  runSecCompare as _runSecComparePanel,
+} from "./panels/sec.js";
+import {
+  renderReportTabs,
+  renderReportVisual,
+  applyReportViewMode,
+  runReport,
+} from "./panels/report.js";
+import {
+  PRESET_SETTING_LABELS,
+  presetSettingLabel,
+  renderProfilePanel,
+  renderPresetApplyPreview,
+  loadProfiles,
+  applyProfile,
+} from "./panels/profile.js";
+import {
+  renderPerformancePanel as _renderPerformancePanel,
+  renderChallengerPanel,
+  renderEvolvePanel,
+  refreshPerformance as _refreshPerformancePanel,
+} from "./panels/performance.js";
+import {
+  setDefaultBacktestDates,
+  restoreBacktestFormFromStorage,
+  wireBacktestFormPersistence,
+  resetBacktestFormToDefaults,
+  setBacktestQueueUiBusy,
+  setBtMetaMessage,
+  syncBtUniverseRow,
+  applyBacktestPresetYears,
+  collectBacktestOverrides,
+  collectBacktestSpecFromForm,
+  renderBacktestResultSummary,
+  renderBacktestResultRaw as _renderBacktestResultRawPanel,
+  backtestSpecSummaryLine,
+  switchBacktestHubTab,
+  refreshBacktestRuns,
+  pollBacktestTask as _pollBacktestTaskPanel,
+  queueUserBacktest as _queueUserBacktestPanel,
+} from "./panels/backtest.js";
+import {
+  strategyChatPayloadMessages,
+  scrollStrategyChatToEnd,
+  renderStrategyChatMessages,
+  hideScQueueCallout,
+  showScQueueCallout as _showScQueueCalloutPanel,
+  sendStrategyChat as _sendStrategyChatPanel,
+} from "./panels/strategyChat.js";
+
+// Thin wrappers preserve the call signatures used by `wireEvents`,
+// `connectSSE`, `runLazyApi`, etc. without leaking the panel-module
+// dependency-injection contract into every call site.
+const submitEnableLiveTrading = () =>
+  _submitEnableLiveTradingPanel({ refreshAccountMe, refreshPending });
+const refreshOnboarding = () => _refreshOnboardingPanel({ runLazyApi });
+const startOnboarding = () => _startOnboardingPanel({ runLazyApi });
+const runOnboardingStep = (step) => _runOnboardingStepPanel(step, { runLazyApi });
+const submitTradingHaltSave = () =>
+  _submitTradingHaltSavePanel({ refreshAccountMe });
+const refreshPortfolio = () => _refreshPortfolioPanel({ runScan });
+const renderSecCompareVisual = (data) =>
+  _renderSecCompareVisualPanel(data, { getDisplayMode });
+const runSecCompare = () => _runSecComparePanel({ getDisplayMode });
+const refreshPerformance = () => _refreshPerformancePanel({ getDisplayMode });
+const renderPerformancePanel = (rootEl, data, opts = {}) =>
+  _renderPerformancePanel(rootEl, data, { ...opts, getDisplayMode });
+const renderBacktestResultRaw = (result, fallbackText) =>
+  _renderBacktestResultRawPanel(result, fallbackText, { getDisplayMode });
+const pollBacktestTask = (taskId) =>
+  _pollBacktestTaskPanel(taskId, { setJobProgress, getDisplayMode });
+const queueUserBacktest = () =>
+  _queueUserBacktestPanel({ setJobProgress, getDisplayMode });
+const showScQueueCallout = (taskId, runId) =>
+  _showScQueueCalloutPanel(taskId, runId, { switchBacktestHubTab });
+const sendStrategyChat = () =>
+  _sendStrategyChatPanel({ refreshBacktestRuns, switchBacktestHubTab });
 
 const lazyLoaded = {
   portfolio: false,
@@ -114,47 +263,6 @@ function setupLazySectionLoading() {
   nodes.forEach((n) => io.observe(n));
 }
 
-function openAncestorDetails(el) {
-  let p = el?.parentElement;
-  while (p) {
-    if (p.tagName === "DETAILS") p.open = true;
-    p = p.parentElement;
-  }
-}
-
-function handleRouteHash() {
-  const id = window.location.hash.slice(1);
-  if (!id) return;
-  const el = document.getElementById(id);
-  if (!el) return;
-  openAncestorDetails(el);
-  requestAnimationFrame(() => el.scrollIntoView({ behavior: "smooth", block: "start" }));
-}
-
-/** Map short query values to element ids, e.g. ?section=backtest → #backtestSection */
-function applyQuerySectionDeepLink() {
-  try {
-    const u = new URL(window.location.href);
-    let sec = (u.searchParams.get("section") || "").trim();
-    if (!sec) return;
-    const aliases = {
-      backtest: "backtestSection",
-      backtests: "backtestSection",
-      pending: "pendingSection",
-      trades: "pendingSection",
-      scan: "workflowPrimary",
-      workflow: "workflowPrimary",
-    };
-    const id = aliases[sec.toLowerCase()] || sec;
-    if (!document.getElementById(id)) return;
-    u.searchParams.delete("section");
-    const q = u.searchParams.toString();
-    window.history.replaceState({}, "", `${u.pathname}${q ? `?${q}` : ""}#${id}`);
-  } catch (_) {
-    /* ignore */
-  }
-}
-
 function markDeferredDataPlaceholders() {
   const pb = document.getElementById("portfolioBody");
   const firstCell = pb?.querySelector("td");
@@ -214,234 +322,8 @@ async function refreshAccountMe() {
   renderLiveTradingSaasPanel();
 }
 
-function renderTwoFaPanel() {
-  const wrap = document.getElementById("twoFaPanel");
-  if (!wrap) return;
-  const st = state.twoFaStatus || {};
-  const enabled = Boolean(st.enabled);
-  const threshold = Number(st.high_value_threshold_usd || 0);
-  const statusText = enabled
-    ? "2FA is enabled for high-value approvals."
-    : "2FA is currently disabled. High-value approvals will be blocked until enabled.";
-  const thresholdText = threshold > 0 ? `Threshold: ${formatMoney(threshold)} notional.` : "Threshold: not configured.";
-  wrap.innerHTML = `
-    <div class="muted small">${safeText(statusText)} ${safeText(thresholdText)}</div>
-    <div class="inline-form compact" style="margin-top: 0.5rem">
-      <button id="twoFaSetupBtn" type="button" class="btn small secondary">Generate 2FA secret</button>
-      <label class="field-label" for="twoFaCodeInput">TOTP code</label>
-      <input id="twoFaCodeInput" type="text" inputmode="numeric" maxlength="8" placeholder="123456" />
-      <button id="twoFaEnableBtn" type="button" class="btn small secondary">Enable 2FA</button>
-    </div>
-    <pre id="twoFaSetupOutput" class="code-block code-block--tight hidden" style="margin-top: 0.5rem"></pre>
-  `;
-  document.getElementById("twoFaSetupBtn")?.addEventListener("click", async () => {
-    const out = await api.post("/api/security/2fa/setup", {});
-    if (!out.ok) {
-      updateActionCenter({ title: "2FA setup failed", message: safeText(out.error), severity: "error" });
-      return;
-    }
-    const pre = document.getElementById("twoFaSetupOutput");
-    if (pre) {
-      pre.classList.remove("hidden");
-      pre.textContent = `Secret: ${safeText(out.data?.secret)}\nAdd this to your authenticator app.\nURI:\n${safeText(out.data?.otpauth_uri)}`;
-    }
-    updateActionCenter({
-      title: "2FA secret generated",
-      message: "Add the secret in your authenticator app, then enter a code and click Enable 2FA.",
-      severity: "info",
-    });
-  });
-  document.getElementById("twoFaEnableBtn")?.addEventListener("click", async () => {
-    const code = document.getElementById("twoFaCodeInput")?.value?.trim() || "";
-    if (!code) {
-      updateActionCenter({ title: "2FA code required", message: "Enter a current authenticator code.", severity: "warn" });
-      return;
-    }
-    const out = await api.post("/api/security/2fa/enable", { otp_code: code });
-    if (!out.ok) {
-      updateActionCenter({ title: "2FA enable failed", message: safeText(out.error), severity: "error" });
-      return;
-    }
-    updateActionCenter({ title: "2FA enabled", message: "High-value approvals now require OTP verification.", severity: "success" });
-    await refreshTwoFaStatus();
-  });
-}
-
-async function refreshTwoFaStatus() {
-  if (!state.publicConfig?.saas_mode) {
-    state.twoFaStatus = null;
-    renderTwoFaPanel();
-    return;
-  }
-  const out = await api.get("/api/security/2fa/status");
-  state.twoFaStatus = out.ok ? out.data || null : null;
-  renderTwoFaPanel();
-}
-
-async function submitEnableLiveTrading() {
-  const ack = Boolean(document.getElementById("enableLiveRiskAck")?.checked);
-  const phrase = document.getElementById("enableLiveTypedPhrase")?.value?.trim() || "";
-  const out = await api.post("/api/settings/enable-live-trading", {
-    risk_acknowledged: ack,
-    typed_phrase: phrase,
-  });
-  if (!out.ok) {
-    const msg = typeof out.error === "string" ? out.error : JSON.stringify(out.error || "Request failed");
-    logEvent({ kind: "system", severity: "error", message: `Enable live trading failed: ${msg}` });
-    updateActionCenter({ title: "Enable live trading", message: msg, severity: "error" });
-    return;
-  }
-  logEvent({ kind: "system", severity: "info", message: "Live trading enabled for this account." });
-  updateActionCenter({
-    title: "Live trading enabled",
-    message: "You can approve pending trades; type the ticker in the dialog to confirm each order.",
-    severity: "success",
-  });
-  const phraseInput = document.getElementById("enableLiveTypedPhrase");
-  if (phraseInput) phraseInput.value = "";
-  await refreshAccountMe();
-  await refreshPending();
-}
-
 async function refreshCritical() {
   await Promise.all([refreshStatus(), refreshAccountMe(), refreshPending(), refreshTwoFaStatus()]);
-}
-
-const AUTH_TOKEN_KEY = "tradingbot.jwt";
-const LEGACY_AUTH_TOKEN_KEYS = ["supabasetoken", "supabaseToken", "supabase_token"];
-
-/** Set by /static/auth-jwt-utils.js (loaded before this file). */
-const AuthJwt = window.TradingBotAuthJwt || {
-  normalizeUserJwt(raw) {
-    let t = String(raw ?? "").trim();
-    if (/^bearer\s+/i.test(t)) t = t.replace(/^bearer\s+/i, "").trim();
-    return t;
-  },
-  isProbablyAccessJwt() {
-    return true;
-  },
-  JWT_BAD_SHAPE_HINT: "",
-};
-const BACKTEST_PREFS_KEY = "tradingbot.backtest.preferences";
-
-let _resolveAuthReady;
-const authSessionReady = new Promise((r) => {
-  _resolveAuthReady = r;
-});
-
-function markAuthReady() {
-  if (_resolveAuthReady) {
-    _resolveAuthReady();
-    _resolveAuthReady = null;
-  }
-}
-
-/** Trim and strip a leading "Bearer " if the user pasted a full Authorization value. */
-function normalizeUserJwt(raw) {
-  return AuthJwt.normalizeUserJwt(raw);
-}
-
-async function getApiAccessToken() {
-  if (state.allowManualJwt) {
-    const manual = normalizeUserJwt(document.getElementById("jwtInput")?.value ?? "");
-    if (manual) {
-      if (!AuthJwt.isProbablyAccessJwt(manual)) {
-        console.warn(AuthJwt.JWT_BAD_SHAPE_HINT);
-        return "";
-      }
-      return manual;
-    }
-  }
-  if (state.allowManualJwt) {
-    const stored = readStoredApiJwt();
-    if (stored) return stored;
-  }
-  if (state.config?.auth_mode === "supabase" && supabaseClient) {
-    const { data, error } = await supabaseClient.auth.getSession();
-    if (error) console.warn("auth.getSession", error);
-    const sessionToken = normalizeUserJwt(data?.session?.access_token ?? "");
-    if (sessionToken && AuthJwt.isProbablyAccessJwt(sessionToken)) return sessionToken;
-  }
-  if (await ensureCookieAuthSession()) return "";
-  return "";
-}
-
-function clearLegacyApiJwtKeys() {
-  LEGACY_AUTH_TOKEN_KEYS.forEach((key) => localStorage.removeItem(key));
-}
-
-function readStoredApiJwt() {
-  const accept = (raw) => {
-    const n = normalizeUserJwt(raw);
-    if (!n) return "";
-    if (!AuthJwt.isProbablyAccessJwt(n)) {
-      console.warn(AuthJwt.JWT_BAD_SHAPE_HINT);
-      clearStoredApiJwt();
-      return "";
-    }
-    return n;
-  };
-  const current = accept(localStorage.getItem(AUTH_TOKEN_KEY) || "");
-  if (current) return current;
-  for (const key of LEGACY_AUTH_TOKEN_KEYS) {
-    const legacy = (localStorage.getItem(key) || "").trim();
-    if (!legacy) continue;
-    const migrated = accept(legacy);
-    if (!migrated) continue;
-    localStorage.setItem(AUTH_TOKEN_KEY, migrated);
-    clearLegacyApiJwtKeys();
-    return migrated;
-  }
-  return "";
-}
-
-function clearStoredApiJwt() {
-  localStorage.removeItem(AUTH_TOKEN_KEY);
-  clearLegacyApiJwtKeys();
-}
-
-async function ensureCookieAuthSession() {
-  try {
-    const out = await fetch("/api/auth/session", {
-      method: "GET",
-      credentials: "same-origin",
-      headers: { Accept: "application/json" },
-    });
-    if (!out.ok) return false;
-    const body = await out.json();
-    const data = body?.data && typeof body.data === "object" ? body.data : {};
-    return Boolean(data.authenticated);
-  } catch {
-    return false;
-  }
-}
-
-async function createCookieAuthSession(accessToken) {
-  const token = normalizeUserJwt(safeText(accessToken));
-  if (!token || !AuthJwt.isProbablyAccessJwt(token)) return false;
-  try {
-    const out = await fetch("/api/auth/session", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ access_token: token }),
-    });
-    return out.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function clearCookieAuthSession() {
-  try {
-    await fetch("/api/auth/session", {
-      method: "DELETE",
-      credentials: "same-origin",
-      headers: { Accept: "application/json" },
-    });
-  } catch {
-    /* ignore */
-  }
 }
 
 function setJobProgress(barId, labelId, fraction, labelText) {
@@ -454,39 +336,6 @@ function setJobProgress(barId, labelId, fraction, labelText) {
     if (wrap) wrap.classList.toggle("hidden", pct <= 0 && !labelText);
   }
   if (lbl) lbl.textContent = labelText || "";
-}
-
-/** Set when /api/public-config exposes Supabase URL + anon key */
-let supabaseClient = null;
-const SUPABASE_ESM = "https://esm.sh/@supabase/supabase-js@2.49.1";
-
-function persistApiJwtFromSession(session) {
-  const at = normalizeUserJwt(session?.access_token ?? "");
-  if (at && AuthJwt.isProbablyAccessJwt(at)) {
-    if (state.allowManualJwt) {
-      localStorage.setItem(AUTH_TOKEN_KEY, at);
-      clearLegacyApiJwtKeys();
-    }
-    void createCookieAuthSession(at);
-    const inp = document.getElementById("jwtInput");
-    if (inp) inp.value = "";
-  }
-}
-
-function updateSupabaseAuthUI(session) {
-  const out = document.getElementById("supabaseSignedOut");
-  const inn = document.getElementById("supabaseSignedIn");
-  const label = document.getElementById("supabaseUserLabel");
-  if (!out || !inn) return;
-  if (session?.user) {
-    out.classList.add("hidden");
-    inn.classList.remove("hidden");
-    if (label) label.textContent = session.user.email || session.user.id || "Signed in";
-  } else {
-    inn.classList.add("hidden");
-    out.classList.remove("hidden");
-    if (label) label.textContent = "";
-  }
 }
 
 async function initSupabaseAuth(url, anonKey) {
@@ -505,21 +354,22 @@ async function initSupabaseAuth(url, anonKey) {
     return;
   }
 
-  supabaseClient = createClient(url, anonKey, {
+  const sb = createClient(url, anonKey, {
     auth: {
       autoRefreshToken: true,
       persistSession: true,
       detectSessionInUrl: true,
     },
   });
+  setSupabaseClient(sb);
 
   const {
     data: { session },
-  } = await supabaseClient.auth.getSession();
+  } = await sb.auth.getSession();
   persistApiJwtFromSession(session);
   updateSupabaseAuthUI(session);
 
-  supabaseClient.auth.onAuthStateChange((_event, nextSession) => {
+  sb.auth.onAuthStateChange((_event, nextSession) => {
     persistApiJwtFromSession(nextSession);
     updateSupabaseAuthUI(nextSession);
     void refreshAccountMe();
@@ -532,7 +382,7 @@ async function initSupabaseAuth(url, anonKey) {
       logEvent({ kind: "system", severity: "warn", message: "Enter email and password." });
       return;
     }
-    const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+    const { error } = await sb.auth.signInWithPassword({ email, password });
     if (error) logEvent({ kind: "system", severity: "error", message: error.message });
     else logEvent({ kind: "system", severity: "info", message: "Signed in." });
   });
@@ -544,7 +394,7 @@ async function initSupabaseAuth(url, anonKey) {
       logEvent({ kind: "system", severity: "warn", message: "Enter email and password to sign up." });
       return;
     }
-    const { error } = await supabaseClient.auth.signUp({ email, password });
+    const { error } = await sb.auth.signUp({ email, password });
     if (error) logEvent({ kind: "system", severity: "error", message: error.message });
     else {
       logEvent({
@@ -556,7 +406,7 @@ async function initSupabaseAuth(url, anonKey) {
   });
 
   document.getElementById("supabaseSignOutBtn")?.addEventListener("click", async () => {
-    await supabaseClient.auth.signOut();
+    await sb.auth.signOut();
     clearStoredApiJwt();
     await clearCookieAuthSession();
     const inp = document.getElementById("jwtInput");
@@ -565,556 +415,6 @@ async function initSupabaseAuth(url, anonKey) {
   });
 
   markAuthReady();
-}
-
-function updateActionCenter({ title = "System Messages", message = "", severity = "info" }) {
-  const wrap = document.getElementById("actionCenter");
-  const titleEl = document.getElementById("actionCenterTitle");
-  const textEl = document.getElementById("actionCenterText");
-  if (!wrap || !titleEl || !textEl) return;
-  wrap.classList.remove("info", "success", "warn", "error");
-  wrap.classList.add(["info", "success", "warn", "error"].includes(severity) ? severity : "info");
-  titleEl.textContent = title;
-  textEl.textContent = message || "Ready.";
-}
-
-const DIAG_LABELS = {
-  watchlist_size: "Watchlist",
-  stage2_fail: "Stage 2 failed",
-  vcp_fail: "VCP failed",
-  breakout_not_confirmed: "Breakout not confirmed",
-  sector_not_winning: "Sector underperforming",
-  too_few_candles: "Insufficient data",
-  df_empty: "No price data",
-  exceptions: "Processing errors",
-  weak_mirofish_alignment: "Weak sentiment alignment",
-  low_breakout_volume: "Low breakout volume",
-  self_study_filtered: "Filtered by self-study",
-  quality_gates_filtered: "Quality gate filtered",
-  advisory_scored: "Advisory scored",
-  advisory_high_confidence: "Advisory high-confidence",
-  advisory_medium_confidence: "Advisory medium-confidence",
-  advisory_low_confidence: "Advisory low-confidence",
-};
-
-const api = {
-  async request(path, options = {}) {
-    const timeoutMs = Number(options.timeoutMs || 90000);
-    const fetchOptions = { ...options };
-    delete fetchOptions.timeoutMs;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    const headers = {
-      "Content-Type": "application/json",
-      ...(fetchOptions.headers || {}),
-    };
-    if (!headers["X-Request-ID"]) {
-      headers["X-Request-ID"] = `ui-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
-    }
-
-    const token = await getApiAccessToken();
-    if (token) headers.Authorization = `Bearer ${token}`;
-
-    const apiKey = state.publicConfig?.api_key_required ? (localStorage.getItem("tradingbot.api_key") || "") : "";
-    if (apiKey) headers["X-API-Key"] = apiKey;
-
-    try {
-      const res = await fetch(path, {
-        ...fetchOptions,
-        credentials: fetchOptions.credentials ?? "same-origin",
-        headers,
-        signal: controller.signal,
-      });
-      const text = await res.text();
-      let data;
-      try {
-        data = text ? JSON.parse(text) : {};
-      } catch {
-        data = { ok: false, error: `Invalid JSON response (${res.status})` };
-      }
-      if (!res.ok) {
-        return {
-          ok: false,
-          error: data?.error || data?.detail || `HTTP ${res.status}`,
-          status: res.status,
-          data: data?.data ?? null,
-        };
-      }
-      return data;
-    } catch (err) {
-      if (err?.name === "AbortError") return { ok: false, error: "Request timed out. Please retry." };
-      return { ok: false, error: err?.message || "Request failed." };
-    } finally {
-      clearTimeout(timeout);
-    }
-  },
-
-  get(path, options = {}) {
-    return this.request(path, { method: "GET", ...options });
-  },
-
-  post(path, body = {}, options = {}) {
-    return this.request(path, { method: "POST", body: JSON.stringify(body), ...options });
-  },
-
-  patch(path, body = {}, options = {}) {
-    return this.request(path, { method: "PATCH", body: JSON.stringify(body), ...options });
-  },
-};
-
-function safeText(value) {
-  if (value === null || value === undefined) return "—";
-  return String(value);
-}
-
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function safeNum(value, fallback = 0) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function prettyJson(value) {
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
-function formatMoney(value) {
-  return `$${safeNum(value, 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
-}
-
-function pct(value, digits = 1) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return "—";
-  return `${(n * 100).toFixed(digits)}%`;
-}
-
-/** Backtest metrics from API are already in percent points (e.g. 55.2 => 55.2%). */
-function formatPercentPoints(value, digits = 2) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return "—";
-  return `${n.toFixed(digits)}%`;
-}
-
-const PRESET_SETTING_LABELS = {
-  POSITION_SIZE_USD: "Position size (USD)",
-  MAX_TRADES_PER_DAY: "Max trades per day",
-  QUALITY_GATES_MODE: "Quality gates",
-  EVENT_RISK_MODE: "Event risk mode",
-  EVENT_ACTION: "Event action",
-  EXEC_QUALITY_MODE: "Execution quality mode",
-};
-
-function presetSettingLabel(key) {
-  return PRESET_SETTING_LABELS[key] || key.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-}
-
-function renderPerformancePanel(rootEl, data, { error } = {}) {
-  const rawDetails = document.getElementById("performanceRawDetails");
-  const rawPre = document.getElementById("performanceRaw");
-  if (!rootEl) return;
-  if (rawPre && !error && data) rawPre.textContent = prettyJson(data);
-  if (rawDetails) {
-    if (error || !data) rawDetails.classList.add("hidden");
-    else rawDetails.classList.remove("hidden");
-  }
-  if (error) {
-    rootEl.innerHTML = `<div class="panel-error">${safeText(error)}</div>`;
-    return;
-  }
-  if (!data || typeof data !== "object") {
-    rootEl.innerHTML = `<div class="report-empty">No performance snapshot loaded yet.</div>`;
-    return;
-  }
-
-  const bt = data.backtest && typeof data.backtest === "object" ? data.backtest : {};
-  const sp = data.shadow_paper && typeof data.shadow_paper === "object" ? data.shadow_paper : {};
-  const lv = data.live && typeof data.live === "object" ? data.live : {};
-  const val = data.validation && typeof data.validation === "object" ? data.validation : {};
-  const sg = data.separation_guard && typeof data.separation_guard === "object" ? data.separation_guard : {};
-
-  const vstat = val.status && typeof val.status === "object" ? val.status : {};
-  const runStatus = safeText(vstat.run_status);
-  const passed = vstat.passed;
-  let valBadgeClass = "bg-slate-900";
-  let valBadgeText = runStatus || "unknown";
-  if (passed === true) {
-    valBadgeClass = "bg-green-900";
-    valBadgeText = runStatus ? `${runStatus} · pass` : "pass";
-  } else if (passed === false) {
-    valBadgeClass = "bg-red-900";
-    valBadgeText = runStatus ? `${runStatus} · fail` : "fail";
-  } else if (runStatus === "idle" || vstat.exists === false) {
-    valBadgeClass = "bg-slate-900";
-    valBadgeText = runStatus || "idle";
-  }
-  const valMetaParts = [];
-  if (vstat.source) valMetaParts.push(`source: ${safeText(vstat.source)}`);
-  if (vstat.progress_pct != null && vstat.progress_pct !== "") valMetaParts.push(`progress: ${safeText(vstat.progress_pct)}%`);
-  if (vstat.generated_at) valMetaParts.push(`updated: ${safeText(vstat.generated_at)}`);
-  const valMeta = valMetaParts.length ? `<span class="muted">${valMetaParts.join(" · ")}</span>` : "";
-  const artifacts = val.artifacts_present === true ? "present" : val.artifacts_present === false ? "missing" : "—";
-
-  const outcomes = Array.isArray(lv.latest_outcomes) ? lv.latest_outcomes : [];
-  let outcomesTable = "";
-  if (outcomes.length) {
-    const rows = outcomes
-      .map((row) => {
-        const o = row && typeof row === "object" ? row : {};
-        return `<tr>
-          <td>${safeText(o.ticker)}</td>
-          <td>${safeText(o.side)}</td>
-          <td>${safeText(o.qty)}</td>
-          <td>${o.fill_price != null && o.fill_price !== "" ? safeText(o.fill_price) : "—"}</td>
-          <td>${safeText(o.date)}</td>
-          <td>${o.mirofish_conviction != null ? safeText(o.mirofish_conviction) : "—"}</td>
-          <td>${safeText(o.sector_etf)}</td>
-        </tr>`;
-      })
-      .join("");
-    outcomesTable = `
-      <div class="performance-outcomes-wrap">
-        <h3>Latest recorded outcomes</h3>
-        <div class="table-wrap">
-          <table>
-            <caption class="visually-hidden">Latest live trade outcomes</caption>
-            <thead>
-              <tr>
-                <th>Ticker</th>
-                <th>Side</th>
-                <th>Qty</th>
-                <th>Fill</th>
-                <th>Date</th>
-                <th>Conviction</th>
-                <th>Sector ETF</th>
-              </tr>
-            </thead>
-            <tbody>${rows}</tbody>
-          </table>
-        </div>
-      </div>`;
-  }
-
-  const calloutMsg = sg.message != null && String(sg.message).trim() ? safeText(sg.message) : "";
-  const callout = calloutMsg
-    ? `<p class="performance-callout" role="note">${calloutMsg}</p>`
-    : "";
-
-  rootEl.innerHTML = `
-    <div class="performance-buckets">
-      <div class="perf-bucket">
-        <h3>Backtest</h3>
-        <div class="perf-source">${safeText(bt.source)}</div>
-        <div class="perf-metric"><span class="label">Run at</span><span class="value">${safeText(bt.run_at)}</span></div>
-        <div class="perf-metric"><span class="label">Trades</span><span class="value">${safeText(bt.total_trades)}</span></div>
-        <div class="perf-metric"><span class="label">Win rate</span><span class="value">${formatPercentPoints(bt.win_rate)}</span></div>
-        <div class="perf-metric"><span class="label">Avg return</span><span class="value">${formatPercentPoints(bt.avg_return_pct)}</span></div>
-        <div class="perf-metric"><span class="label">Max drawdown</span><span class="value">${formatPercentPoints(bt.max_drawdown_pct)}</span></div>
-      </div>
-      <div class="perf-bucket">
-        <h3>Shadow / paper</h3>
-        <div class="perf-source">${safeText(sp.source)}</div>
-        <div class="perf-metric"><span class="label">Shadow actions</span><span class="value">${safeText(sp.shadow_actions)}</span></div>
-        <p class="perf-bucket-note">${safeText(sp.notes)}</p>
-      </div>
-      <div class="perf-bucket">
-        <h3>Live</h3>
-        <div class="perf-source">${safeText(lv.source)}</div>
-        <div class="perf-metric"><span class="label">Live actions</span><span class="value">${safeText(lv.live_actions)}</span></div>
-        <div class="perf-metric"><span class="label">Recorded outcomes</span><span class="value">${safeText(lv.recorded_outcomes)}</span></div>
-      </div>
-    </div>
-    <div class="performance-validation">
-      <span class="health-badge ${valBadgeClass}">${safeText(valBadgeText)}</span>
-      <span class="muted">Artifacts dir: <strong>${safeText(artifacts)}</strong></span>
-      ${valMeta}
-    </div>
-    ${callout}
-    ${outcomesTable || `<p class="muted perf-outcomes-empty">No recent outcome rows yet.</p>`}
-  `;
-  if (rawDetails && data && !error && getDisplayMode() === "pro") rawDetails.open = true;
-
-  const ch = data && data.challenger && typeof data.challenger === "object" ? data.challenger : null;
-  if (ch && ch.available && ch.latest) {
-    const challengerPanel = document.getElementById("challengerPanel");
-    if (challengerPanel) renderChallengerPanel(challengerPanel, ch);
-  }
-}
-
-function renderChallengerPanel(rootEl, ch) {
-  if (!rootEl || !ch) return;
-  const latest = ch.latest && typeof ch.latest === "object" ? ch.latest : null;
-  const wr = ch.win_rate && typeof ch.win_rate === "object" ? ch.win_rate : {};
-  if (!latest) {
-    rootEl.innerHTML = "";
-    return;
-  }
-  const v = safeText(latest.verdict || "?");
-  const delta = latest.score_delta != null ? Number(latest.score_delta).toFixed(1) : "?";
-  const champ = latest.champion || {};
-  const chall = latest.challenger || {};
-  let verdictClass = "bg-slate-900";
-  if (v === "challenger_better") verdictClass = "bg-green-900";
-  else if (v === "champion_better") verdictClass = "bg-red-900";
-
-  const overrides = latest.env_overrides && typeof latest.env_overrides === "object"
-    ? Object.entries(latest.env_overrides).map(([k, val]) => `<code>${safeText(k)}=${safeText(val)}</code>`).join(", ")
-    : "none";
-
-  let wrLine = "";
-  if (wr.total_runs > 0) {
-    wrLine = `<p class="muted">Overall: ${safeText(wr.total_runs)} runs — Challenger wins ${safeText(wr.challenger_wins)}, Champion wins ${safeText(wr.champion_wins)}, Ties ${safeText(wr.ties)} (${safeText(wr.challenger_win_rate_pct)}% challenger win rate)</p>`;
-  }
-
-  rootEl.innerHTML = `
-    <h3>Champion vs Challenger</h3>
-    <div class="performance-buckets">
-      <div class="perf-bucket">
-        <h3>Champion (current)</h3>
-        <div class="perf-metric"><span class="label">Signals</span><span class="value">${safeText(champ.count)}</span></div>
-        <div class="perf-metric"><span class="label">Avg score</span><span class="value">${safeText(champ.avg_score)}</span></div>
-        <div class="perf-metric"><span class="label">Top ticker</span><span class="value">${safeText(champ.top_ticker || "—")}</span></div>
-      </div>
-      <div class="perf-bucket">
-        <h3>Challenger (suggested)</h3>
-        <div class="perf-metric"><span class="label">Signals</span><span class="value">${safeText(chall.count)}</span></div>
-        <div class="perf-metric"><span class="label">Avg score</span><span class="value">${safeText(chall.avg_score)}</span></div>
-        <div class="perf-metric"><span class="label">Top ticker</span><span class="value">${safeText(chall.top_ticker || "—")}</span></div>
-      </div>
-    </div>
-    <div class="performance-validation">
-      <span class="health-badge ${verdictClass}">${v.replace(/_/g, " ")}</span>
-      <span class="muted">Score delta: <strong>${delta}</strong></span>
-      <span class="muted">Run: ${safeText(latest.run_at || "?")}</span>
-    </div>
-    <p class="muted" style="margin-top:0.5rem">Overrides tested: ${overrides}</p>
-    ${wrLine}
-  `;
-}
-
-function renderEvolvePanel(rootEl, data) {
-  const rawDetails = document.getElementById("learningRawDetails");
-  const rawPre = document.getElementById("learningRaw");
-  if (!rootEl) return;
-  if (rawPre && data) rawPre.textContent = prettyJson(data);
-  if (rawDetails && data) rawDetails.classList.remove("hidden");
-
-  if (!data || typeof data !== "object") {
-    rootEl.innerHTML = `<div class="report-empty">No learning engine results yet.</div>`;
-    return;
-  }
-  if (data.status !== "ok") {
-    rootEl.innerHTML = `<div class="panel-error">${safeText(data.message || data.error || data.status)}</div>`;
-    return;
-  }
-
-  const training = data.training || {};
-  const importance = training.feature_importance || [];
-  const updates = data.updates || [];
-  const r2Train = Number(training.r2_train != null ? training.r2_train : 0);
-  const r2Val = training.r2_validation == null ? null : Number(training.r2_validation);
-  const r2Label = r2Val == null
-    ? `train R² = ${r2Train.toFixed(4)}`
-    : `train R² = ${r2Train.toFixed(4)}, val R² = ${r2Val.toFixed(4)}`;
-
-  const impRows = importance.slice(0, 10).map((f) => {
-    const barW = Math.min(100, Math.round((f.importance || 0) * 200));
-    return `<tr>
-      <td>${safeText(f.feature)}</td>
-      <td>${Number(f.importance).toFixed(4)}</td>
-      <td><div style="background:var(--accent);height:12px;width:${barW}%;border-radius:4px;"></div></td>
-    </tr>`;
-  }).join("");
-
-  const updateRows = updates.map((u) => `<tr>
-    <td><code>${safeText(u.env_key)}</code></td>
-    <td>${safeText(u.current_value)}</td>
-    <td><strong>${safeText(u.suggested_value)}</strong></td>
-    <td>${Number(u.importance).toFixed(3)}</td>
-    <td class="muted">${safeText(u.rationale).substring(0, 120)}</td>
-  </tr>`).join("");
-
-  rootEl.innerHTML = `
-    <div class="perf-bucket" style="margin-bottom:1rem">
-      <h3>Feature Importance (${r2Label}, n = ${safeText(training.n_samples)})</h3>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Feature</th><th>Importance</th><th></th></tr></thead>
-          <tbody>${impRows || '<tr><td colspan="3" class="muted">No features analyzed</td></tr>'}</tbody>
-        </table>
-      </div>
-    </div>
-    ${updates.length ? `
-    <div class="perf-bucket">
-      <h3>Suggested Threshold Adjustments (${updates.length})</h3>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Parameter</th><th>Current</th><th>Suggested</th><th>Importance</th><th>Rationale</th></tr></thead>
-          <tbody>${updateRows}</tbody>
-        </table>
-      </div>
-      <p class="muted" style="margin-top:0.5rem">Run a <strong>Challenger Scan</strong> to test these adjustments before applying.</p>
-    </div>` : '<p class="muted">No threshold adjustments suggested at this time.</p>'}
-  `;
-}
-
-function renderProfilePanel(rootEl, data, { error } = {}) {
-  const rawDetails = document.getElementById("profileRawDetails");
-  const rawPre = document.getElementById("profileRaw");
-  if (!rootEl) return;
-  if (rawPre && !error && data) rawPre.textContent = prettyJson(data);
-  if (rawDetails) {
-    if (error || !data) rawDetails.classList.add("hidden");
-    else rawDetails.classList.remove("hidden");
-  }
-  if (error) {
-    rootEl.innerHTML = `<div class="panel-error">${safeText(error)}</div>`;
-    return;
-  }
-  if (!data || typeof data !== "object") {
-    rootEl.innerHTML = `<div class="report-empty">No preset loaded.</div>`;
-    return;
-  }
-
-  const profile = safeText(data.profile || "—");
-  const mode = safeText(data.mode || "standard");
-  const expertUi = mode === "expert";
-  const autoOn = Boolean(data.automation_opt_in);
-  const active = data.active_profile_settings && typeof data.active_profile_settings === "object" ? data.active_profile_settings : {};
-  const keys = Object.keys(active).sort();
-  const catalog = state.presetCatalog && typeof state.presetCatalog === "object" ? state.presetCatalog : {};
-  const profileKey = String(data.profile || "").toLowerCase();
-  const dispMap =
-    catalog[profileKey] && catalog[profileKey].settings_display && typeof catalog[profileKey].settings_display === "object"
-      ? catalog[profileKey].settings_display
-      : {};
-
-  const settingsRows = keys
-    .map((k) => {
-      const d = dispMap[k] && typeof dispMap[k] === "object" ? dispMap[k] : {};
-      const label = safeText(d.label || presetSettingLabel(k));
-      const plain = safeText(d.plain || active[k]);
-      const raw = safeText(d.raw != null ? d.raw : active[k]);
-      const valueCell = expertUi ? `${plain}<br/><code class="preset-value">${raw}</code>` : plain;
-      return `<tr><th scope="row">${label}</th><td>${valueCell}</td></tr>`;
-    })
-    .join("");
-
-  const expert = data.expert_runtime_overrides && typeof data.expert_runtime_overrides === "object" ? data.expert_runtime_overrides : null;
-  let expertBlock = "";
-  if (expert) {
-    const ek = Object.keys(expert).sort();
-    const expertRows = ek
-      .map((k) => `<tr><th scope="row"><code>${safeText(k)}</code></th><td>${safeText(expert[k])}</td></tr>`)
-      .join("");
-    expertBlock = `
-      <div class="preset-subsection preset-expert">
-        <h3>Runtime env (read-only)</h3>
-        <table class="preset-kv-table">
-          <tbody>${expertRows || `<tr><td colspan="2" class="muted">No values</td></tr>`}</tbody>
-        </table>
-      </div>`;
-  }
-
-  rootEl.innerHTML = `
-    <div class="preset-chips">
-      <span class="preset-chip">Profile: ${profile}</span>
-      <span class="preset-chip muted-chip">Mode: ${mode}</span>
-      <span class="preset-chip ${autoOn ? "" : "muted-chip"}">${autoOn ? "Automation: on" : "Automation: off"}</span>
-    </div>
-    <div class="preset-subsection">
-      <h3>Active preset parameters</h3>
-      <table class="preset-kv-table">
-        <tbody>${
-          settingsRows || `<tr><td colspan="2" class="muted">No parameters in response.</td></tr>`
-        }</tbody>
-      </table>
-    </div>
-    ${expertBlock}
-  `;
-}
-
-function renderPresetApplyPreview() {
-  const root = document.getElementById("presetApplyPreview");
-  if (!root) return;
-  const saved = state.savedUiSettings;
-  const catalog = state.presetCatalog;
-  if (!saved || !catalog || typeof catalog !== "object") {
-    root.innerHTML = `<p class="muted small">Load presets to see a change summary.</p>`;
-    return;
-  }
-  const selProfile = document.getElementById("profileSelect")?.value || saved.profile;
-  const selMode = document.getElementById("settingsModeSelect")?.value || saved.mode;
-  const selAuto = Boolean(document.getElementById("automationOptIn")?.checked);
-
-  const cur = String(saved.profile || "balanced").toLowerCase();
-  const next = String(selProfile || "balanced").toLowerCase();
-  const curSet = catalog[cur]?.settings || {};
-  const nextSet = catalog[next]?.settings || {};
-  const keys = [...new Set([...Object.keys(curSet), ...Object.keys(nextSet)])].sort();
-
-  const parts = [];
-  if (next !== cur) {
-    const blurb = safeText(catalog[next]?.blurb || "");
-    parts.push(
-      `<li><strong>Profile:</strong> ${safeText(cur)} → ${safeText(next)}.${blurb ? ` ${blurb}` : ""}</li>`
-    );
-  }
-  keys.forEach((k) => {
-    if (curSet[k] !== nextSet[k]) {
-      const d0 = catalog[cur]?.settings_display?.[k] || {};
-      const d1 = catalog[next]?.settings_display?.[k] || {};
-      const label = safeText(d1.label || d0.label || presetSettingLabel(k));
-      const fromPlain = safeText(d0.plain || curSet[k]);
-      const toPlain = safeText(d1.plain || nextSet[k]);
-      parts.push(`<li><strong>${label}:</strong> ${fromPlain} → ${toPlain}</li>`);
-    }
-  });
-  if (String(selMode) !== String(saved.mode)) {
-    const hint =
-      selMode === "expert" ? "You will see raw env values under presets." : "Raw env values stay hidden.";
-    parts.push(`<li><strong>Dashboard mode:</strong> ${safeText(saved.mode)} → ${safeText(selMode)}. ${hint}</li>`);
-  }
-  if (selAuto !== Boolean(saved.automation_opt_in)) {
-    parts.push(
-      `<li><strong>Automation opt-in (saved setting):</strong> ${saved.automation_opt_in ? "on" : "off"} → ${selAuto ? "on" : "off"}. When off, API clients must pass an explicit live-confirmation flag; this dashboard still makes you type the ticker to approve.</li>`
-    );
-  }
-
-  if (!parts.length) {
-    root.innerHTML = `<p class="muted preset-preview-none">No changes to apply.</p>`;
-    return;
-  }
-  root.innerHTML = `<h3 class="preset-preview-title">If you apply now</h3><ul class="preset-preview-list">${parts.join("")}</ul>`;
-}
-
-function timeAgo(iso) {
-  if (!iso) return "unknown";
-  const ts = Date.parse(iso);
-  if (Number.isNaN(ts)) return "unknown";
-  const sec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-  if (sec < 60) return `${sec}s ago`;
-  const min = Math.floor(sec / 60);
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  return `${Math.floor(hr / 24)}d ago`;
-}
-
-function durationSec(startIso, endIso) {
-  const start = Date.parse(startIso || "");
-  const end = Date.parse(endIso || "");
-  if (Number.isNaN(start) || Number.isNaN(end) || end < start) return null;
-  return Math.max(0, Math.floor((end - start) / 1000));
 }
 
 function renderValidationRecentSteps(validation = {}) {
@@ -1189,26 +489,6 @@ function updateTopStrategyChip(summary = null) {
     return;
   }
   el.textContent = `Top Strategy: ${dominant} (${count}/${total})`;
-}
-
-function statusClass(status) {
-  const s = (status || "").toLowerCase();
-  if (["executed", "approved", "connected", "ok"].includes(s)) return "pill good";
-  if (["failed", "rejected", "expired", "disconnected", "fail"].includes(s)) return "pill bad";
-  if (["pending", "degraded", "warn"].includes(s)) return "pill warn";
-  if (["info"].includes(s)) return "pill info";
-  return "pill neutral";
-}
-
-function sentimentTagClass(tag) {
-  const t = String(tag || "").toUpperCase();
-  if (t.includes("BULLISH")) return "pill good";
-  if (t.includes("BEARISH")) return "pill bad";
-  return "pill neutral";
-}
-
-function healthBadgeClass(ok) {
-  return ok ? "health-badge bg-green-900" : "health-badge bg-red-900";
 }
 
 function setHealthRibbonTiles(authOk, quoteOk, errRate, validation) {
@@ -1295,41 +575,6 @@ function updateHeroInfographic() {
     const n = state.lastWatchlistSize;
     wlEl.textContent = n !== null && n !== undefined && n >= 0 ? String(n) : "—";
   }
-}
-
-function verdictFromScore(score, high = 70, low = 45) {
-  const n = safeNum(score, 0);
-  if (n >= high) return "bullish";
-  if (n <= low) return "bearish";
-  return "neutral";
-}
-
-function logEvent({ message, kind = "system", severity = "info" }) {
-  const list = document.getElementById("logList");
-  if (!list) return;
-  const item = document.createElement("li");
-  item.innerHTML = `
-    <div class="log-item">
-      <span class="log-kind ${kind} ${severity === "error" ? "error" : ""}">${kind}</span>
-      <span class="${statusClass(severity)}">${severity}</span>
-      <span>${new Date().toLocaleTimeString()} - ${safeText(message)}</span>
-    </div>
-  `;
-  list.prepend(item);
-  while (list.children.length > 30) list.removeChild(list.lastChild);
-  const mapped = severity === "error" ? "error" : severity === "warn" ? "warn" : "info";
-  updateActionCenter({ title: `${kind.toUpperCase()} Update`, message: safeText(message), severity: mapped });
-}
-
-function setStatusPill(el, label) {
-  const status = (label || "").toLowerCase();
-  el.className = statusClass(status);
-  const dotClass = status.includes("connect")
-    ? "good"
-    : status.includes("disconnect")
-      ? "bad"
-      : "warn";
-  el.innerHTML = `<span class="status-dot ${dotClass}"></span>${safeText(label)}`;
 }
 
 function setLoading(textMap = {}) {
@@ -1507,541 +752,12 @@ function getSectorKeyFromTrade(row) {
   return String(sector || "Unknown").toUpperCase();
 }
 
-function clampPct(v) {
-  return Math.max(0, Math.min(100, safeNum(v, 0)));
-}
-
 function meterFromScore(score) {
   return clampPct(safeNum(score, 0));
 }
 
 function meterFromConviction(conviction) {
   return clampPct((safeNum(conviction, 0) + 100) / 2);
-}
-
-function renderQuickViewCard(data, error) {
-  const ph = document.getElementById("quickViewPlaceholder");
-  const sum = document.getElementById("quickViewSummary");
-  const det = document.getElementById("quickViewJsonDetails");
-  const pre = document.getElementById("quickViewOutput");
-  if (error) {
-    if (ph) { ph.textContent = error; ph.classList.remove("hidden"); }
-    if (sum) { sum.classList.add("hidden"); sum.innerHTML = ""; }
-    if (det) det.classList.add("hidden");
-    if (pre) pre.textContent = "";
-    return;
-  }
-  if (ph) ph.classList.add("hidden");
-  const d = data || {};
-  const ez = d.entry_zone || {};
-  const sz = d.size || {};
-  const conf = d.confidence || {};
-  const blocked = Boolean(d.checklist && d.checklist.blocked);
-  const scoreN = Number(conf.signal_score);
-  const scoreTxt = Number.isFinite(scoreN) ? scoreN.toFixed(1) : "—";
-  const verdict = blocked
-    ? "Blocked by safety checks."
-    : "Passes current safety snapshot.";
-  const verdictClass = blocked ? "bad" : "good";
-  if (sum) {
-    sum.classList.remove("hidden");
-    sum.innerHTML = `
-      <h4 class="tool-summary-title">${safeText(d.ticker)}</h4>
-      <ul class="tool-summary-list">
-        <li><strong>Size:</strong> ${safeNum(sz.qty, 0)} shares (~${formatMoney(sz.usd || 0)})</li>
-        <li><strong>Entry zone:</strong> $${safeText(ez.low)} – $${safeText(ez.high)}</li>
-        <li><strong>Stop idea:</strong> $${safeText(d.stop_invalidation)}</li>
-        <li><strong>Confidence:</strong> ${safeText(conf.bucket)} (score ${scoreTxt})</li>
-        <li><strong>Status:</strong> <span class="pill ${verdictClass} small">${verdict}</span></li>
-      </ul>
-      ${(d.key_reasons || []).length ? `<div class="chip-row" style="margin-top: 8px;">${d.key_reasons.map(r => `<span class="chip">${safeText(r)}</span>`).join("")}</div>` : ""}
-    `;
-  }
-  if (det) det.classList.remove("hidden");
-  if (pre) pre.textContent = prettyJson(data);
-}
-
-async function openQuickViewForTrade(row) {
-  const panel = document.getElementById("quickViewPanel");
-  panel.classList.add("open");
-  renderQuickViewCard(null, "Loading decision card...");
-  const out = await api.get(`/api/decision-card/${encodeURIComponent(row.ticker)}`);
-  if (!out.ok) {
-    renderQuickViewCard(null, `Quick view unavailable: ${out.error}`);
-    return;
-  }
-  renderQuickViewCard(out.data, null);
-}
-
-function renderReportTabs(data) {
-  const tabs = document.getElementById("reportTabs");
-  tabs.innerHTML = "";
-  if (!data) return;
-  tabs.setAttribute("role", "tablist");
-  tabs.setAttribute("aria-label", "Report sections");
-  const d = data.section && data.data ? { ticker: data.ticker, [data.section]: data.data } : data;
-  const candidates = ["summary", "technical", "dcf", "comps", "health", "edgar", "mirofish", "synthesis"];
-  const available = candidates.filter((key) => key === "summary" || d[key] !== undefined && d[key] !== null);
-  if (!available.includes(state.activeReportTab)) state.activeReportTab = "summary";
-
-  available.forEach((key) => {
-    const btn = document.createElement("button");
-    const tabId = `report-tab-${key}`;
-    const panelId = `report-panel-${key}`;
-    const selected = state.activeReportTab === key;
-    btn.className = `report-tab ${state.activeReportTab === key ? "active" : ""}`;
-    btn.id = tabId;
-    btn.type = "button";
-    btn.setAttribute("role", "tab");
-    btn.setAttribute("aria-selected", selected ? "true" : "false");
-    btn.setAttribute("aria-controls", panelId);
-    btn.tabIndex = selected ? 0 : -1;
-    btn.textContent = key === "summary" ? "Summary" : key[0].toUpperCase() + key.slice(1);
-    btn.addEventListener("click", () => {
-      state.activeReportTab = key;
-      renderReportTabs(data);
-      renderReportVisual(data);
-    });
-    tabs.appendChild(btn);
-  });
-}
-
-function renderReportVisual(data) {
-  const root = document.getElementById("reportVisual");
-  if (!root) return;
-  if (!data) {
-    root.innerHTML = `<div class="report-empty">No report data.</div>`;
-    return;
-  }
-
-  const d = data.section && data.data ? { ticker: data.ticker, [data.section]: data.data } : data;
-  const ticker = d.ticker || "—";
-  const tech = d.technical || null;
-  const dcf = d.dcf || null;
-  const health = d.health || null;
-  const comps = d.comps || null;
-  const edgar = d.edgar || null;
-  const miro = d.mirofish || null;
-  const synthesis = d.synthesis || "";
-
-  const sectionVerdicts = {
-    technical: verdictFromScore(tech?.signal_score ?? 50, 65, 45),
-    dcf: verdictFromScore(dcf?.margin_of_safety ?? 0, 10, -10),
-    health: (health?.flags || []).length === 0 ? "bullish" : (health.flags.length >= 3 ? "bearish" : "neutral"),
-    mirofish: verdictFromScore(miro?.conviction_score ?? 0, 30, -30),
-  };
-
-  const kpis = [
-    { label: "Ticker", value: ticker },
-    { label: "Stage 2", value: tech ? (tech.stage_2 ? "YES" : "NO") : "—" },
-    { label: "Signal Score", value: tech?.signal_score != null ? `${safeNum(tech.signal_score).toFixed(0)}/100` : "—" },
-    { label: "DCF MOS", value: dcf?.margin_of_safety != null ? `${safeNum(dcf.margin_of_safety).toFixed(1)}%` : "—" },
-  ];
-
-  const blocks = {
-    summary: `
-      <div class="report-section">
-        <h4>Summary</h4>
-        <div class="subtle">Top-level reading before diving into sections.</div>
-        <ul class="report-bullets">
-          <li>Technical Verdict: <span class="verdict ${sectionVerdicts.technical}">${sectionVerdicts.technical}</span></li>
-          <li>DCF Verdict: <span class="verdict ${sectionVerdicts.dcf}">${sectionVerdicts.dcf}</span></li>
-          <li>Health Verdict: <span class="verdict ${sectionVerdicts.health}">${sectionVerdicts.health}</span></li>
-          <li>MiroFish Verdict: <span class="verdict ${sectionVerdicts.mirofish}">${sectionVerdicts.mirofish}</span></li>
-        </ul>
-      </div>`,
-    technical: tech ? `
-      <div class="report-section">
-        <h4>Technical <span class="verdict ${sectionVerdicts.technical}">${sectionVerdicts.technical}</span></h4>
-        <ul class="report-bullets">
-          <li>Price: ${formatMoney(tech.current_price)}</li>
-          <li>52w Range: ${formatMoney(tech.low_52w)} - ${formatMoney(tech.high_52w)}</li>
-          <li>SMA 50/150/200: ${formatMoney(tech.sma_50)} / ${formatMoney(tech.sma_150)} / ${formatMoney(tech.sma_200)}</li>
-          <li>VCP: ${tech.vcp ? "YES" : "NO"} | Sector: ${safeText(tech.sector_etf)}</li>
-          <li>Takeaway: ${tech.stage_2 && tech.vcp ? "Trend and volume structure are aligned." : "Setup quality is incomplete."}</li>
-        </ul>
-      </div>` : "",
-    dcf: dcf ? `
-      <div class="report-section">
-        <h4>DCF <span class="verdict ${sectionVerdicts.dcf}">${sectionVerdicts.dcf}</span></h4>
-        <ul class="report-bullets">
-          <li>Intrinsic Value: ${formatMoney(dcf.intrinsic_value)}</li>
-          <li>Current Price: ${formatMoney(dcf.current_price)}</li>
-          <li>Margin of Safety: ${safeNum(dcf.margin_of_safety).toFixed(1)}%</li>
-          <li>Growth / WACC / Terminal: ${pct(dcf.growth_rate)} / ${pct(dcf.wacc)} / ${pct(dcf.terminal_growth)}</li>
-          <li>Takeaway: ${safeNum(dcf.margin_of_safety) >= 0 ? "Valuation supports upside." : "Valuation implies premium pricing."}</li>
-        </ul>
-      </div>` : "",
-    comps: comps ? `
-      <div class="report-section">
-        <h4>Comps</h4>
-        <ul class="report-bullets">
-          <li>Peers: ${(comps.peers || []).slice(0, 6).map((p) => p.ticker).join(", ") || "—"}</li>
-          <li>Median P/E: ${safeText(comps.median_pe)} | Median P/S: ${safeText(comps.median_ps)}</li>
-          <li>Implied P/E: ${formatMoney(comps.implied_price_pe)} | Implied P/S: ${formatMoney(comps.implied_price_ps)}</li>
-          <li>Takeaway: Comps provide cross-check against standalone DCF assumptions.</li>
-        </ul>
-      </div>` : "",
-    health: health ? `
-      <div class="report-section">
-        <h4>Health <span class="verdict ${sectionVerdicts.health}">${sectionVerdicts.health}</span></h4>
-        <ul class="report-bullets">
-          <li>Current Ratio: ${safeText(health.current_ratio)}</li>
-          <li>Debt/Equity: ${safeText(health.debt_to_equity)}</li>
-          <li>Interest Coverage: ${safeText(health.interest_coverage)}x</li>
-          <li>ROE: ${pct(health.roe)} | Op Margin: ${pct(health.operating_margin)}</li>
-          <li>Flags: ${(health.flags || []).length ? health.flags.slice(0, 3).join("; ") : "None"}</li>
-        </ul>
-      </div>` : "",
-    edgar: edgar ? `
-      <div class="report-section">
-        <h4>EDGAR</h4>
-        <ul class="report-bullets">
-          <li>Risk Tag: ${safeText(edgar.risk_tag).toUpperCase()}</li>
-          <li>Recent 8-K: ${edgar.recent_8k ? "YES" : "NO"}</li>
-          <li>Filing Recency: ${safeText(edgar.filing_recency_days)} day(s)</li>
-          <li>Takeaway: ${(edgar.risk_reasons || []).slice(0, 2).join("; ") || "No notable filing risks."}</li>
-        </ul>
-      </div>` : "",
-    mirofish: miro ? `
-      <div class="report-section">
-        <h4>MiroFish <span class="verdict ${sectionVerdicts.mirofish}">${sectionVerdicts.mirofish}</span></h4>
-        <ul class="report-bullets">
-          <li>Conviction: ${safeText(miro.conviction_score)}</li>
-          <li>Continuation: ${pct(miro.continuation_probability, 0)}</li>
-          <li>Bull Trap: ${pct(miro.bull_trap_probability, 0)}</li>
-          <li>Takeaway: ${safeText(miro.summary || "No summary provided.")}</li>
-        </ul>
-      </div>` : "",
-    synthesis: synthesis ? `
-      <div class="report-section">
-        <h4>Synthesis</h4>
-        <div class="report-text">${safeText(synthesis)}</div>
-      </div>` : "",
-  };
-
-  const tab = state.activeReportTab || "summary";
-  root.setAttribute("role", "tabpanel");
-  root.setAttribute("id", `report-panel-${tab}`);
-  root.setAttribute("aria-labelledby", `report-tab-${tab}`);
-  root.innerHTML = `
-    <div class="report-grid">
-      ${kpis.map((k) => `<div class="report-kpi"><div class="label">${k.label}</div><div class="value">${safeText(k.value)}</div></div>`).join("")}
-    </div>
-    ${blocks[tab] || blocks.summary}
-  `;
-}
-
-function applyReportViewMode() {
-  const raw = document.getElementById("reportOutput");
-  const visual = document.getElementById("reportVisual");
-  const btn = document.getElementById("toggleReportViewBtn");
-  if (!raw || !visual || !btn) return;
-  if (state.reportRawView) {
-    raw.style.display = "block";
-    visual.style.display = "none";
-    btn.textContent = "Show Visual";
-  } else {
-    raw.style.display = "none";
-    visual.style.display = "grid";
-    btn.textContent = "Show Raw JSON";
-  }
-}
-
-function applySecCompareMode() {
-  const modeEl = document.getElementById("secCompareMode");
-  const tickerB = document.getElementById("secCompareTickerB");
-  const changesOnly = document.getElementById("secCompareChangesOnly");
-  if (!modeEl || !tickerB) return;
-  const mode = modeEl.value;
-  const requiresSecondTicker = mode === "ticker_vs_ticker";
-  tickerB.disabled = !requiresSecondTicker;
-  tickerB.placeholder = requiresSecondTicker ? "Ticker B (MSFT)" : "Not required for over-time mode";
-  if (changesOnly) {
-    changesOnly.disabled = mode !== "ticker_over_time";
-    if (mode !== "ticker_over_time") changesOnly.checked = false;
-  }
-}
-
-function renderSecAnalysisCard(label, analysis) {
-  if (!analysis) return "";
-  const themes = (analysis.key_themes || []).slice(0, 3).map((t) => `<li>${safeText(t)}</li>`).join("");
-  const risks = (analysis.risk_terms || []).slice(0, 5).join(", ") || "None highlighted";
-  const guidance = safeText(analysis.guidance_signal || "neutral");
-  const takeaway = safeText(analysis.high_level_takeaway || "No takeaway.");
-  const verdict = safeText(analysis.verdict || "neutral");
-  const confidence = Number.isFinite(Number(analysis.confidence)) ? Number(analysis.confidence) : null;
-  const why = (analysis.why || []).slice(0, 3);
-  const evidence = (analysis.evidence || []).slice(0, 2);
-  const limits = (analysis.limits || []).slice(0, 3);
-  const analysisMode = safeText(analysis.analysis_mode || "full_text");
-  const warning = analysisMode !== "full_text" || limits.length
-    ? `<div class="report-callout warn">Mode: ${analysisMode}. ${limits.length ? `Limits: ${safeText(limits.join("; "))}` : "Reduced confidence mode."}</div>`
-    : "";
-  return `
-    <div class="compare-card">
-      <h4>${safeText(label)}</h4>
-      <div class="subtle">Verdict: <span class="${statusClass(verdict === "bullish" ? "good" : verdict === "bearish" ? "bad" : "neutral")}">${verdict}</span>${confidence !== null ? ` | Confidence: ${safeText(confidence)}/100` : ""}</div>
-      ${warning}
-      <ul class="report-bullets">
-        <li>Form: ${safeText(analysis.form)} | Filed: ${safeText(analysis.filing_date)}</li>
-        <li>Guidance: <span class="${statusClass(guidance === "negative" ? "bad" : guidance === "positive" ? "good" : "neutral")}">${guidance}</span></li>
-        <li>Risk terms: ${safeText(risks)}</li>
-        <li>Takeaway: ${takeaway}</li>
-      </ul>
-      ${why.length ? `<div class="subtle">Why this verdict</div><ul class="report-bullets">${why.map((w) => `<li>${safeText(w)}</li>`).join("")}</ul>` : ""}
-      ${evidence.length ? `<div class="subtle">Top evidence</div><ul class="report-bullets">${evidence.map((ev) => `<li>${safeText(ev.claim || "Evidence")}: ${safeText(ev.quote || "")}</li>`).join("")}</ul>` : ""}
-      <div class="subtle">Top themes</div>
-      <ul class="report-bullets">${themes || "<li>No theme sentences extracted.</li>"}</ul>
-    </div>
-  `;
-}
-
-function toReadableDeltaLabel(key) {
-  const map = {
-    revenue_mentions: "Revenue references",
-    profit_mentions: "Profitability references",
-    cashflow_mentions: "Cash-flow references",
-    debt_mentions: "Debt references",
-    liquidity_mentions: "Liquidity references",
-  };
-  return map[key] || String(key || "").replaceAll("_", " ");
-}
-
-function buildNarrativeSummary(comparePayload) {
-  const compare = comparePayload?.compare || {};
-  if (compare.narrative_summary) return safeText(compare.narrative_summary);
-
-  const similarities = compare.similarities || [];
-  const differences = compare.differences || [];
-  const material = compare.material_changes || [];
-  const investor = compare.investor_takeaway || "No investor takeaway was generated.";
-
-  const firstSimilarity = similarities[0] || "The filings share limited direct overlap.";
-  const firstDifference = differences[0] || "No major contrast surfaced in the initial pass.";
-  const firstMaterial = material[0] || "No strongly material disclosure change was detected.";
-  return `${investor} ${firstSimilarity} ${firstDifference} ${firstMaterial}`;
-}
-
-function renderSecCompareEmpty(message) {
-  const headlineRoot = document.getElementById("secCompareHeadline");
-  const narrativeRoot = document.getElementById("secCompareNarrative");
-  const changesRoot = document.getElementById("secCompareChanges");
-  const evidenceRoot = document.getElementById("secCompareVisual");
-  const msg = safeText(message || "No SEC compare data available.");
-  if (headlineRoot) headlineRoot.innerHTML = `<div class="report-empty">${msg}</div>`;
-  if (narrativeRoot) narrativeRoot.innerHTML = `<div class="report-empty">${msg}</div>`;
-  if (changesRoot) changesRoot.innerHTML = `<div class="report-empty">${msg}</div>`;
-  if (evidenceRoot) evidenceRoot.innerHTML = `<div class="report-empty">${msg}</div>`;
-}
-
-function renderSecCompareVisual(data) {
-  const headlineRoot = document.getElementById("secCompareHeadline");
-  const narrativeRoot = document.getElementById("secCompareNarrative");
-  const changesRoot = document.getElementById("secCompareChanges");
-  const evidenceRoot = document.getElementById("secCompareVisual");
-  if (!headlineRoot || !narrativeRoot || !changesRoot || !evidenceRoot) return;
-  if (!data || !data.ok) {
-    renderSecCompareEmpty("No SEC compare data available.");
-    return;
-  }
-
-  const compare = data.compare || {};
-  const left = data.left || data.latest || null;
-  const right = data.right || data.prior || null;
-  const leftLabel = compare.left_label || "Left";
-  const rightLabel = compare.right_label || "Right";
-  const forensic = compare.forensic_divergence || {};
-  const sentimentTag = safeText(compare.sentiment_tag || forensic.sentiment_tag || "[NEUTRAL/BOILERPLATE]");
-  const similaritiesRaw = compare.top_commonalities || compare.similarities || [];
-  const differencesRaw = compare.top_differences || compare.differences || [];
-  const materialRaw = compare.material_changes || [];
-  const similarities = similaritiesRaw.slice(0, 6).map((x) => `<li>${safeText(x)}</li>`).join("");
-  const differences = differencesRaw.slice(0, 6).map((x) => `<li>${safeText(x)}</li>`).join("");
-  const material = materialRaw.slice(0, 6).map((x) => `<li>${safeText(x)}</li>`).join("");
-  const deltas = compare.metric_deltas || {};
-  const deltaChips = Object.entries(deltas)
-    .map(([k, v]) => `<span class="delta-chip">${safeText(toReadableDeltaLabel(k))}: ${safeNum(v, 0) >= 0 ? "+" : ""}${safeText(v)}</span>`)
-    .join("");
-  const headline = safeText(compare.summary_headline || compare.investor_takeaway || "SEC compare completed");
-  const narrative = safeText(buildNarrativeSummary(data));
-  const redFlags = Array.isArray(forensic.red_flag_ledger) ? forensic.red_flag_ledger : [];
-  const moat = forensic.margin_moat_check || {};
-  const moatBullets = Array.isArray(moat.bullets) ? moat.bullets : [];
-  const tldrVerdict = safeText(forensic.tldr_verdict || compare.investor_takeaway || "No clear divergence verdict generated.");
-  const compareConfidence = Number.isFinite(Number(compare.compare_confidence)) ? Number(compare.compare_confidence) : null;
-  const analysisMode = safeText(compare.analysis_mode || data.analysis_mode || "full_text");
-  const compareLimits = (compare.limits || []).slice(0, 3);
-  const rationale = (compare.change_summary?.plain_english_rationale || []).slice(0, 3);
-  const evidenceRanked = (compare.evidence || compare.change_summary?.evidence_ranked || []).slice(0, 4);
-  const warning = analysisMode !== "full_text" || compareLimits.length;
-
-  headlineRoot.innerHTML = `
-    <div class="report-section compare-headline-card">
-      <h4>SEC Compare Verdict</h4>
-      <div><span class="${sentimentTagClass(sentimentTag)}">${sentimentTag}</span></div>
-      <div class="compare-lead">${headline}</div>
-      <div class="subtle">Mode: ${safeText(data.mode || compare.mode || "N/A")} | Form: ${safeText(data.form_type || "N/A")} | Analysis: ${analysisMode}${compareConfidence !== null ? ` | Confidence: ${safeText(compareConfidence)}/100` : ""}</div>
-      ${warning ? `<div class="report-callout warn">Reduced confidence context. ${compareLimits.length ? `Limits: ${safeText(compareLimits.join("; "))}` : "Metadata fallback or partial evidence mode."}</div>` : ""}
-    </div>
-  `;
-
-  narrativeRoot.innerHTML = `
-    <div class="report-section compare-narrative-card">
-      <h4>The "Red Flag" Ledger</h4>
-      <ul class="report-bullets">
-        ${(redFlags.length ? redFlags : differencesRaw.slice(0, 4)).map((x) => `<li>${safeText(x)}</li>`).join("") || "<li>No newly introduced legal-risk language flagged.</li>"}
-      </ul>
-      ${rationale.length ? `<div class="subtle">Why this verdict</div><ul class="report-bullets">${rationale.map((x) => `<li>${safeText(x)}</li>`).join("")}</ul>` : ""}
-      <div class="subtle">Focus: new legal/risk language in recent filing that did not appear in comparator.</div>
-    </div>
-  `;
-
-  changesRoot.innerHTML = `
-    <div class="report-section compare-changes-card">
-      <h4>Margin &amp; Moat Check</h4>
-      <ul class="report-bullets">
-        ${(moatBullets.length ? moatBullets : [narrative]).map((x) => `<li>${safeText(x)}</li>`).join("")}
-      </ul>
-      <div class="subtle">Metric Context</div>
-      <div>${deltaChips || "<span class='muted'>No material metric deltas captured.</span>"}</div>
-      <div class="subtle">The "TL;DR Verdict"</div>
-      <div class="compare-lead">${tldrVerdict}</div>
-      <div class="subtle">Shared context</div>
-      <ul class="report-bullets">${similarities || "<li>No major similarities highlighted.</li>"}</ul>
-      <div class="subtle">Divergence context</div>
-      <ul class="report-bullets">${material || differences || "<li>No major differences highlighted.</li>"}</ul>
-      ${evidenceRanked.length ? `<div class="subtle">Top evidence snippets</div><ul class="report-bullets">${evidenceRanked.map((ev) => `<li>${safeText(ev.claim || "Evidence")}: ${safeText(ev.quote || "")}</li>`).join("")}</ul>` : ""}
-    </div>
-  `;
-
-  evidenceRoot.innerHTML = `
-    <div class="compare-grid">
-      ${renderSecAnalysisCard(leftLabel, left)}
-      ${renderSecAnalysisCard(rightLabel, right)}
-    </div>
-  `;
-  const deep = document.getElementById("secCompareDeepPanel");
-  if (deep && getDisplayMode() === "pro") deep.open = true;
-}
-
-async function buildFallbackSecCompare(mode, tickerA, tickerB, formType) {
-  const safeForm = (formType || "10-K").toUpperCase();
-  const fetchEdgar = async (ticker) => {
-    const out = await api.get(`/api/report/${ticker}?section=edgar&skip_mirofish=true&skip_edgar=false`, { timeoutMs: 180000 });
-    if (!out.ok) return { ok: false, error: out.error || `Failed report fetch for ${ticker}` };
-    const sectionData = out.data?.data || out.data?.edgar || null;
-    if (!sectionData) return { ok: false, error: `Missing EDGAR payload for ${ticker}` };
-    const filings = (sectionData.recent_filings || []).filter((f) => String(f.form || "").toUpperCase() === safeForm);
-    const filing = filings[0] || sectionData.recent_filings?.[0] || {};
-    return {
-      ok: true,
-      ticker: ticker,
-      form: filing.form || safeForm,
-      filing_date: filing.date || "N/A",
-      filing_url: filing.url || "",
-      guidance_signal: "neutral",
-      key_themes: (sectionData.risk_reasons || []).slice(0, 4).map((r) => `Risk note: ${r}`),
-      risk_terms: (sectionData.risk_reasons || []).map((r) => String(r).toLowerCase()),
-      high_level_takeaway: (sectionData.risk_reasons || []).length
-        ? sectionData.risk_reasons.slice(0, 2).join("; ")
-        : "No notable filing risks in current metadata snapshot.",
-      kpi_signals: {
-        revenue_mentions: [],
-        profit_mentions: [],
-        cashflow_mentions: [],
-        debt_mentions: [],
-        liquidity_mentions: [],
-      },
-    };
-  };
-
-  const toComparePayload = (left, right, compareMode, leftLabel, rightLabel) => {
-    const leftRisks = new Set(left.risk_terms || []);
-    const rightRisks = new Set(right.risk_terms || []);
-    const commonRisks = [...leftRisks].filter((x) => rightRisks.has(x));
-    const leftOnly = [...leftRisks].filter((x) => !rightRisks.has(x));
-    const rightOnly = [...rightRisks].filter((x) => !leftRisks.has(x));
-    const differences = [];
-    if (leftOnly.length) differences.push(`${leftLabel} unique risk notes: ${leftOnly.slice(0, 4).join(", ")}.`);
-    if (rightOnly.length) differences.push(`${rightLabel} unique risk notes: ${rightOnly.slice(0, 4).join(", ")}.`);
-    if (!differences.length) differences.push("Risk posture appears similar based on EDGAR metadata.");
-    const sentimentTag = differences.length > 1 ? "[BEARISH CHANGE]" : "[NEUTRAL/BOILERPLATE]";
-    const redFlagLedger = differences.slice(0, 3);
-    const marginMoatBullets = [
-      `${leftLabel}: revenue references from metadata are limited; innovation signal may be undercounted in fallback mode.`,
-      `${rightLabel}: revenue references from metadata are limited; innovation signal may be undercounted in fallback mode.`,
-    ];
-    const tldrVerdict = `${leftLabel} vs ${rightLabel} remains inconclusive under metadata-only mode; use full SEC compare endpoint for a reliable divergence call.`;
-    return {
-      ok: true,
-      mode: compareMode,
-      form_type: safeForm,
-      left,
-      right,
-      compare: {
-        ok: true,
-        mode: compareMode,
-        left_label: leftLabel,
-        right_label: rightLabel,
-        similarities: commonRisks.length
-          ? [`Shared risk notes: ${commonRisks.slice(0, 5).join(", ")}.`]
-          : ["Limited overlap from metadata-only filing notes."],
-        differences,
-        metric_deltas: {
-          revenue_mentions: 0,
-          profit_mentions: 0,
-          cashflow_mentions: 0,
-          r_and_d_mentions: 0,
-          debt_mentions: 0,
-          liquidity_mentions: 0,
-        },
-        sentiment_tag: sentimentTag,
-        forensic_divergence: {
-          sentiment_tag: sentimentTag,
-          red_flag_ledger: redFlagLedger,
-          margin_moat_check: {
-            left_label: leftLabel,
-            right_label: rightLabel,
-            left_revenue_refs: 0,
-            left_r_and_d_refs: 0,
-            right_revenue_refs: 0,
-            right_r_and_d_refs: 0,
-            bullets: marginMoatBullets,
-          },
-          tldr_verdict: tldrVerdict,
-        },
-        material_changes: [],
-        summary_headline: "Metadata-only compare completed.",
-        narrative_summary: "This compare uses EDGAR metadata fallback only. It highlights broad risk-note overlap and differences but does not parse full filing text.",
-        top_differences: differences.slice(0, 3),
-        top_commonalities: commonRisks.length
-          ? [`Shared risk notes: ${commonRisks.slice(0, 5).join(", ")}.`]
-          : ["Limited overlap from metadata-only filing notes."],
-        investor_takeaway: "Fallback compare is based on EDGAR metadata only. Enable SEC compare API for deeper filing-text analysis.",
-        analysis_mode: "metadata_fallback",
-        compare_confidence: 25,
-        limits: ["Metadata-only fallback (full filing text unavailable)"],
-      },
-    };
-  };
-
-  if (mode === "ticker_vs_ticker") {
-    const [left, right] = await Promise.all([fetchEdgar(tickerA), fetchEdgar(tickerB)]);
-    if (!left.ok) return { ok: false, error: left.error };
-    if (!right.ok) return { ok: false, error: right.error };
-    return toComparePayload(left, right, mode, tickerA, tickerB);
-  }
-
-  const latest = await fetchEdgar(tickerA);
-  if (!latest.ok) return { ok: false, error: latest.error };
-  return toComparePayload(
-    { ...latest, ticker: tickerA, filing_date: latest.filing_date || "latest" },
-    { ...latest, ticker: tickerA, filing_date: "prior (metadata fallback)", high_level_takeaway: "Prior filing text compare unavailable in fallback mode." },
-    mode,
-    `${tickerA} latest`,
-    `${tickerA} prior`,
-  );
 }
 
 function renderPendingContext(row) {
@@ -2129,6 +845,8 @@ function applySchwabConnectButtonVisibility() {
   const pc = state.publicConfig || {};
   document.getElementById("onboardingSchwabBtn")?.classList.toggle("hidden", !pc.schwab_oauth);
   document.getElementById("onboardingSchwabMarketBtn")?.classList.toggle("hidden", !pc.schwab_market_oauth);
+  document.getElementById("onboardingSchwabLink")?.classList.toggle("hidden", !pc.schwab_oauth);
+  document.getElementById("onboardingSchwabMarketLink")?.classList.toggle("hidden", !pc.schwab_market_oauth);
 }
 
 async function loadConfig() {
@@ -2207,8 +925,8 @@ async function loadConfig() {
       if (!manualJwtAllowed) return;
       const val = normalizeUserJwt(tokenInput?.value);
       if (val) {
-        if (!AuthJwt.isProbablyAccessJwt(val)) {
-          logEvent({ kind: "system", severity: "error", message: AuthJwt.JWT_BAD_SHAPE_HINT });
+        if (!isProbablyAccessJwt(val)) {
+          logEvent({ kind: "system", severity: "error", message: JWT_BAD_SHAPE_HINT });
           return;
         }
         localStorage.setItem(AUTH_TOKEN_KEY, val);
@@ -2259,11 +977,7 @@ async function loadConfig() {
   const marketOauthSt = params.get("schwab_market_oauth");
   if (oauthSt || marketOauthSt) {
     const msg = params.get("message") || "";
-    const u = new URL(window.location.href);
-    u.searchParams.delete("schwab_oauth");
-    u.searchParams.delete("schwab_market_oauth");
-    u.searchParams.delete("message");
-    window.history.replaceState({}, "", u.pathname + (u.search ? u.search : ""));
+    clearOAuthQueryParams(["schwab_oauth", "schwab_market_oauth", "message"]);
     applySchwabConnectButtonVisibility();
 
     if (oauthSt) {
@@ -2973,7 +1687,7 @@ async function refreshPending() {
     btn.addEventListener("click", async (e) => {
       const id = e.currentTarget.getAttribute("data-quick");
       const row = rows.find((r) => r.id === id);
-      if (row) await openQuickViewForTrade(row);
+      if (row) await openTradeDrawerForTrade(row);
     });
   });
 
@@ -3050,485 +1764,6 @@ async function approveTradeById(id) {
     updateActionCenter({ title: "Trade Approved", message: `Trade ${id} approved and submitted.`, severity: "success" });
   }
   await refreshPending();
-}
-
-function renderOnboardingCards(data) {
-  const cards = document.getElementById("onboardingCards");
-  const det = document.getElementById("onboardingJsonDetails");
-  const pre = document.getElementById("onboardingOutput");
-  if (!cards) return;
-  if (!data) {
-    cards.innerHTML = `<p class="muted">Run the wizard or click individual steps above.</p>`;
-    if (det) det.classList.add("hidden");
-    return;
-  }
-  const steps = data.steps || {};
-  const stepNames = { connect: "Link Schwab", verify_token_health: "Verify Tokens", test_scan: "Test Scan", test_paper_order: "Paper Order" };
-  const stepDescs = { connect: "Token files exist for market & account sessions.", verify_token_health: "Live API check: market token, account token, and quote probe.", test_scan: "Run the signal scanner and confirm no fatal errors.", test_paper_order: "Shadow-mode order to verify execution path." };
-  let html = '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px;">';
-  for (const [key, label] of Object.entries(stepNames)) {
-    const step = steps[key] || {};
-    const ok = Boolean(step.ok);
-    const borderColor = ok ? "rgba(52, 211, 153, 0.45)" : step.at ? "rgba(251, 113, 133, 0.45)" : "rgba(100, 116, 139, 0.35)";
-    const bgColor = ok ? "rgba(6, 78, 59, 0.2)" : step.at ? "rgba(127, 29, 29, 0.15)" : "rgba(10, 16, 34, 0.6)";
-    const statusPill = ok
-      ? '<span class="pill good small">Pass</span>'
-      : step.at ? '<span class="pill bad small">Fail</span>' : '<span class="pill neutral small">Not run</span>';
-    const fixPath = step.fix_path ? `<p class="muted" style="font-size: 0.78rem; margin: 6px 0 0;">${safeText(step.fix_path)}</p>` : "";
-    html += `<div style="border-radius: 12px; border: 1px solid ${borderColor}; background: ${bgColor}; padding: 12px;">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-        <strong style="font-size: 0.88rem;">${label}</strong>
-        ${statusPill}
-      </div>
-      <p class="muted" style="font-size: 0.8rem; margin: 0;">${stepDescs[key]}</p>
-      ${fixPath}
-    </div>`;
-  }
-  html += "</div>";
-  const elapsed = data.elapsed_minutes;
-  const done = data.completed_under_target;
-  if (elapsed != null) {
-    html += `<p class="muted" style="margin-top: 10px;">Elapsed: ${elapsed} min${done ? ' · <span class="pill good small">Under target</span>' : ""}</p>`;
-  }
-  cards.innerHTML = html;
-  if (det) det.classList.remove("hidden");
-  if (pre) pre.textContent = prettyJson(data);
-}
-
-async function refreshOnboarding() {
-  const out = await api.get("/api/onboarding/status");
-  const meta = document.getElementById("onboardingMeta");
-  const section = document.getElementById("onboardingSection");
-  if (!meta) return;
-  if (!out.ok) {
-    renderOnboardingCards(null);
-    meta.textContent = `Onboarding status failed: ${out.error}`;
-    return;
-  }
-  state.onboarding = out.data;
-  if (section) section.style.display = "block";
-  const conn = out.data?.connection_status || (out.data?.schwab_linked ? "connected" : "disconnected");
-  const ah = out.data?.api_health || {};
-  const apiLine = ah.schwab_linked
-    ? `API: market ${ah.market_token_ok ? "ok" : "—"} · account ${ah.account_token_ok ? "ok" : "—"} · quotes ${ah.quote_ok ? "ok" : "—"}`
-    : "API: connect Schwab to probe tokens and quotes.";
-  const haltLine = state.publicConfig.platform_live_trading_kill_switch ? " · Global operator halt: ON" : "";
-  meta.textContent = `Connection: ${conn} · ${apiLine}${haltLine}`;
-  renderOnboardingCards(out.data);
-}
-
-async function startOnboarding() {
-  await runLazyApi("onboarding");
-  const out = await api.post("/api/onboarding/start", {});
-  if (!out.ok) {
-    logEvent({ kind: "system", severity: "error", message: `Onboarding start failed: ${out.error}` });
-    renderOnboardingCards(null);
-    updateActionCenter({ title: "Schwab setup", message: out.error || "Could not start onboarding.", severity: "error" });
-    return;
-  }
-  logEvent({ kind: "system", severity: "info", message: "Setup wizard started." });
-  await refreshOnboarding();
-}
-
-async function runOnboardingStep(step) {
-  await runLazyApi("onboarding");
-  const out = await api.post(`/api/onboarding/step/${step}`, {});
-  if (!out.ok) {
-    logEvent({ kind: "system", severity: "error", message: `Onboarding step failed: ${out.error}` });
-    updateActionCenter({ title: "Schwab setup", message: out.error || `Step ${step} failed.`, severity: "error" });
-    return;
-  }
-  logEvent({ kind: "system", severity: "info", message: `Onboarding step complete: ${step}.` });
-  await refreshOnboarding();
-}
-
-async function loadProfiles() {
-  const mode = document.getElementById("settingsModeSelect")?.value || "standard";
-  const expert = mode === "expert";
-  const out = await api.get(`/api/settings/profiles?expert=${expert}`);
-  const panel = document.getElementById("profilePanel");
-  if (!panel) return;
-  if (!out.ok) {
-    renderProfilePanel(panel, null, { error: `Profile load failed: ${out.error}` });
-    return;
-  }
-  state.profile = out.data;
-  state.presetCatalog =
-    out.data.preset_catalog && typeof out.data.preset_catalog === "object" ? out.data.preset_catalog : {};
-  state.savedUiSettings = {
-    profile: out.data.profile || "balanced",
-    mode: out.data.mode || "standard",
-    automation_opt_in: Boolean(out.data.automation_opt_in),
-  };
-  document.getElementById("profileSelect").value = out.data.profile || "balanced";
-  document.getElementById("settingsModeSelect").value = out.data.mode || "standard";
-  document.getElementById("automationOptIn").checked = Boolean(out.data.automation_opt_in);
-  renderProfilePanel(panel, out.data);
-  renderPresetApplyPreview();
-}
-
-async function applyProfile() {
-  const profile = document.getElementById("profileSelect").value;
-  const mode = document.getElementById("settingsModeSelect").value;
-  const automationOptIn = document.getElementById("automationOptIn").checked;
-  const out = await api.post(`/api/settings/profile?profile=${encodeURIComponent(profile)}&mode=${encodeURIComponent(mode)}&automation_opt_in=${automationOptIn}`, {});
-  const panel = document.getElementById("profilePanel");
-  if (!out.ok) {
-    if (panel) renderProfilePanel(panel, null, { error: `Apply preset failed: ${out.error}` });
-    logEvent({ kind: "system", severity: "error", message: `Preset apply failed: ${out.error}` });
-    return;
-  }
-  logEvent({
-    kind: "system",
-    severity: "info",
-    message: `Preset: ${profile}, automation ${automationOptIn ? "on" : "off"}, ${mode} mode.`,
-  });
-  updateActionCenter({
-    title: "Preset applied",
-    message: `${profile} · ${mode} mode · automation ${automationOptIn ? "on" : "off"}`,
-    severity: "success",
-  });
-  await loadProfiles();
-}
-
-function renderDecisionCardView(data, error) {
-  const ph = document.getElementById("decisionPlaceholder");
-  const sum = document.getElementById("decisionSummary");
-  const det = document.getElementById("decisionJsonDetails");
-  const pre = document.getElementById("decisionOutput");
-  if (!pre) return;
-  if (error) {
-    if (ph) {
-      ph.textContent = error;
-      ph.classList.remove("hidden");
-    }
-    if (sum) {
-      sum.classList.add("hidden");
-      sum.innerHTML = "";
-    }
-    if (det) det.classList.add("hidden");
-    pre.textContent = "";
-    return;
-  }
-  if (ph) ph.classList.add("hidden");
-  const ez = data.entry_zone || {};
-  const sz = data.size || {};
-  const conf = data.confidence || {};
-  const blocked = Boolean(data.checklist && data.checklist.blocked);
-  const scoreN = Number(conf.signal_score);
-  const scoreTxt = Number.isFinite(scoreN) ? scoreN.toFixed(1) : "—";
-  const verdict = blocked
-    ? "Safety checks say do not send this live yet."
-    : "Passes current safety snapshot; you still confirm each live order in the queue.";
-  if (sum) {
-    sum.classList.remove("hidden");
-    sum.innerHTML = `
-      <h4 class="tool-summary-title">${safeText(data.ticker)}</h4>
-      <ul class="tool-summary-list">
-        <li><strong>Size:</strong> ${safeNum(sz.qty, 0)} shares (~${formatMoney(sz.usd || 0)}).</li>
-        <li><strong>Entry zone:</strong> ${safeText(ez.low)} – ${safeText(ez.high)}.</li>
-        <li><strong>Stop idea:</strong> near ${safeText(data.stop_invalidation)}.</li>
-        <li><strong>Confidence:</strong> ${safeText(conf.bucket)} (score ${scoreTxt}).</li>
-        <li><strong>Live readiness:</strong> ${verdict}</li>
-      </ul>
-    `;
-  }
-  if (det) det.classList.remove("hidden");
-  pre.textContent = prettyJson(data);
-}
-
-async function loadDecisionCard() {
-  const ticker = document.getElementById("decisionTickerInput").value.trim().toUpperCase();
-  if (!ticker) return;
-  const out = await api.get(`/api/decision-card/${ticker}`);
-  if (!out.ok) {
-    renderDecisionCardView(null, `Decision card failed: ${out.error}`);
-    return;
-  }
-  renderDecisionCardView(out.data, null);
-}
-
-function renderRecoveryView(data, error) {
-  const ph = document.getElementById("recoveryPlaceholder");
-  const sum = document.getElementById("recoverySummary");
-  const det = document.getElementById("recoveryJsonDetails");
-  const pre = document.getElementById("recoveryOutput");
-  if (!pre) return;
-  if (error) {
-    if (ph) {
-      ph.textContent = error;
-      ph.classList.remove("hidden");
-    }
-    if (sum) {
-      sum.classList.add("hidden");
-      sum.innerHTML = "";
-    }
-    if (det) det.classList.add("hidden");
-    pre.textContent = "";
-    return;
-  }
-  if (ph) ph.classList.add("hidden");
-  if (sum) {
-    sum.classList.remove("hidden");
-    sum.innerHTML = `
-      <h4 class="tool-summary-title">${safeText(data.title)}</h4>
-      <p class="tool-summary-p">${safeText(data.summary)}</p>
-      <p class="tool-summary-next"><strong>Next step:</strong> ${safeText(data.fix_path)}</p>
-    `;
-  }
-  if (det) det.classList.remove("hidden");
-  pre.textContent = prettyJson(data);
-}
-
-async function mapRecovery() {
-  const source = document.getElementById("recoverySource").value;
-  const message = document.getElementById("recoveryMessage").value.trim();
-  if (!message) return;
-  const out = await api.get(`/api/recovery/map?source=${encodeURIComponent(source)}&error=${encodeURIComponent(message)}`);
-  if (!out.ok) {
-    renderRecoveryView(null, `Recovery mapping failed: ${out.error}`);
-    return;
-  }
-  renderRecoveryView(out.data, null);
-}
-
-async function refreshPerformance() {
-  const out = await api.get("/api/performance");
-  const panel = document.getElementById("performancePanel");
-  const evolveBtn = document.getElementById("evolveBtn");
-  const challengerBtn = document.getElementById("challengerBtn");
-  if (!panel) return;
-  if (!out.ok) {
-    renderPerformancePanel(panel, null, { error: `Performance load failed: ${out.error}` });
-    if (evolveBtn) {
-      evolveBtn.disabled = true;
-      evolveBtn.title = "Performance data unavailable.";
-    }
-    if (challengerBtn) {
-      challengerBtn.disabled = true;
-      challengerBtn.title = "Performance data unavailable.";
-    }
-    return;
-  }
-  state.performance = out.data;
-  renderPerformancePanel(panel, out.data);
-  const outcomeCount = Number(out.data?.live?.recorded_outcomes || 0);
-  if (evolveBtn) {
-    const canRunEvolve = outcomeCount > 0;
-    evolveBtn.disabled = !canRunEvolve;
-    evolveBtn.title = canRunEvolve
-      ? ""
-      : "No persisted trade outcomes yet. Execute trades first, then run analysis.";
-  }
-  const canRunChallenger = Boolean(out.data?.challenger?.can_run);
-  if (challengerBtn) {
-    challengerBtn.disabled = !canRunChallenger;
-    challengerBtn.title = canRunChallenger
-      ? ""
-      : "Run Post-Mortem Analysis first to generate strategy overrides.";
-  }
-}
-
-function renderCalibrationPanel(panel, data, error) {
-  if (!panel) return;
-  if (error) {
-    panel.innerHTML = `<div class="report-empty">${escapeHtml(error)}</div>`;
-    return;
-  }
-  if (!data) {
-    panel.innerHTML = `<div class="report-empty">No data.</div>`;
-    return;
-  }
-  if (data.empty) {
-    panel.innerHTML = `<div class="report-empty">${escapeHtml(data.hint || "No calibration snapshot yet.")}</div>`;
-    return;
-  }
-  const parts = [];
-  if (data.self_study) {
-    const ss = data.self_study;
-    let ssHtml = '<div class="preset-subsection"><h3>Self-study</h3>';
-    if (ss.min_conviction_threshold != null) {
-      ssHtml += `<div class="perf-metric"><span class="label">Min conviction threshold</span><span class="value">${safeNum(ss.min_conviction_threshold, 1)}</span></div>`;
-    }
-    if (ss.round_trips != null) {
-      ssHtml += `<div class="perf-metric"><span class="label">Round trips</span><span class="value">${safeNum(ss.round_trips, 0)}</span></div>`;
-    }
-    if (ss.win_rate != null) {
-      ssHtml += `<div class="perf-metric"><span class="label">Win rate</span><span class="value">${(safeNum(ss.win_rate, 2) * 100).toFixed(1)}%</span></div>`;
-    }
-    if (ss.avg_return_pct != null) {
-      ssHtml += `<div class="perf-metric"><span class="label">Avg return</span><span class="value">${safeNum(ss.avg_return_pct, 2).toFixed(2)}%</span></div>`;
-    }
-    ssHtml += `<details class="tool-json-details" style="margin-top: 8px;"><summary>Raw data</summary><pre class="code-block code-block--tight">${escapeHtml(prettyJson(ss))}</pre></details>`;
-    ssHtml += "</div>";
-    parts.push(ssHtml);
-  }
-  if (data.hypothesis_ledger) {
-    const hl = data.hypothesis_ledger;
-    let hlHtml = '<div class="preset-subsection"><h3>Hypothesis ledger</h3>';
-    if (hl.total_hypotheses != null) {
-      hlHtml += `<div class="perf-metric"><span class="label">Total hypotheses</span><span class="value">${safeNum(hl.total_hypotheses, 0)}</span></div>`;
-    }
-    if (hl.scored != null) {
-      hlHtml += `<div class="perf-metric"><span class="label">Scored</span><span class="value">${safeNum(hl.scored, 0)}</span></div>`;
-    }
-    if (hl.hit_rate != null) {
-      hlHtml += `<div class="perf-metric"><span class="label">Hit rate</span><span class="value">${(safeNum(hl.hit_rate, 2) * 100).toFixed(1)}%</span></div>`;
-    }
-    hlHtml += `<details class="tool-json-details" style="margin-top: 8px;"><summary>Raw data</summary><pre class="code-block code-block--tight">${escapeHtml(prettyJson(hl))}</pre></details>`;
-    hlHtml += "</div>";
-    parts.push(hlHtml);
-  }
-  panel.innerHTML =
-    parts.length > 0
-      ? parts.join("")
-      : `<div class="muted">No calibration data available yet.</div>`;
-}
-
-async function refreshCalibration() {
-  const panel = document.getElementById("calibrationPanel");
-  if (!panel) return;
-  const out = await api.get("/api/calibration/summary");
-  if (!out.ok) {
-    renderCalibrationPanel(panel, null, `Calibration load failed: ${out.error}`);
-    return;
-  }
-  state.calibration = out.data;
-  renderCalibrationPanel(panel, out.data, null);
-}
-
-async function submitTradingHaltSave() {
-  if (!state.publicConfig.saas_mode) return;
-  const halted = Boolean(document.getElementById("tradingHaltedCheckbox")?.checked);
-  const out = await api.patch("/api/settings/trading-halt", { halted });
-  if (!out.ok) {
-    const msg = typeof out.error === "string" ? out.error : JSON.stringify(out.error || "Request failed");
-    updateActionCenter({ title: "Trading pause", message: msg, severity: "error" });
-    return;
-  }
-  updateActionCenter({
-    title: halted ? "Trading paused" : "Trading pause cleared",
-    message: halted
-      ? "New live approvals are blocked until you turn this off."
-      : "You may approve live trades again when live trading is enabled.",
-    severity: "success",
-  });
-  await refreshAccountMe();
-}
-
-function setDefaultBacktestDates() {
-  const startEl = document.getElementById("btStart");
-  const endEl = document.getElementById("btEnd");
-  if (startEl?.value && endEl?.value) return;
-  const end = new Date();
-  const start = new Date();
-  start.setFullYear(end.getFullYear() - 5);
-  const fmt = (d) => d.toISOString().slice(0, 10);
-  if (startEl && !startEl.value) startEl.value = fmt(start);
-  if (endEl && !endEl.value) endEl.value = fmt(end);
-}
-
-function restoreBacktestFormFromStorage() {
-  try {
-    const raw = localStorage.getItem(BACKTEST_PREFS_KEY);
-    if (!raw) return false;
-    const o = JSON.parse(raw);
-    if (!o || typeof o !== "object") return false;
-    const setVal = (id, val) => {
-      const el = document.getElementById(id);
-      if (!el || val === undefined || val === null) return;
-      el.value = String(val);
-    };
-    setVal("btUniverse", o.universe);
-    setVal("btTickers", o.tickers);
-    setVal("btTheory", o.theory);
-    setVal("btStart", o.start);
-    setVal("btEnd", o.end);
-    setVal("btSlippage", o.slippage);
-    setVal("btFeeShare", o.feeShare);
-    setVal("btMinFee", o.minFee);
-    setVal("btMaxAdv", o.maxAdv);
-    setVal("btQualityGates", o.qualityGates);
-    setVal("btBreakoutConfirm", o.breakoutConfirm);
-    setVal("btForensicMode", o.forensicMode);
-    setVal("btPead", o.pead);
-    const skip = document.getElementById("btSkipMirofish");
-    if (skip && typeof o.skipMirofish === "boolean") skip.checked = o.skipMirofish;
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function snapshotBacktestFormForStorage() {
-  return {
-    universe: document.getElementById("btUniverse")?.value ?? "",
-    tickers: document.getElementById("btTickers")?.value ?? "",
-    theory: document.getElementById("btTheory")?.value ?? "",
-    start: document.getElementById("btStart")?.value ?? "",
-    end: document.getElementById("btEnd")?.value ?? "",
-    slippage: document.getElementById("btSlippage")?.value ?? "",
-    feeShare: document.getElementById("btFeeShare")?.value ?? "",
-    minFee: document.getElementById("btMinFee")?.value ?? "",
-    maxAdv: document.getElementById("btMaxAdv")?.value ?? "",
-    qualityGates: document.getElementById("btQualityGates")?.value ?? "",
-    breakoutConfirm: document.getElementById("btBreakoutConfirm")?.value ?? "",
-    forensicMode: document.getElementById("btForensicMode")?.value ?? "",
-    pead: document.getElementById("btPead")?.value ?? "",
-    skipMirofish: Boolean(document.getElementById("btSkipMirofish")?.checked),
-  };
-}
-
-let _backtestPersistTimer = null;
-function schedulePersistBacktestForm() {
-  if (_backtestPersistTimer) clearTimeout(_backtestPersistTimer);
-  _backtestPersistTimer = setTimeout(() => {
-    _backtestPersistTimer = null;
-    try {
-      localStorage.setItem(BACKTEST_PREFS_KEY, JSON.stringify(snapshotBacktestFormForStorage()));
-    } catch {
-      /* quota */
-    }
-  }, 400);
-}
-
-function wireBacktestFormPersistence() {
-  const root = document.getElementById("backtestSection");
-  if (!root) return;
-  root.addEventListener("input", schedulePersistBacktestForm);
-  root.addEventListener("change", schedulePersistBacktestForm);
-}
-
-function resetBacktestFormToDefaults() {
-  localStorage.removeItem(BACKTEST_PREFS_KEY);
-  const u = document.getElementById("btUniverse");
-  if (u) u.value = "watchlist";
-  const tick = document.getElementById("btTickers");
-  if (tick) tick.value = "";
-  const th = document.getElementById("btTheory");
-  if (th) th.value = "";
-  const s = document.getElementById("btStart");
-  const e = document.getElementById("btEnd");
-  if (s) s.value = "";
-  if (e) e.value = "";
-  setDefaultBacktestDates();
-  const slip = document.getElementById("btSlippage");
-  if (slip) slip.value = "15";
-  const fee = document.getElementById("btFeeShare");
-  if (fee) fee.value = "0.005";
-  const minf = document.getElementById("btMinFee");
-  if (minf) minf.value = "1";
-  const adv = document.getElementById("btMaxAdv");
-  if (adv) adv.value = "0.02";
-  ["btQualityGates", "btBreakoutConfirm", "btForensicMode", "btPead"].forEach((id) => {
-    const el = document.getElementById(id);
-    if (el) el.value = "";
-  });
-  const skip = document.getElementById("btSkipMirofish");
-  if (skip) skip.checked = false;
-  syncBtUniverseRow();
-  setBtMetaMessage("Form reset to defaults. Queue when ready.");
-  logEvent({ kind: "system", severity: "info", message: "Backtest form reset." });
 }
 
 function openQueueScanDialog(sig) {
@@ -3632,766 +1867,6 @@ async function submitManualPendingTrade() {
   if (btn) btn.disabled = false;
 }
 
-function setBacktestQueueUiBusy(busy) {
-  state.backtestQueueBusy = busy;
-  const btn = document.getElementById("btQueueBtn");
-  if (btn) btn.disabled = busy;
-  const spin = document.getElementById("btMetaSpinner");
-  const metaText = document.getElementById("btMetaText");
-  if (spin) spin.classList.toggle("hidden", !busy);
-  if (metaText && busy && !metaText.dataset.sticky) metaText.textContent = "Running…";
-}
-
-function setBtMetaMessage(text, { sticky = false } = {}) {
-  const metaText = document.getElementById("btMetaText");
-  if (!metaText) return;
-  metaText.textContent = text;
-  if (sticky) metaText.dataset.sticky = "1";
-  else delete metaText.dataset.sticky;
-}
-
-function syncBtUniverseRow() {
-  const sel = document.getElementById("btUniverse");
-  const row = document.getElementById("btTickersRow");
-  if (!row) return;
-  const mode = sel?.value || "watchlist";
-  row.classList.toggle("hidden", mode !== "tickers");
-}
-
-function applyBacktestPresetYears(years) {
-  const end = new Date();
-  const start = new Date();
-  start.setFullYear(end.getFullYear() - Number(years));
-  const fmt = (d) => d.toISOString().slice(0, 10);
-  const startEl = document.getElementById("btStart");
-  const endEl = document.getElementById("btEnd");
-  if (startEl) startEl.value = fmt(start);
-  if (endEl) endEl.value = fmt(end);
-  setBtMetaMessage(`Date range set to last ${years} year(s).`);
-  schedulePersistBacktestForm();
-}
-
-function collectBacktestOverrides() {
-  const o = {};
-  const q = document.getElementById("btQualityGates")?.value || "";
-  if (q) o.quality_gates_mode = q;
-  const bo = document.getElementById("btBreakoutConfirm")?.value || "";
-  if (bo === "on") o.breakout_confirm_enabled = true;
-  if (bo === "off") o.breakout_confirm_enabled = false;
-  const pead = document.getElementById("btPead")?.value || "";
-  if (pead === "on") o.pead_enabled = true;
-  if (pead === "off") o.pead_enabled = false;
-  if (document.getElementById("btSkipMirofish")?.checked) o.skip_mirofish = true;
-  const fm = document.getElementById("btForensicMode")?.value || "";
-  if (fm === "disabled") o.forensic_enabled = false;
-  else if (fm === "shadow" || fm === "soft" || fm === "hard") {
-    o.forensic_enabled = true;
-    o.forensic_filter_mode = fm;
-  } else if (fm === "off") {
-    o.forensic_enabled = true;
-    o.forensic_filter_mode = "off";
-  }
-  return Object.keys(o).length ? o : null;
-}
-
-function collectBacktestSpecFromForm() {
-  const theory = document.getElementById("btTheory")?.value?.trim() || "";
-  const universe = document.getElementById("btUniverse")?.value || "watchlist";
-  const tickersRaw = document.getElementById("btTickers")?.value || "";
-  const tickers = tickersRaw
-    .split(/[\s,]+/)
-    .map((t) => t.trim().toUpperCase())
-    .filter(Boolean);
-  const start = document.getElementById("btStart")?.value;
-  const end = document.getElementById("btEnd")?.value;
-  const slip = Number(document.getElementById("btSlippage")?.value);
-  const fee = Number(document.getElementById("btFeeShare")?.value);
-  const minf = Number(document.getElementById("btMinFee")?.value);
-  const adv = Number(document.getElementById("btMaxAdv")?.value);
-  const spec = {
-    schema_version: 1,
-    universe_mode: universe === "tickers" ? "tickers" : "watchlist",
-    tickers: universe === "tickers" ? tickers : [],
-    start_date: start,
-    end_date: end,
-  };
-  if (theory) spec.theory_name = theory;
-  if (Number.isFinite(slip)) spec.slippage_bps_per_side = slip;
-  if (Number.isFinite(fee)) spec.fee_per_share = fee;
-  if (Number.isFinite(minf)) spec.min_fee_per_order = minf;
-  if (Number.isFinite(adv)) spec.max_adv_participation = adv;
-  const ov = collectBacktestOverrides();
-  if (ov) spec.overrides = ov;
-  return spec;
-}
-
-function renderBacktestResultSummary(result) {
-  const box = document.getElementById("btResultSummary");
-  if (!box) return;
-  if (!result || typeof result !== "object") {
-    box.innerHTML = "";
-    return;
-  }
-  const tt = result.total_trades;
-  if (tt === undefined || tt === null) {
-    box.innerHTML = "";
-    return;
-  }
-  const findings = typeof result.findings === "string" ? result.findings : "";
-  box.innerHTML = `
-    <div class="bt-metric-grid">
-      <div class="bt-metric"><div class="bt-metric-label">Trades</div><div class="bt-metric-value">${safeText(tt)}</div></div>
-      <div class="bt-metric"><div class="bt-metric-label">Win rate (net)</div><div class="bt-metric-value">${formatPercentPoints(result.win_rate_net, 1)}</div></div>
-      <div class="bt-metric"><div class="bt-metric-label">Total return (net)</div><div class="bt-metric-value">${formatPercentPoints(result.total_return_net_pct, 2)}</div></div>
-      <div class="bt-metric"><div class="bt-metric-label">CAGR (net)</div><div class="bt-metric-value">${formatPercentPoints(result.cagr_net_pct, 2)}</div></div>
-      <div class="bt-metric"><div class="bt-metric-label">Max drawdown (net)</div><div class="bt-metric-value">${formatPercentPoints(result.max_drawdown_net_pct, 2)}</div></div>
-    </div>
-    ${findings ? `<div class="bt-findings">${escapeHtml(findings)}</div>` : ""}
-  `;
-}
-
-function renderBacktestResultRaw(result, fallbackText) {
-  const pre = document.getElementById("btResult");
-  const details = document.getElementById("btResultRawDetails");
-  if (!pre) return;
-  if (result && typeof result === "object") {
-    pre.textContent = prettyJson(result);
-    if (details) details.open = getDisplayMode() === "pro";
-  } else {
-    pre.textContent = fallbackText || "No run yet.";
-    if (details) details.open = false;
-  }
-}
-
-function backtestSpecSummaryLine(spec) {
-  if (!spec || typeof spec !== "object") return "";
-  const mode = spec.universe_mode === "tickers" ? "custom tickers" : "watchlist";
-  const dr = spec.start_date && spec.end_date ? `${safeText(spec.start_date)} → ${safeText(spec.end_date)}` : "";
-  const n = Array.isArray(spec.tickers) ? spec.tickers.length : 0;
-  const tickPart = spec.universe_mode === "tickers" && n ? ` · ${n} names` : "";
-  return `${mode}${tickPart}${dr ? ` · ${dr}` : ""}`;
-}
-
-function strategyChatPayloadMessages() {
-  return (Array.isArray(state.strategyChatMessages) ? state.strategyChatMessages : [])
-    .filter((m) => m && (m.role === "user" || m.role === "assistant"))
-    .map((m) => ({ role: m.role, content: String(m.content ?? "") }));
-}
-
-function scrollStrategyChatToEnd() {
-  const el = document.getElementById("scMessages");
-  if (el) el.scrollTop = el.scrollHeight;
-}
-
-function renderStrategyChatMessages() {
-  const el = document.getElementById("scMessages");
-  const chips = document.getElementById("scEmptyChips");
-  if (!el) return;
-  const msgs = Array.isArray(state.strategyChatMessages) ? state.strategyChatMessages : [];
-  el.innerHTML = "";
-  if (!msgs.length) {
-    const hint = document.createElement("div");
-    hint.className = "chat-empty-hint";
-    hint.textContent = "Describe the universe, date range, and any rule tweaks. Examples below.";
-    el.appendChild(hint);
-    if (chips) chips.classList.remove("hidden");
-    return;
-  }
-  if (chips) chips.classList.add("hidden");
-  msgs.forEach((m) => {
-    const wrap = document.createElement("div");
-    const role = m.role === "user" ? "user" : "assistant";
-    wrap.className = `chat-bubble chat-bubble-${role}`;
-    const roleEl = document.createElement("div");
-    roleEl.className = "chat-bubble-role";
-    roleEl.textContent = role === "user" ? "You" : "Assistant";
-    wrap.appendChild(roleEl);
-    const body = document.createElement("div");
-    body.textContent = m.content != null ? String(m.content) : "";
-    wrap.appendChild(body);
-    if (role === "assistant" && Array.isArray(m.toolResults) && m.toolResults.length) {
-      const det = document.createElement("details");
-      det.className = "chat-tool-details";
-      const sum = document.createElement("summary");
-      sum.textContent = "Tool calls & raw results";
-      det.appendChild(sum);
-      const pre = document.createElement("pre");
-      pre.className = "code-block";
-      pre.textContent = prettyJson(m.toolResults);
-      det.appendChild(pre);
-      wrap.appendChild(det);
-    }
-    el.appendChild(wrap);
-  });
-  scrollStrategyChatToEnd();
-}
-
-function hideScQueueCallout() {
-  const c = document.getElementById("scQueueCallout");
-  if (c) {
-    c.classList.add("hidden");
-    c.innerHTML = "";
-  }
-}
-
-function showScQueueCallout(taskId, runId) {
-  const c = document.getElementById("scQueueCallout");
-  if (!c || !taskId) return;
-  const tid = safeText(taskId);
-  const rid = runId ? safeText(runId) : "";
-  c.classList.remove("hidden");
-  c.innerHTML = `
-    <strong>Backtest queued.</strong> It runs in the background (often a few minutes). Results appear in <strong>Recent runs</strong> below when finished.
-    <div class="callout-actions">
-      <code id="scTaskIdCopy">${tid}</code>
-      <button type="button" class="btn small secondary" id="scCopyTaskBtn">Copy task id</button>
-      <button type="button" class="btn small secondary" id="scSwitchFormTabBtn">Open form tab</button>
-    </div>
-    ${rid ? `<div class="muted" style="margin-top:8px;font-size:0.82rem">Run id: ${rid.slice(0, 12)}…</div>` : ""}
-  `;
-  document.getElementById("scCopyTaskBtn")?.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(tid);
-      logEvent({ kind: "system", severity: "info", message: "Task id copied." });
-    } catch {
-      logEvent({ kind: "system", severity: "warn", message: "Could not copy task id." });
-    }
-  });
-  document.getElementById("scSwitchFormTabBtn")?.addEventListener("click", () => switchBacktestHubTab("form"));
-}
-
-function switchBacktestHubTab(which) {
-  const formTab = document.getElementById("btHubTabForm");
-  const chatTab = document.getElementById("btHubTabChat");
-  const formPanel = document.getElementById("btHubPanelForm");
-  const chatPanel = document.getElementById("strategyChatPanel");
-  const isForm = which === "form";
-  if (formTab && chatTab) {
-    formTab.classList.toggle("tab-btn-active", isForm);
-    chatTab.classList.toggle("tab-btn-active", !isForm);
-    formTab.setAttribute("aria-selected", isForm ? "true" : "false");
-    chatTab.setAttribute("aria-selected", isForm ? "false" : "true");
-  }
-  if (formPanel) formPanel.classList.toggle("hidden", !isForm);
-  if (chatPanel) chatPanel.classList.toggle("hidden", isForm);
-  if (!isForm) scrollStrategyChatToEnd();
-}
-
-async function refreshBacktestRuns() {
-  const list = document.getElementById("btRunList");
-  const out = await api.get("/api/backtest-runs?limit=15");
-  if (!list) return;
-  if (!out.ok) {
-    list.innerHTML = `<li class="muted">List failed: ${safeText(out.error)}</li>`;
-    return;
-  }
-  const rows = Array.isArray(out.data) ? out.data : [];
-  if (!rows.length) {
-    list.innerHTML = `<li class="muted">No backtests yet.</li>`;
-    return;
-  }
-  list.innerHTML = rows
-    .map((r) => {
-      const tid = r.celery_task_id ? `${safeText(r.celery_task_id).slice(0, 12)}…` : "—";
-      const specLine = backtestSpecSummaryLine(r.spec);
-      const sum = r.result_summary && typeof r.result_summary === "object" ? r.result_summary : null;
-      let metrics = "";
-      if (sum) {
-        metrics = `<div class="bt-run-metrics">
-          Trades ${safeText(sum.total_trades)} · Win ${formatPercentPoints(sum.win_rate_net, 1)} ·
-          Return ${formatPercentPoints(sum.total_return_net_pct, 2)} · CAGR ${formatPercentPoints(sum.cagr_net_pct, 2)} ·
-          Max DD ${formatPercentPoints(sum.max_drawdown_net_pct, 2)}
-        </div>`;
-        if (sum.findings_preview) {
-          metrics += `<div class="muted" style="margin-top:4px;font-size:0.78rem">${escapeHtml(sum.findings_preview)}</div>`;
-        }
-      } else if (r.error_message) {
-        metrics = `<div class="bt-run-metrics muted">${safeText(r.error_message)}</div>`;
-      }
-      return `<li class="bt-run-item"><strong>${safeText(r.status)}</strong> · task ${tid} · ${safeText(r.created_at)}
-        <div class="bt-run-spec">${safeText(specLine)}</div>${metrics}</li>`;
-    })
-    .join("");
-}
-
-async function pollBacktestTask(taskId) {
-  const t0 = Date.now();
-  const pre = document.getElementById("btResult");
-  setJobProgress("btJobProgress", "btJobProgressLabel", 0.08, "Queued…");
-  for (let i = 0; i < 120; i++) {
-    const elapsed = Math.floor((Date.now() - t0) / 1000);
-    setBtMetaMessage(`Running… ${elapsed}s · waiting for worker`, { sticky: true });
-    const st = await api.get(`/api/backtest-runs/tasks/${encodeURIComponent(taskId)}`, { timeoutMs: 120000 });
-    if (!st.ok) {
-      setBtMetaMessage(`Status poll failed: ${st.error}`, { sticky: true });
-      return;
-    }
-    const d = st.data || {};
-    const celery = safeText(d.celery_status || "").toLowerCase();
-    setBtMetaMessage(`Running… ${elapsed}s · status: ${celery} · saved: ${safeText(d.db_status || "—")}`, { sticky: true });
-    const progFrac =
-      celery === "pending" || celery === "received"
-        ? 0.15
-        : celery === "started" || celery === "retry"
-          ? 0.5 + Math.min(0.45, (i / 120) * 0.45)
-          : 0.2;
-    setJobProgress("btJobProgress", "btJobProgressLabel", progFrac, `${celery} · ${elapsed}s`);
-    if (celery === "success" && d.result && pre) {
-      renderBacktestResultSummary(d.result);
-      renderBacktestResultRaw(d.result, "");
-      setBtMetaMessage("Complete. Summary above; full JSON below.", { sticky: true });
-      setJobProgress("btJobProgress", "btJobProgressLabel", 1, "Complete");
-      await refreshBacktestRuns();
-      return;
-    }
-    if (celery === "failure" || celery === "revoked") {
-      renderBacktestResultSummary(null);
-      renderBacktestResultRaw(null, prettyJson(d.task_result || d));
-      setBtMetaMessage("Run finished with an error.", { sticky: true });
-      setJobProgress("btJobProgress", "btJobProgressLabel", 0, "");
-      await refreshBacktestRuns();
-      return;
-    }
-    if (d.db_status === "failed" && d.error_message) {
-      renderBacktestResultSummary(null);
-      if (pre) pre.textContent = safeText(d.error_message);
-      setBtMetaMessage(safeText(d.error_message), { sticky: true });
-      setJobProgress("btJobProgress", "btJobProgressLabel", 0, "");
-      await refreshBacktestRuns();
-      return;
-    }
-    await new Promise((r) => setTimeout(r, 3000));
-  }
-  setBtMetaMessage("Still running; use Refresh list or check back later.", { sticky: true });
-  setJobProgress("btJobProgress", "btJobProgressLabel", 0.9, "Still running…");
-}
-
-async function queueUserBacktest() {
-  if (state.backtestQueueBusy) return;
-  const pre = document.getElementById("btResult");
-  const start = document.getElementById("btStart")?.value;
-  const end = document.getElementById("btEnd")?.value;
-  if (!start || !end) {
-    setBtMetaMessage("Choose start and end dates.");
-    return;
-  }
-  const spec = collectBacktestSpecFromForm();
-  if (spec.universe_mode === "tickers" && (!spec.tickers || !spec.tickers.length)) {
-    setBtMetaMessage("Add at least one ticker, or switch universe to saved watchlist.");
-    return;
-  }
-  setBacktestQueueUiBusy(true);
-  setBtMetaMessage("Queueing…", { sticky: true });
-  try {
-    const out = await api.post("/api/backtest-runs", { spec }, { timeoutMs: 120000 });
-    if (!out.ok) {
-      setBtMetaMessage(safeText(out.error), { sticky: true });
-      logEvent({ kind: "system", severity: "error", message: `Backtest queue failed: ${out.error}` });
-      return;
-    }
-    const taskId = out.data?.task_id;
-    setBtMetaMessage(taskId ? `Queued. Tracking task ${safeText(taskId).slice(0, 14)}…` : "Queued.", { sticky: true });
-    logEvent({ kind: "system", severity: "info", message: "Backtest queued." });
-    if (taskId) await pollBacktestTask(taskId);
-    else await refreshBacktestRuns();
-  } finally {
-    setBacktestQueueUiBusy(false);
-  }
-}
-
-async function sendStrategyChat() {
-  if (state.strategyChatBusy) return;
-  const input = document.getElementById("scInput");
-  const text = input?.value?.trim() || "";
-  if (!text) return;
-  if (!Array.isArray(state.strategyChatMessages)) state.strategyChatMessages = [];
-  hideScQueueCallout();
-  state.strategyChatMessages.push({ role: "user", content: text });
-  input.value = "";
-  renderStrategyChatMessages();
-  state.strategyChatBusy = true;
-  const sendBtn = document.getElementById("scSendBtn");
-  if (sendBtn) sendBtn.disabled = true;
-  try {
-    const out = await api.post("/api/strategy-chat", { messages: strategyChatPayloadMessages() }, { timeoutMs: 180000 });
-    if (!out.ok) {
-      logEvent({ kind: "system", severity: "error", message: `Strategy chat: ${out.error}` });
-      state.strategyChatMessages.push({ role: "assistant", content: `Error: ${out.error}` });
-      renderStrategyChatMessages();
-      return;
-    }
-    const assistant = out.data?.message || "";
-    const tools = out.data?.tool_results;
-    state.strategyChatMessages.push({
-      role: "assistant",
-      content: assistant || "(empty reply)",
-      toolResults: Array.isArray(tools) && tools.length ? tools : null,
-    });
-    if (Array.isArray(tools)) {
-      for (const t of tools) {
-        if (t && t.tool === "queue_backtest" && t.result && t.result.task_id) {
-          showScQueueCallout(t.result.task_id, t.result.run_id);
-          break;
-        }
-      }
-    }
-    renderStrategyChatMessages();
-    await refreshBacktestRuns();
-  } finally {
-    state.strategyChatBusy = false;
-    if (sendBtn) sendBtn.disabled = false;
-  }
-}
-
-async function refreshPortfolio() {
-  const out = await api.get("/api/portfolio");
-  const body = document.getElementById("portfolioBody");
-  const meta = document.getElementById("portfolioMeta");
-  body.innerHTML = "";
-  if (!out.ok) {
-    meta.textContent = "Portfolio unavailable.";
-    body.innerHTML = `<tr><td colspan="5" class="muted">${safeText(out.error)}</td></tr>`;
-    logEvent({ kind: "system", severity: "warn", message: `Portfolio load failed: ${out.error}` });
-    return;
-  }
-  const data = out.data;
-  meta.textContent = `${data.positions_count} position(s) • ${formatMoney(data.total_market_value)}`;
-  if (!data.positions.length) {
-    body.innerHTML = `
-      <tr>
-        <td colspan="5" class="muted">
-          <div class="empty-state-cell">
-            <svg class="empty-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <path d="M12 3v18M3 12h18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-              <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.5"/>
-            </svg>
-            <div>No open positions yet.</div>
-            <button id="portfolioEmptyCtaBtn" class="btn small secondary" type="button">Run Scan to Begin</button>
-          </div>
-        </td>
-      </tr>
-    `;
-    const cta = document.getElementById("portfolioEmptyCtaBtn");
-    if (cta) cta.addEventListener("click", runScan);
-    return;
-  }
-  data.positions.slice(0, 25).forEach((p) => {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${safeText(p.symbol)}</td>
-      <td>${safeText(p.qty)}</td>
-      <td>${formatMoney(p.last)}</td>
-      <td>${formatMoney(p.market_value)}</td>
-      <td>${safeNum(p.pl_pct) >= 0 ? "+" : ""}${safeText(p.pl_pct)}%</td>
-    `;
-    body.appendChild(tr);
-  });
-}
-
-async function loadPortfolioRisk() {
-  const panel = document.getElementById("portfolioRiskContent");
-  if (!panel) return;
-  panel.innerHTML = `<div class="muted">Loading risk analytics...</div>`;
-  const out = await api.get("/api/portfolio/risk");
-  if (!out.ok) {
-    panel.innerHTML = `<div class="muted">Risk analytics unavailable: ${safeText(out.error)}</div>`;
-    return;
-  }
-  const d = out.data;
-  if (!d.position_count) {
-    panel.innerHTML = `<div class="muted">No positions to analyze.</div>`;
-    return;
-  }
-
-  const conc = d.concentration || {};
-  const concColor = conc.hhi > 2500 ? "var(--bad)" : conc.hhi > 1500 ? "var(--warn)" : "var(--good)";
-  const dayColor = d.day_pl_total >= 0 ? "var(--good)" : "var(--bad)";
-
-  let html = `
-    <div class="risk-kpi-row">
-      <div class="risk-kpi">
-        <div class="risk-kpi-value">${formatMoney(d.total_value)}</div>
-        <div class="risk-kpi-label">Total Value</div>
-      </div>
-      <div class="risk-kpi">
-        <div class="risk-kpi-value" style="color:${dayColor}">${d.day_pl_total >= 0 ? "+" : ""}${formatMoney(d.day_pl_total)}</div>
-        <div class="risk-kpi-label">Day P/L</div>
-      </div>
-      <div class="risk-kpi">
-        <div class="risk-kpi-value" style="color:${concColor}">${safeText(conc.hhi_label || "N/A")}</div>
-        <div class="risk-kpi-label">Concentration (HHI ${safeText(conc.hhi)})</div>
-      </div>
-      <div class="risk-kpi">
-        <div class="risk-kpi-value">${safeText(conc.top_position_pct)}%</div>
-        <div class="risk-kpi-label">Largest Position</div>
-      </div>
-      <div class="risk-kpi">
-        <div class="risk-kpi-value">${safeText(conc.top_5_pct)}%</div>
-        <div class="risk-kpi-label">Top 5 Weight</div>
-      </div>
-      <div class="risk-kpi">
-        <div class="risk-kpi-value">${safeText(conc.sector_count)}</div>
-        <div class="risk-kpi-label">Sectors</div>
-      </div>
-    </div>`;
-
-  if (d.sector_allocation && d.sector_allocation.length) {
-    const maxSector = Math.max(1, ...d.sector_allocation.map((s) => s.weight_pct));
-    html += `<div class="risk-section-title">Sector Allocation</div><div class="risk-sector-bars">`;
-    d.sector_allocation.forEach((s) => {
-      const barW = Math.max(2, Math.round((s.weight_pct / maxSector) * 100));
-      html += `
-        <div class="risk-sector-row">
-          <span class="risk-sector-name">${safeText(s.sector)}</span>
-          <div class="risk-sector-bar-track">
-            <div class="risk-sector-bar-fill" style="width:${barW}%"></div>
-          </div>
-          <span class="risk-sector-pct mono-nums">${safeText(s.weight_pct)}%</span>
-          <span class="risk-sector-val muted mono-nums">${formatMoney(s.value)}</span>
-        </div>`;
-    });
-    html += `</div>`;
-  }
-
-  if (d.positions_weighted && d.positions_weighted.length) {
-    const maxW = Math.max(1, ...d.positions_weighted.map((p) => p.weight_pct));
-    html += `<div class="risk-section-title">Position Weights</div><div class="risk-weight-grid">`;
-    d.positions_weighted.slice(0, 15).forEach((p) => {
-      const barW = Math.max(2, Math.round((p.weight_pct / maxW) * 100));
-      const plColor = p.pl_pct >= 0 ? "var(--good)" : "var(--bad)";
-      html += `
-        <div class="risk-weight-row">
-          <span class="risk-weight-sym">${safeText(p.symbol)}</span>
-          <div class="risk-sector-bar-track">
-            <div class="risk-weight-bar-fill" style="width:${barW}%"></div>
-          </div>
-          <span class="risk-sector-pct mono-nums">${safeText(p.weight_pct)}%</span>
-          <span class="mono-nums" style="color:${plColor};min-width:52px;text-align:right">${p.pl_pct >= 0 ? "+" : ""}${safeText(p.pl_pct)}%</span>
-        </div>`;
-    });
-    html += `</div>`;
-  }
-
-  if (d.day_pl_breakdown && d.day_pl_breakdown.length) {
-    html += `<div class="risk-section-title">Day P/L Movers</div><div class="risk-pl-list">`;
-    d.day_pl_breakdown.slice(0, 8).forEach((p) => {
-      const color = p.day_pl >= 0 ? "var(--good)" : "var(--bad)";
-      html += `
-        <div class="risk-pl-row">
-          <span class="risk-weight-sym">${safeText(p.symbol)}</span>
-          <span class="mono-nums" style="color:${color}">${p.day_pl >= 0 ? "+" : ""}${formatMoney(p.day_pl)}</span>
-        </div>`;
-    });
-    html += `</div>`;
-  }
-
-  panel.innerHTML = html;
-}
-
-async function refreshSectors() {
-  const out = await api.get("/api/sectors");
-  const grid = document.getElementById("sectorGrid");
-  grid.innerHTML = "";
-  if (!out.ok) {
-    grid.innerHTML = `<div class="muted">Sectors unavailable: ${safeText(out.error)}</div>`;
-    logEvent({ kind: "system", severity: "warn", message: `Sector load failed: ${out.error}` });
-    return;
-  }
-  const rows = out.data.rows || [];
-  if (!rows.length) {
-    grid.innerHTML = `<div class="muted">No sector data.</div>`;
-    return;
-  }
-  const maxAbsVs = Math.max(1, ...rows.map((r) => Math.abs(safeNum(r.vs_spy, 0))));
-  rows.forEach((row) => {
-    const card = document.createElement("div");
-    card.className = `sector-card ${row.winning ? "win" : "loss"}`;
-    const vs = safeNum(row.vs_spy, 0);
-    const barPct = Math.round((Math.abs(vs) / maxAbsVs) * 100);
-    card.innerHTML = `
-      <div class="${row.winning ? "sector-winning" : "sector-lagging"}"><strong>${safeText(row.etf)}</strong> ${safeText(row.name || "")}</div>
-      <div class="${row.winning ? "sector-winning" : "sector-lagging"} mono-nums">${safeNum(row.return_pct).toFixed(2)}% vs SPY ${vs.toFixed(2)}%</div>
-      <div class="sector-bar-track" aria-hidden="true" title="Relative strength vs SPY (within this grid)">
-        <div class="sector-bar-fill ${row.winning ? "sector-bar-fill--win" : "sector-bar-fill--loss"}" style="width:${barPct}%"></div>
-      </div>
-      <div class="${row.winning ? "pill good" : "pill bad"}">${row.winning ? "Winning" : "Lagging"}</div>
-    `;
-    grid.appendChild(card);
-  });
-}
-
-function renderQuickCheckCard(data, error) {
-  const ph = document.getElementById("checkPlaceholder");
-  const sum = document.getElementById("checkSummary");
-  const det = document.getElementById("checkJsonDetails");
-  const pre = document.getElementById("checkOutput");
-  if (!sum) return;
-  if (error) {
-    if (ph) { ph.textContent = error; ph.classList.remove("hidden"); }
-    sum.classList.add("hidden"); sum.innerHTML = "";
-    if (det) det.classList.add("hidden");
-    if (pre) pre.textContent = "";
-    return;
-  }
-  if (ph) ph.classList.add("hidden");
-  const d = data || {};
-
-  const title = d.title || d.ticker || "Quick Check";
-  const desc = (d.description || "").replace(/\*\*/g, "");
-  const fields = d.fields || [];
-
-  let fieldsHtml = "";
-  if (fields.length) {
-    fieldsHtml = '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; margin-top: 10px;">';
-    for (const f of fields) {
-      const val = (f.value || "").replace(/\*\*/g, "").replace(/\n/g, "<br>");
-      fieldsHtml += `<div class="preset-subsection" style="padding: 10px;">
-        <h3 style="margin: 0 0 6px; font-size: 0.82rem;">${safeText(f.name)}</h3>
-        <div style="font-size: 0.84rem; color: #dbe6ff; line-height: 1.5;">${val}</div>
-      </div>`;
-    }
-    fieldsHtml += "</div>";
-  } else {
-    const items = [];
-    const price = d.price ?? d.current_price ?? d.last_price;
-    const stage2 = d.stage_2 ?? d.is_stage_2;
-    const vcp = d.vcp ?? d.vcp_detected;
-    const score = d.signal_score ?? d.score;
-    const sector = d.sector ?? d.sector_etf;
-    if (price != null) items.push(`<li><strong>Price:</strong> $${Number(price).toFixed(2)}</li>`);
-    if (stage2 != null) items.push(`<li><strong>Stage 2:</strong> <span class="pill ${stage2 ? 'good' : 'bad'} small">${stage2 ? 'Yes' : 'No'}</span></li>`);
-    if (vcp != null) items.push(`<li><strong>VCP:</strong> <span class="pill ${vcp ? 'good' : 'bad'} small">${vcp ? 'Detected' : 'None'}</span></li>`);
-    if (score != null) items.push(`<li><strong>Signal Score:</strong> ${Number(score).toFixed(1)}/100</li>`);
-    if (sector) items.push(`<li><strong>Sector:</strong> ${safeText(sector)}</li>`);
-    Object.entries(d).forEach(([k, v]) => {
-      if (v != null && typeof v !== "object" && !["title", "description", "color", "timestamp", "ticker"].includes(k)) {
-        items.push(`<li><strong>${safeText(k)}:</strong> ${safeText(String(v))}</li>`);
-      }
-    });
-    if (items.length) fieldsHtml = `<ul class="tool-summary-list">${items.join("")}</ul>`;
-  }
-
-  sum.classList.remove("hidden");
-  sum.innerHTML = `
-    <h4 class="tool-summary-title">${safeText(title)}</h4>
-    ${desc ? `<p class="tool-summary-p" style="margin-bottom: 4px;">${safeText(desc)}</p>` : ""}
-    ${fieldsHtml}
-  `;
-  if (det) det.classList.remove("hidden");
-  if (pre) pre.textContent = prettyJson(data);
-}
-
-async function quickCheck() {
-  const ticker = document.getElementById("tickerInput").value.trim().toUpperCase();
-  if (!ticker) return;
-  renderQuickCheckCard(null, "Loading...");
-  const out = await api.get(`/api/check/${ticker}`);
-  if (!out.ok) {
-    renderQuickCheckCard(null, `Check failed: ${out.error}`);
-    logEvent({ kind: "system", severity: "error", message: `Check ${ticker} failed: ${out.error}` });
-    return;
-  }
-  renderQuickCheckCard(out.data, null);
-  renderTickerChart(ticker);
-  logEvent({ kind: "system", severity: "info", message: `Check complete for ${ticker}.` });
-}
-
-async function runReport() {
-  const ticker = document.getElementById("reportTickerInput").value.trim().toUpperCase();
-  if (!ticker) return;
-  const section = document.getElementById("reportSection").value.trim();
-  const skipMirofish = document.getElementById("skipMirofish").checked;
-  const skipEdgar = document.getElementById("skipEdgar").checked;
-  const btn = document.getElementById("reportBtn");
-  const output = document.getElementById("reportOutput");
-  const visual = document.getElementById("reportVisual");
-
-  btn.disabled = true;
-  btn.textContent = "Running...";
-  output.textContent = "Generating report...";
-  visual.innerHTML = `<div class="report-empty">Generating visual report...</div>`;
-  updateActionCenter({ title: "Report Running", message: `Generating report for ${ticker}...`, severity: "info" });
-
-  try {
-    const qs = new URLSearchParams();
-    if (section) qs.set("section", section);
-    qs.set("skip_mirofish", String(skipMirofish));
-    qs.set("skip_edgar", String(skipEdgar));
-    const out = await api.get(`/api/report/${ticker}?${qs.toString()}`, { timeoutMs: 300000 });
-    if (!out.ok) {
-      output.textContent = out.error || "Report failed.";
-      visual.innerHTML = `<div class="report-empty">${safeText(out.error || "Report failed.")}</div>`;
-      logEvent({ kind: "report", severity: "error", message: `Report ${ticker} failed: ${out.error}` });
-      return;
-    }
-    state.lastReportData = out.data;
-    state.activeReportTab = "summary";
-    output.textContent = JSON.stringify(out.data, null, 2);
-    renderReportTabs(out.data);
-    renderReportVisual(out.data);
-    logEvent({ kind: "report", severity: "info", message: `Report complete for ${ticker}${section ? ` (${section})` : ""}.` });
-    updateActionCenter({ title: "Report Complete", message: `Full report ready for ${ticker}.`, severity: "success" });
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Run Report";
-  }
-}
-
-async function runSecCompare() {
-  const mode = document.getElementById("secCompareMode").value.trim();
-  const tickerA = document.getElementById("secCompareTickerA").value.trim().toUpperCase();
-  const tickerB = document.getElementById("secCompareTickerB").value.trim().toUpperCase();
-  const formType = document.getElementById("secCompareFormType").value.trim().toUpperCase();
-  const highlightChangesOnly = document.getElementById("secCompareChangesOnly")?.checked ? "true" : "false";
-  const btn = document.getElementById("secCompareBtn");
-  const meta = document.getElementById("secCompareMeta");
-
-  if (!tickerA) return;
-  if (mode === "ticker_vs_ticker" && !tickerB) return;
-
-  btn.disabled = true;
-  meta.textContent = "Running SEC compare...";
-  renderSecCompareEmpty("Running SEC compare...");
-  updateActionCenter({ title: "SEC Compare Running", message: "Comparing filing evidence. This can take a moment.", severity: "info" });
-  try {
-    const qs = new URLSearchParams();
-    qs.set("mode", mode);
-    qs.set("ticker", tickerA);
-    qs.set("form_type", formType);
-    qs.set("highlight_changes_only", highlightChangesOnly);
-    if (mode === "ticker_vs_ticker") qs.set("ticker_b", tickerB);
-    const out = await api.get(`/api/sec/compare?${qs.toString()}`, { timeoutMs: 300000 });
-    let payload = out.ok ? out.data : null;
-    if (!out.ok && (out.status === 404 || String(out.error || "").toLowerCase().includes("not found"))) {
-      meta.textContent = "SEC compare endpoint not found; using metadata fallback.";
-      const fallback = await buildFallbackSecCompare(mode, tickerA, tickerB, formType);
-      if (!fallback.ok) {
-        meta.textContent = `SEC compare failed: ${safeText(fallback.error)}`;
-        renderSecCompareEmpty(safeText(fallback.error || "Compare failed."));
-        logEvent({ kind: "report", severity: "error", message: `SEC compare fallback failed: ${fallback.error}` });
-        return;
-      }
-      payload = fallback;
-    } else if (!out.ok) {
-      meta.textContent = `SEC compare failed: ${safeText(out.error)}`;
-      renderSecCompareEmpty(safeText(out.error || "Compare failed."));
-      logEvent({ kind: "report", severity: "error", message: `SEC compare failed: ${out.error}` });
-      return;
-    }
-    state.secCompareResult = payload;
-    meta.textContent = `SEC compare complete (${mode}, ${formType}).`;
-    renderSecCompareVisual(payload);
-    logEvent({ kind: "report", severity: "info", message: `SEC compare complete for ${tickerA}${tickerB ? ` vs ${tickerB}` : ""}.` });
-    updateActionCenter({
-      title: "SEC Compare Complete",
-      message: `Compare finished for ${tickerA}${tickerB ? ` vs ${tickerB}` : ""}.`,
-      severity: "success",
-    });
-  } finally {
-    btn.disabled = false;
-  }
-}
-
 async function refreshAll() {
   resetLazyLoaded();
   setLoading({ portfolio: "Loading portfolio..." });
@@ -4464,37 +1939,15 @@ function wireEvents() {
   document.getElementById("onboardingVerifyBtn")?.addEventListener("click", () => runOnboardingStep("verify_token_health"));
   document.getElementById("onboardingScanBtn")?.addEventListener("click", () => runOnboardingStep("test_scan"));
   document.getElementById("onboardingPaperBtn")?.addEventListener("click", () => runOnboardingStep("test_paper_order"));
-  document.getElementById("onboardingSchwabBtn")?.addEventListener("click", async () => {
-    if (!state.publicConfig?.schwab_oauth) {
-      logEvent({ kind: "system", severity: "warn", message: "Schwab OAuth is not configured on this server." });
-      return;
-    }
-    const out = await api.get("/api/oauth/schwab/authorize-url");
-    if (!out.ok || !out.data?.url) {
-      logEvent({ kind: "system", severity: "error", message: out.error || "Could not start Schwab OAuth." });
-      return;
-    }
-    window.location.href = out.data.url;
+  document.getElementById("onboardingSchwabBtn")?.addEventListener("click", () => triggerSchwabAccountOAuth());
+  document.getElementById("onboardingSchwabMarketBtn")?.addEventListener("click", () => triggerSchwabMarketOAuth());
+  document.getElementById("onboardingSchwabLink")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    void triggerSchwabAccountOAuth();
   });
-  document.getElementById("onboardingSchwabMarketBtn")?.addEventListener("click", async () => {
-    if (!state.publicConfig?.schwab_market_oauth) {
-      logEvent({
-        kind: "system",
-        severity: "warn",
-        message: "Schwab market OAuth is not configured on this server.",
-      });
-      return;
-    }
-    const out = await api.get("/api/oauth/schwab/market/authorize-url");
-    if (!out.ok || !out.data?.url) {
-      logEvent({
-        kind: "system",
-        severity: "error",
-        message: out.error || "Could not start Schwab market OAuth.",
-      });
-      return;
-    }
-    window.location.href = out.data.url;
+  document.getElementById("onboardingSchwabMarketLink")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    void triggerSchwabMarketOAuth();
   });
   document.getElementById("applyProfileBtn").addEventListener("click", applyProfile);
   document.getElementById("enableLiveTradingBtn")?.addEventListener("click", () => void submitEnableLiveTrading());
@@ -4543,9 +1996,7 @@ function wireEvents() {
       if (btn) { btn.disabled = false; btn.textContent = "Run Challenger Scan"; }
     }
   });
-  document.getElementById("closeQuickViewBtn").addEventListener("click", () => {
-    document.getElementById("quickViewPanel").classList.remove("open");
-  });
+  // Close button + Esc + backdrop are wired inside panels/tradeDrawer.js.
   document.getElementById("activityDrawerToggle").addEventListener("click", () => {
     const body = document.getElementById("activityDrawerBody");
     const toggle = document.getElementById("activityDrawerToggle");
@@ -4657,8 +2108,6 @@ function wireEvents() {
   }, { rootMargin: "-35% 0px -55% 0px", threshold: 0.01 });
   sections.forEach((section) => observer.observe(section));
 
-  window.addEventListener("hashchange", handleRouteHash);
-
   document.getElementById("displayModeSelect")?.addEventListener("change", (e) => {
     const v = e.target.value;
     applyDisplayMode(v);
@@ -4670,191 +2119,6 @@ function wireEvents() {
 }
 
 /* ── Scroll-to-top button ─────────────────────── */
-function setupScrollToTop() {
-  const btn = document.getElementById("scrollTopBtn");
-  if (!btn) return;
-  let ticking = false;
-  const toggle = () => {
-    btn.classList.toggle("visible", window.scrollY > 400);
-    ticking = false;
-  };
-  window.addEventListener("scroll", () => {
-    if (!ticking) {
-      requestAnimationFrame(toggle);
-      ticking = true;
-    }
-  }, { passive: true });
-  btn.addEventListener("click", () => {
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  });
-}
-
-/* ── Toast notification system ────────────────── */
-function showToast(message, type = "info", duration = 4000) {
-  const container = document.getElementById("toastContainer");
-  if (!container) return;
-  const toast = document.createElement("div");
-  toast.className = `toast toast-${type}`;
-  toast.innerHTML = `<span class="toast-dot"></span><span>${message}</span>`;
-  container.appendChild(toast);
-  const dismiss = () => {
-    toast.classList.add("exiting");
-    toast.addEventListener("animationend", () => toast.remove(), { once: true });
-  };
-  toast.addEventListener("click", dismiss);
-  if (duration > 0) setTimeout(dismiss, duration);
-}
-
-/* ── Lightweight Charts (price chart for ticker check) ─── */
-let _activeChart = null;
-async function renderTickerChart(ticker) {
-  const container = document.getElementById("tickerChartContainer");
-  if (!container || typeof LightweightCharts === "undefined") return;
-  container.classList.remove("hidden");
-  container.innerHTML = "";
-
-  const out = await api.get(`/api/chart/${encodeURIComponent(ticker)}`);
-  if (!out.ok || !out.data?.candles?.length) {
-    container.innerHTML = `<div class="muted" style="padding:12px">No chart data available for ${safeText(ticker)}.</div>`;
-    return;
-  }
-
-  const chart = LightweightCharts.createChart(container, {
-    width: container.clientWidth,
-    height: 280,
-    layout: { background: { type: "solid", color: "transparent" }, textColor: "#9ca3b8" },
-    grid: { vertLines: { color: "rgba(99,120,200,0.06)" }, horzLines: { color: "rgba(99,120,200,0.06)" } },
-    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-    rightPriceScale: { borderColor: "rgba(99,120,200,0.15)" },
-    timeScale: { borderColor: "rgba(99,120,200,0.15)", timeVisible: false },
-  });
-  const candleSeries = chart.addCandlestickSeries({
-    upColor: "#34d399", downColor: "#fb7185",
-    borderUpColor: "#34d399", borderDownColor: "#fb7185",
-    wickUpColor: "#34d399", wickDownColor: "#fb7185",
-  });
-  candleSeries.setData(out.data.candles);
-
-  const volSeries = chart.addHistogramSeries({
-    priceFormat: { type: "volume" },
-    priceScaleId: "",
-    scaleMargins: { top: 0.85, bottom: 0 },
-  });
-  volSeries.setData(out.data.candles.map((c) => ({
-    time: c.time,
-    value: c.volume,
-    color: c.close >= c.open ? "rgba(52,211,153,0.25)" : "rgba(251,113,133,0.25)",
-  })));
-
-  chart.timeScale().fitContent();
-  _activeChart = chart;
-
-  const ro = new ResizeObserver(() => {
-    if (_activeChart) _activeChart.applyOptions({ width: container.clientWidth });
-  });
-  ro.observe(container);
-}
-
-/* ── Notification Center ─────────────────────── */
-const _notifications = [];
-const NOTIF_STORAGE_KEY = "tradingbot.notifications";
-
-function loadStoredNotifications() {
-  try {
-    const raw = localStorage.getItem(NOTIF_STORAGE_KEY);
-    if (raw) {
-      const arr = JSON.parse(raw);
-      if (Array.isArray(arr)) _notifications.push(...arr.slice(-50));
-    }
-  } catch { /* ignore */ }
-}
-
-function saveNotifications() {
-  try {
-    localStorage.setItem(NOTIF_STORAGE_KEY, JSON.stringify(_notifications.slice(-50)));
-  } catch { /* ignore */ }
-}
-
-function addNotification(message, severity = "info") {
-  _notifications.push({
-    message,
-    severity,
-    time: new Date().toISOString(),
-    read: false,
-  });
-  if (_notifications.length > 100) _notifications.splice(0, _notifications.length - 100);
-  saveNotifications();
-  renderNotifications();
-}
-
-function renderNotifications() {
-  const badge = document.getElementById("notifBadge");
-  const list = document.getElementById("notifList");
-  if (!badge || !list) return;
-
-  const unread = _notifications.filter((n) => !n.read).length;
-  if (unread > 0) {
-    badge.textContent = unread > 99 ? "99+" : String(unread);
-    badge.classList.remove("hidden");
-  } else {
-    badge.classList.add("hidden");
-  }
-
-  if (!_notifications.length) {
-    list.innerHTML = `<li class="muted">No notifications yet.</li>`;
-    return;
-  }
-
-  list.innerHTML = _notifications
-    .slice()
-    .reverse()
-    .slice(0, 30)
-    .map((n) => {
-      const dotClass = n.severity === "error" ? "notif-dot--bad" : n.severity === "success" ? "notif-dot--good" : "notif-dot--info";
-      const timeStr = new Date(n.time).toLocaleTimeString();
-      return `<li class="notif-item${n.read ? "" : " notif-unread"}">
-        <span class="notif-dot ${dotClass}"></span>
-        <span class="notif-msg">${safeText(n.message)}</span>
-        <span class="notif-time muted">${safeText(timeStr)}</span>
-      </li>`;
-    })
-    .join("");
-}
-
-function clearNotifications() {
-  _notifications.length = 0;
-  saveNotifications();
-  renderNotifications();
-  const panel = document.getElementById("notifPanel");
-  if (panel) panel.classList.add("hidden");
-}
-
-function setupNotifications() {
-  loadStoredNotifications();
-  renderNotifications();
-
-  document.getElementById("notifBellBtn")?.addEventListener("click", () => {
-    const panel = document.getElementById("notifPanel");
-    if (!panel) return;
-    panel.classList.toggle("hidden");
-    if (!panel.classList.contains("hidden")) {
-      _notifications.forEach((n) => { n.read = true; });
-      saveNotifications();
-      renderNotifications();
-    }
-  });
-
-  document.getElementById("notifClearBtn")?.addEventListener("click", clearNotifications);
-
-  document.addEventListener("click", (e) => {
-    const panel = document.getElementById("notifPanel");
-    const bell = document.getElementById("notifBellBtn");
-    if (panel && !panel.classList.contains("hidden") && !panel.contains(e.target) && !bell?.contains(e.target)) {
-      panel.classList.add("hidden");
-    }
-  });
-}
-
 /* ── Server-Sent Events ───────────────────────── */
 let _sseSource = null;
 function connectSSE() {
@@ -4913,194 +2177,16 @@ function connectSSE() {
   };
 }
 
-/* ── Command Palette ─────────────────────────── */
-const CMD_PALETTE_ACTIONS = [
-  { id: "scan", label: "Run Scan", shortcut: "S", icon: "search", action: () => document.getElementById("scanBtn")?.click() },
-  { id: "refresh", label: "Refresh All", shortcut: "R", icon: "refresh", action: () => document.getElementById("refreshBtn")?.click() },
-  { id: "ticker", label: "Quick Ticker Check", shortcut: "T", icon: "chart", action: () => { document.getElementById("tickerInput")?.focus(); document.getElementById("quickCheckSection")?.scrollIntoView({ behavior: "smooth" }); } },
-  { id: "pending", label: "Go to Pending Trades", icon: "list", action: () => document.getElementById("pendingSection")?.scrollIntoView({ behavior: "smooth" }) },
-  { id: "portfolio", label: "Go to Portfolio", icon: "wallet", action: () => { runLazyApi("portfolio"); document.getElementById("portfolioSection")?.scrollIntoView({ behavior: "smooth" }); } },
-  { id: "sectors", label: "Go to Sectors", icon: "grid", action: () => { runLazyApi("sectors"); document.getElementById("sectorsSection")?.scrollIntoView({ behavior: "smooth" }); } },
-  { id: "backtest", label: "Go to Backtests", icon: "clock", action: () => { runLazyApi("backtest"); document.getElementById("backtestSection")?.scrollIntoView({ behavior: "smooth" }); } },
-  { id: "performance", label: "Go to Performance", icon: "trending", action: () => { runLazyApi("performance"); document.getElementById("performanceSection")?.scrollIntoView({ behavior: "smooth" }); } },
-  { id: "onboarding", label: "Go to Setup / Onboarding", icon: "settings", action: () => { runLazyApi("onboarding"); document.getElementById("onboardingSection")?.scrollIntoView({ behavior: "smooth" }); } },
-  { id: "calibration", label: "Go to Calibration", icon: "tune", action: () => { runLazyApi("calibration"); document.getElementById("calibrationSection")?.scrollIntoView({ behavior: "smooth" }); } },
-  { id: "sec", label: "SEC Filing Compare", icon: "file", action: () => document.getElementById("secCompareSection")?.scrollIntoView({ behavior: "smooth" }) },
-  { id: "report", label: "Full Report", icon: "doc", action: () => document.getElementById("fullReportSection")?.scrollIntoView({ behavior: "smooth" }) },
-  { id: "decision", label: "Decision Card", icon: "card", action: () => document.getElementById("decisionSection")?.scrollIntoView({ behavior: "smooth" }) },
-  { id: "profiles", label: "Strategy Presets", icon: "sliders", action: () => { runLazyApi("profiles"); document.getElementById("presetsSection")?.scrollIntoView({ behavior: "smooth" }); } },
-  { id: "simple-view", label: "Switch to Simple view", icon: "eye", action: () => { applyDisplayMode("simple"); document.getElementById("displayModeSelect").value = "simple"; } },
-  { id: "standard-view", label: "Switch to Standard view", icon: "eye", action: () => { applyDisplayMode("standard"); document.getElementById("displayModeSelect").value = "standard"; } },
-  { id: "pro-view", label: "Switch to Pro view", icon: "eye", action: () => { applyDisplayMode("pro"); document.getElementById("displayModeSelect").value = "pro"; } },
-  { id: "simple-page", label: "Open Simple Scan Page", icon: "external", action: () => { window.location.href = "/simple"; } },
-  { id: "login", label: "Open Sign In Page", icon: "key", action: () => { window.location.href = "/login"; } },
-  { id: "top", label: "Scroll to Top", icon: "arrow-up", action: () => window.scrollTo({ top: 0, behavior: "smooth" }) },
-];
-
-function openCommandPalette() {
-  let dialog = document.getElementById("cmdPaletteDialog");
-  if (!dialog) return;
-  dialog.classList.add("open");
-  const input = document.getElementById("cmdPaletteInput");
-  if (input) { input.value = ""; input.focus(); }
-  renderCommandResults("");
-}
-
-function closeCommandPalette() {
-  const dialog = document.getElementById("cmdPaletteDialog");
-  if (dialog) dialog.classList.remove("open");
-}
-
-function renderCommandResults(query) {
-  const list = document.getElementById("cmdPaletteList");
-  if (!list) return;
-  const q = query.trim().toLowerCase();
-  const filtered = q
-    ? CMD_PALETTE_ACTIONS.filter((a) => a.label.toLowerCase().includes(q) || a.id.includes(q))
-    : CMD_PALETTE_ACTIONS;
-  list.innerHTML = filtered
-    .map(
-      (a, i) =>
-        `<button class="cmd-palette-item${i === 0 ? " selected" : ""}" data-idx="${i}" type="button">
-          <span class="cmd-palette-label">${safeText(a.label)}</span>
-          ${a.shortcut ? `<kbd class="cmd-palette-kbd">${safeText(a.shortcut)}</kbd>` : ""}
-        </button>`
-    )
-    .join("");
-  list.querySelectorAll(".cmd-palette-item").forEach((btn, idx) => {
-    btn.addEventListener("click", () => {
-      closeCommandPalette();
-      filtered[idx]?.action();
-    });
-    btn.addEventListener("mouseenter", () => {
-      list.querySelectorAll(".cmd-palette-item").forEach((b) => b.classList.remove("selected"));
-      btn.classList.add("selected");
-    });
-  });
-}
-
-function setupCommandPalette() {
-  const input = document.getElementById("cmdPaletteInput");
-  if (!input) return;
-  input.addEventListener("input", () => renderCommandResults(input.value));
-  input.addEventListener("keydown", (e) => {
-    const list = document.getElementById("cmdPaletteList");
-    const items = list ? Array.from(list.querySelectorAll(".cmd-palette-item")) : [];
-    const cur = items.findIndex((b) => b.classList.contains("selected"));
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      const next = Math.min(cur + 1, items.length - 1);
-      items.forEach((b) => b.classList.remove("selected"));
-      items[next]?.classList.add("selected");
-      items[next]?.scrollIntoView({ block: "nearest" });
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      const prev = Math.max(cur - 1, 0);
-      items.forEach((b) => b.classList.remove("selected"));
-      items[prev]?.classList.add("selected");
-      items[prev]?.scrollIntoView({ block: "nearest" });
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      const sel = items[cur >= 0 ? cur : 0];
-      if (sel) sel.click();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      closeCommandPalette();
-    }
-  });
-  document.getElementById("cmdPaletteDialog")?.addEventListener("click", (e) => {
-    if (e.target.id === "cmdPaletteDialog") closeCommandPalette();
-  });
-}
-
-/* ── Keyboard shortcuts ───────────────────────── */
-function setupKeyboardShortcuts() {
-  document.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "k") {
-      e.preventDefault();
-      const dialog = document.getElementById("cmdPaletteDialog");
-      if (dialog?.classList.contains("open")) closeCommandPalette();
-      else openCommandPalette();
-      return;
-    }
-
-    if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
-
-    switch (e.key) {
-      case "r":
-      case "R":
-        e.preventDefault();
-        document.getElementById("refreshBtn")?.click();
-        showToast("Refreshing all data...", "info", 2000);
-        break;
-      case "s":
-      case "S":
-        e.preventDefault();
-        document.getElementById("scanBtn")?.click();
-        break;
-      case "t":
-      case "T":
-        e.preventDefault();
-        document.getElementById("tickerInput")?.focus();
-        document.getElementById("quickCheckSection")?.scrollIntoView({ behavior: "smooth" });
-        break;
-      case "?":
-        e.preventDefault();
-        showToast("Shortcuts: Ctrl+K = Command palette, R = Refresh, S = Scan, T = Ticker, 1-3 = View", "info", 5000);
-        break;
-      case "1":
-        e.preventDefault();
-        applyDisplayMode("simple");
-        document.getElementById("displayModeSelect").value = "simple";
-        showToast("Switched to Simple view", "info", 2000);
-        break;
-      case "2":
-        e.preventDefault();
-        applyDisplayMode("standard");
-        document.getElementById("displayModeSelect").value = "standard";
-        showToast("Switched to Standard view", "info", 2000);
-        break;
-      case "3":
-        e.preventDefault();
-        applyDisplayMode("pro");
-        document.getElementById("displayModeSelect").value = "pro";
-        showToast("Switched to Pro view", "info", 2000);
-        break;
-    }
-  });
-}
-
-/* ── Activity drawer badge counter ────────────── */
-function updateActivityBadge() {
-  const toggle = document.getElementById("activityDrawerToggle");
-  const list = document.getElementById("logList");
-  if (!toggle || !list) return;
-  const count = list.children.length;
-  let badge = toggle.querySelector(".activity-badge");
-  if (count > 0) {
-    if (!badge) {
-      badge = document.createElement("span");
-      badge.className = "activity-badge";
-      toggle.appendChild(badge);
-    }
-    badge.textContent = count > 99 ? "99+" : String(count);
-  } else if (badge) {
-    badge.remove();
-  }
-}
-
-const _origLogEvent = logEvent;
-logEvent = function (opts) {
-  _origLogEvent(opts);
-  updateActivityBadge();
-};
-
 (async () => {
   wireEvents();
   setupScrollToTop();
-  setupKeyboardShortcuts();
-  setupCommandPalette();
+  setupCommandPalette({ runLazyApi, applyDisplayMode, openTradeDrawer });
+  setupKeyboardShortcuts({
+    openCommandPalette,
+    closeCommandPalette,
+    showToast,
+    applyDisplayMode,
+  });
   setupNotifications();
   applyDisplayMode(getDisplayMode());
   applyReportViewMode();
@@ -5124,8 +2210,7 @@ logEvent = function (opts) {
     await refreshAll();
     setupLazySectionLoading();
   }
-  applyQuerySectionDeepLink();
-  handleRouteHash();
+  installRouter();
   updateActivityBadge();
   logEvent({ kind: "system", severity: "info", message: "Dashboard loaded." });
 })();

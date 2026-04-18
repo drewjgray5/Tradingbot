@@ -9,8 +9,13 @@ import pytest
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+from starlette.requests import Request
 
-from webapp.security import decode_supabase_jwt
+from webapp.db import Base
+from webapp.models import User
+from webapp.security import _jwt_secrets_for_decode, decode_supabase_jwt, get_current_user
 
 
 def test_decode_uses_primary_secret(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -25,6 +30,12 @@ def test_decode_falls_back_to_legacy_secret(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("SUPABASE_JWT_SECRET_LEGACY", "old_secret")
     token = jwt.encode({"sub": "u_legacy"}, "old_secret", algorithm="HS256")
     assert decode_supabase_jwt(token)["sub"] == "u_legacy"
+
+
+def test_jwt_secret_decode_order_keeps_primary_then_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", "new_secret")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET_LEGACY", "old_secret")
+    assert _jwt_secrets_for_decode() == ["new_secret", "old_secret"]
 
 
 def test_decode_primary_preferred_when_both_match(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -139,3 +150,58 @@ def test_decode_validates_audience_and_issuer(monkeypatch: pytest.MonkeyPatch) -
     with pytest.raises(HTTPException) as ei:
         decode_supabase_jwt(bad_aud)
     assert ei.value.status_code == 401
+
+
+@pytest.fixture
+def db_session() -> Session:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    return factory()
+
+
+def _request_with_cookie(cookie_header: str | None) -> Request:
+    headers = []
+    if cookie_header:
+        headers.append((b"cookie", cookie_header.encode("utf-8")))
+    scope = {"type": "http", "method": "GET", "path": "/", "headers": headers}
+    return Request(scope)
+
+
+def test_get_current_user_prefers_authorization_then_cookie(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_session.add(User(id="u_bearer", email="bearer@example.com", auth_provider="supabase"))
+    db_session.add(User(id="u_cookie", email="cookie@example.com", auth_provider="supabase"))
+    db_session.commit()
+
+    def _decode(token: str) -> dict[str, str]:
+        if token == "bearer-token":
+            return {"sub": "u_bearer"}
+        if token == "cookie-token":
+            return {"sub": "u_cookie"}
+        raise HTTPException(status_code=401, detail="invalid")
+
+    monkeypatch.setattr("webapp.security.decode_supabase_jwt", _decode)
+    req = _request_with_cookie("tradingbot_session=cookie-token")
+    user = get_current_user(req, authorization="Bearer bearer-token", db=db_session)
+    assert user.id == "u_bearer"
+
+
+def test_get_current_user_falls_back_to_cookie_when_authorization_invalid(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_session.add(User(id="u_cookie_only", email="cookie@example.com", auth_provider="supabase"))
+    db_session.commit()
+
+    def _decode(token: str) -> dict[str, str]:
+        if token == "bad-bearer":
+            raise HTTPException(status_code=401, detail="bad bearer")
+        if token == "cookie-token":
+            return {"sub": "u_cookie_only"}
+        raise HTTPException(status_code=401, detail="invalid")
+
+    monkeypatch.setattr("webapp.security.decode_supabase_jwt", _decode)
+    req = _request_with_cookie("tradingbot_session=cookie-token")
+    user = get_current_user(req, authorization="Bearer bad-bearer", db=db_session)
+    assert user.id == "u_cookie_only"

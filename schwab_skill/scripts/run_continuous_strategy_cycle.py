@@ -57,6 +57,7 @@ def main() -> int:
     parser.add_argument("--skip-backtest", action="store_true", help="Skip weekly promotion backtest step.")
     parser.add_argument("--skip-tune", action="store_true", help="Skip walk-forward tune cycle.")
     parser.add_argument("--strict", action="store_true", help="Stop at first failure.")
+    parser.add_argument("--tune-timeout-seconds", type=int, default=3600, help="Tune-cycle optimizer timeout per run (0 disables).")
     args = parser.parse_args()
 
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
@@ -66,7 +67,17 @@ def main() -> int:
         ("validate_all_server", [py, str(SCRIPTS_DIR / "validate_all.py"), "--profile", "server", "--strict"]),
     ]
     if not args.skip_tune:
-        steps.append(("run_strategy_tune_cycle", [py, str(SCRIPTS_DIR / "run_strategy_tune_cycle.py")]))
+        steps.append(
+            (
+                "run_strategy_tune_cycle",
+                [
+                    py,
+                    str(SCRIPTS_DIR / "run_strategy_tune_cycle.py"),
+                    "--timeout-seconds",
+                    str(args.tune_timeout_seconds),
+                ],
+            )
+        )
     if not args.skip_backtest:
         steps.append(
             (

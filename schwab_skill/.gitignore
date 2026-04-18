@@ -31,7 +31,8 @@ trading_bot.log*
 *.db
 *.db-journal
 
-# Local state and caches
+# Local state and caches (skill-root dotfiles + the small handful of
+# non-dot runtime artefacts the engine writes alongside them).
 .backtest_results.json
 .forensic_cache.json
 .mirofish_cache.json
@@ -44,8 +45,26 @@ trading_bot.log*
 .signal_quality_metrics.json
 .trade_outcomes.json
 .watchlist_cache.json
+.prediction_market_*.json
+.pm_*.json
+.hypothesis_ledger*.json
+.counterfactual_*.json
+.scan_outcomes.json
 guardrail_trades.json
 execution_safety_metrics.json
+strategy_state.json
+strategy_chat_log.jsonl
+
+# Per-tenant runtime skill dirs (created on demand for SaaS user sandboxes).
+tenants/
+.tenant_runtime_cache/
+
+# Encrypted token artefacts — in addition to `*.enc` above, defend against
+# a writer that ever drops them with a different extension or sibling name.
+tokens_*.enc
+tokens_*.enc.bak
+tokens_*.json
+.token_cache.json
 
 # Generated/model artifacts
 artifacts/

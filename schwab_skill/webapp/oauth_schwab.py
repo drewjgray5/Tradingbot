@@ -81,6 +81,7 @@ def verify_schwab_oauth_state(token: str) -> tuple[str, str] | None:
 
 def schwab_authorize_url(client_id: str, redirect_uri: str, state: str) -> str:
     params: dict[str, str] = {
+        "response_type": "code",
         "client_id": client_id.strip(),
         "redirect_uri": redirect_uri.strip(),
         "state": state,

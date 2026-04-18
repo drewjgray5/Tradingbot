@@ -225,35 +225,33 @@ async function getApiAccessToken() {
 }
 
 function clearLegacyApiJwtKeys() {
+  if (typeof AuthJwt.clearLegacyApiJwtKeys === "function") {
+    AuthJwt.clearLegacyApiJwtKeys(localStorage, LEGACY_AUTH_TOKEN_KEYS);
+    return;
+  }
   LEGACY_AUTH_TOKEN_KEYS.forEach((key) => localStorage.removeItem(key));
 }
 
 function readStoredApiJwt() {
-  const accept = (raw) => {
-    const n = normalizeUserJwt(raw);
-    if (!n) return "";
-    if (!AuthJwt.isProbablyAccessJwt(n)) {
-      console.warn(AuthJwt.JWT_BAD_SHAPE_HINT);
-      clearStoredApiJwt();
-      return "";
-    }
-    return n;
-  };
-  const current = accept(localStorage.getItem(AUTH_TOKEN_KEY) || "");
-  if (current) return current;
-  for (const key of LEGACY_AUTH_TOKEN_KEYS) {
-    const legacy = (localStorage.getItem(key) || "").trim();
-    if (!legacy) continue;
-    const migrated = accept(legacy);
-    if (!migrated) continue;
-    localStorage.setItem(AUTH_TOKEN_KEY, migrated);
-    clearLegacyApiJwtKeys();
-    return migrated;
+  if (typeof AuthJwt.readStoredApiJwt === "function") {
+    return AuthJwt.readStoredApiJwt({
+      storage: localStorage,
+      authTokenKey: AUTH_TOKEN_KEY,
+      legacyAuthTokenKeys: LEGACY_AUTH_TOKEN_KEYS,
+      normalizeUserJwt,
+      isProbablyAccessJwt: AuthJwt.isProbablyAccessJwt,
+      jwtBadShapeHint: AuthJwt.JWT_BAD_SHAPE_HINT,
+    });
   }
-  return "";
+  const n = normalizeUserJwt(localStorage.getItem(AUTH_TOKEN_KEY) || "");
+  return n && AuthJwt.isProbablyAccessJwt(n) ? n : "";
 }
 
 function clearStoredApiJwt() {
+  if (typeof AuthJwt.clearStoredApiJwt === "function") {
+    AuthJwt.clearStoredApiJwt(localStorage, AUTH_TOKEN_KEY, LEGACY_AUTH_TOKEN_KEYS);
+    return;
+  }
   localStorage.removeItem(AUTH_TOKEN_KEY);
   clearLegacyApiJwtKeys();
 }

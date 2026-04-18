@@ -100,6 +100,7 @@ def get_authorization_url(
     log in, and copy the full redirect URL (with ?code=...) back.
     """
     params = {
+        "response_type": "code",
         "client_id": client_id,
         "redirect_uri": redirect_uri,
     }

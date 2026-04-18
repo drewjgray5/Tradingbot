@@ -15,10 +15,16 @@
 - [[execution-engine]] — Order placement, guardrails, plugin hooks
 - [[guardrails]] — Risk limits, circuit breaker, sector caps
 - [[advisory-model]] — Calibrated P(up in 10 days) probability scoring
+- [[agent-intelligence]] — Dynamic weighting, meta-policy, uncertainty throttling
+- [[meta-policy]] — Final-stage emit / suppress / downweight combiner
+- [[mirofish-engine]] — Multi-persona simulation backbone
+- [[feature-store]] — Append-only feature + outcome history
+- [[prediction-market]] — Polymarket overlay and provider abstraction
 - [[database-schema]] — SQLAlchemy tables and relationships
 - [[discord-integration]] — Webhook alerts and notification types
 - [[webapp-dashboard]] — FastAPI local dashboard
 - [[saas-api]] — Multi-tenant production API
+- [[static-module-layout]] — Frontend ES module map (`/static/modules/*.js`)
 
 ## Trading Strategies
 
@@ -33,6 +39,7 @@
 - [[plugin-modes]] — Execution, exit, event risk, regime, correlation plugins
 - [[hypothesis-ledger]] — Decision quality tracking
 - [[self-study]] — Automated trade outcome analysis
+- [[evolve-logic]] — Post-mortem feature → threshold tuner
 
 ## Configuration Reference
 
@@ -56,6 +63,9 @@
 - [[validation]] — Validation pipeline and matrix
 - [[canary-rollout]] — Controlled live testing process
 - [[signal-quality-rollout]] — Quality gate promotion plan
+- [[promotion-playbook]] — Signed off → shadow → live promotion process
+- [[backtest]] — Historical replay harness (live-parity rules)
+- [[backtest-intelligence-overlay]] — Historical attribution for shadow plugins
 - [[backup-restore]] — Backup strategy, restore drills, and DR targets
 - [[incident-response-saas]] — SaaS incident triage and escalation flow
 - [[slo-alerting]] — SLI/SLO targets, alert thresholds, and error budget policy

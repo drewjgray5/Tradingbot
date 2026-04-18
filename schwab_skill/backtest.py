@@ -10,13 +10,13 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 import pandas as pd
+import requests
 
 try:
     import yfinance as yf
@@ -24,6 +24,14 @@ except ImportError:
     print("Install yfinance: pip install yfinance")
     raise
 
+from backtest_intelligence import (
+    BacktestIntelligenceConfig,
+    apply_event_risk_overlay,
+    apply_exec_quality_overlay,
+    apply_meta_policy_overlay,
+    evaluate_event_risk_for_backtest,
+    simulate_exit_with_manager,
+)
 from config import (
     get_adaptive_stop_base_pct,
     get_adaptive_stop_enabled,
@@ -39,6 +47,8 @@ from config import (
     get_quality_gates_mode,
     get_quality_soft_min_reasons,
 )
+from env_overrides import temporary_env
+from schwab_auth import DualSchwabAuth
 from signal_scanner import _evaluate_quality_gates, _load_watchlist
 from stage_analysis import add_indicators, check_vcp_volume, compute_signal_components, is_stage_2
 
@@ -46,23 +56,9 @@ SKILL_DIR = Path(__file__).resolve().parent
 LOG = logging.getLogger(__name__)
 
 
-@contextmanager
 def _temporary_env(overrides: dict[str, str] | None) -> Iterator[None]:
-    if not overrides:
-        yield
-        return
-    previous: dict[str, str | None] = {}
-    try:
-        for key, value in overrides.items():
-            previous[key] = os.environ.get(key)
-            os.environ[str(key)] = str(value)
-        yield
-    finally:
-        for key, prior in previous.items():
-            if prior is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = prior
+    # Compatibility wrapper retained for existing imports/call sites.
+    return temporary_env(overrides)
 
 HOLD_DAYS = 20
 MIN_BARS = 260
@@ -80,6 +76,7 @@ class BacktestContext:
     sector_etf_by_ticker: dict[str, str | None]
     sector_perf: dict[str, pd.DataFrame]
     excluded_tickers: list[dict[str, Any]]
+    data_integrity: dict[str, Any]
 
 
 def _normalize_history(df: pd.DataFrame) -> pd.DataFrame:
@@ -106,20 +103,93 @@ def _normalize_history(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fetch_history(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    df, _meta = _fetch_history_with_meta(symbol, start_date, end_date)
+    return df
+
+
+def _fetch_history_with_meta(symbol: str, start_date: str, end_date: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    meta: dict[str, Any] = {
+        "provider": "unknown",
+        "used_fallback": False,
+        "reason": "unknown",
+        "rows": 0,
+    }
+    if (os.getenv("SCHWAB_ONLY_DATA") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        out = _fetch_history_schwab(symbol, start_date, end_date)
+        meta["provider"] = "schwab"
+        meta["used_fallback"] = False
+        meta["rows"] = int(len(out))
+        meta["reason"] = "schwab_only"
+        return out, meta
     for attempt in range(3):
         try:
             t = yf.Ticker(symbol)
             raw = t.history(start=start_date, end=end_date, auto_adjust=True)
+            if raw is None:
+                meta["provider"] = "yfinance"
+                meta["used_fallback"] = True
+                meta["reason"] = "yfinance_history_none"
+                return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]).rename_axis("date"), meta
             time.sleep(0.05)
-            return _normalize_history(raw)
+            out = _normalize_history(raw)
+            meta["provider"] = "yfinance"
+            meta["used_fallback"] = True
+            meta["rows"] = int(len(out))
+            meta["reason"] = "yfinance_ok" if not out.empty else "yfinance_empty_after_normalize"
+            return out, meta
         except Exception as e:
             msg = str(e)
             if "Too Many Requests" in msg and attempt < 2:
                 time.sleep(2.0 * (attempt + 1))
                 continue
             LOG.warning("History fetch failed for %s: %s", symbol, e)
+            meta["provider"] = "yfinance"
+            meta["used_fallback"] = True
+            meta["reason"] = f"yfinance_exception:{type(e).__name__}"
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]).rename_axis("date"), meta
+    meta["provider"] = "yfinance"
+    meta["used_fallback"] = True
+    meta["reason"] = "yfinance_retries_exhausted"
+    return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]).rename_axis("date"), meta
+
+
+def _fetch_history_schwab(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    url = "https://api.schwabapi.com/marketdata/v1/pricehistory"
+    params = {
+        "symbol": str(symbol).upper().strip(),
+        "periodType": "month",
+        "frequencyType": "daily",
+        "startDate": int(datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc).timestamp() * 1000),
+        "endDate": int(datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc).timestamp() * 1000),
+    }
+    try:
+        auth = DualSchwabAuth(skill_dir=SKILL_DIR)
+        token = auth.get_market_token()
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        resp = requests.get(url, params=params, headers=headers, timeout=30)
+        if resp.status_code == 401 and auth.market_session.force_refresh():
+            token = auth.get_market_token()
+            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+            resp = requests.get(url, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        candles = payload.get("candles") or []
+        if not candles:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]).rename_axis("date")
-    return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]).rename_axis("date")
+        df = pd.DataFrame(candles)
+        if "datetime" not in df.columns:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]).rename_axis("date")
+        dt_series = pd.to_datetime(df["datetime"], unit="ms", utc=True)
+        for c in ("open", "high", "low", "close", "volume"):
+            if c not in df.columns:
+                return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]).rename_axis("date")
+        out = df[["open", "high", "low", "close", "volume"]].copy().astype(float)
+        out.index = pd.DatetimeIndex(dt_series).tz_localize(None).normalize()
+        out.index.name = "date"
+        return out.sort_index().drop_duplicates()
+    except Exception as e:
+        LOG.warning("Schwab-only history fetch failed for %s: %s", symbol, e)
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]).rename_axis("date")
 
 
 def _prepare_context(
@@ -137,10 +207,40 @@ def _prepare_context(
     price_data: dict[str, pd.DataFrame] = {}
     sector_etf_by_ticker: dict[str, str | None] = {}
     excluded: list[dict[str, Any]] = []
+    data_integrity: dict[str, Any] = {
+        "history_fetch_total": 0,
+        "history_fetch_empty": 0,
+        "history_fetch_too_short": 0,
+        "history_provider_schwab": 0,
+        "history_provider_yfinance": 0,
+        "history_provider_unknown": 0,
+        "history_fallback_used": 0,
+        "history_reason_counts": {},
+    }
 
     for ticker in universe:
-        df = _fetch_history(ticker, start_date, end_date)
+        df, history_meta = _fetch_history_with_meta(ticker, start_date, end_date)
+        data_integrity["history_fetch_total"] = int(data_integrity.get("history_fetch_total", 0) or 0) + 1
+        provider = str(history_meta.get("provider") or "unknown")
+        reason = str(history_meta.get("reason") or "unknown")
+        reason_counts = dict(data_integrity.get("history_reason_counts") or {})
+        reason_counts[reason] = int(reason_counts.get(reason, 0) or 0) + 1
+        data_integrity["history_reason_counts"] = reason_counts
+        if provider == "schwab":
+            data_integrity["history_provider_schwab"] = int(data_integrity.get("history_provider_schwab", 0) or 0) + 1
+        elif provider == "yfinance":
+            data_integrity["history_provider_yfinance"] = int(data_integrity.get("history_provider_yfinance", 0) or 0) + 1
+        else:
+            data_integrity["history_provider_unknown"] = int(data_integrity.get("history_provider_unknown", 0) or 0) + 1
+        if bool(history_meta.get("used_fallback")):
+            data_integrity["history_fallback_used"] = int(data_integrity.get("history_fallback_used", 0) or 0) + 1
         if df.empty or len(df) < MIN_BARS:
+            if df.empty:
+                data_integrity["history_fetch_empty"] = int(data_integrity.get("history_fetch_empty", 0) or 0) + 1
+            else:
+                data_integrity["history_fetch_too_short"] = int(
+                    data_integrity.get("history_fetch_too_short", 0) or 0
+                ) + 1
             excluded.append({"ticker": ticker, "reason": "insufficient_history", "bars": len(df)})
             continue
         price_data[ticker] = add_indicators(df)
@@ -151,7 +251,7 @@ def _prepare_context(
 
     sector_perf: dict[str, pd.DataFrame] = {}
     for sym in sorted(set(SECTOR_ETFS + ["SPY"])):
-        sdf = _fetch_history(sym, start_date, end_date)
+        sdf, _meta = _fetch_history_with_meta(sym, start_date, end_date)
         if not sdf.empty and len(sdf) >= MIN_BARS:
             sector_perf[sym] = sdf
 
@@ -161,6 +261,7 @@ def _prepare_context(
         sector_etf_by_ticker=sector_etf_by_ticker,
         sector_perf=sector_perf,
         excluded_tickers=excluded,
+        data_integrity=data_integrity,
     )
 
 
@@ -340,6 +441,9 @@ def run_backtest(
     max_adv_participation: float = DEFAULT_MAX_ADV_PARTICIPATION,
     skill_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
+    include_all_trades: bool = False,
+    prediction_market_snapshot_path: str | None = None,
+    intelligence_overlay: dict[str, str] | BacktestIntelligenceConfig | None = None,
 ) -> dict[str, Any]:
     with _temporary_env(env_overrides):
         return _run_backtest_core(
@@ -351,6 +455,9 @@ def run_backtest(
             min_fee_per_order=min_fee_per_order,
             max_adv_participation=max_adv_participation,
             skill_dir=skill_dir,
+            include_all_trades=include_all_trades,
+            prediction_market_snapshot_path=prediction_market_snapshot_path,
+            intelligence_overlay=intelligence_overlay,
         )
 
 
@@ -363,10 +470,20 @@ def _run_backtest_core(
     min_fee_per_order: float = DEFAULT_MIN_FEE_PER_ORDER,
     max_adv_participation: float = DEFAULT_MAX_ADV_PARTICIPATION,
     skill_dir: Path | None = None,
+    include_all_trades: bool = False,
+    prediction_market_snapshot_path: str | None = None,
+    intelligence_overlay: dict[str, str] | BacktestIntelligenceConfig | None = None,
 ) -> dict[str, Any]:
     sd = skill_dir or SKILL_DIR
     end = end_date or datetime.now().strftime("%Y-%m-%d")
     start = start_date or (datetime.now() - timedelta(days=3652)).strftime("%Y-%m-%d")
+
+    if isinstance(intelligence_overlay, BacktestIntelligenceConfig):
+        overlay_cfg = intelligence_overlay
+    elif intelligence_overlay is not None:
+        overlay_cfg = BacktestIntelligenceConfig.from_mapping(intelligence_overlay)
+    else:
+        overlay_cfg = BacktestIntelligenceConfig.all_off()
 
     requested = [str(t).strip().upper() for t in (tickers or []) if str(t).strip()]
     context = _prepare_context(start, end, watchlist=requested if requested else None, skill_dir=sd)
@@ -382,6 +499,20 @@ def _run_backtest_core(
         "regime_blocked": 0,
         "entries": 0,
         "liquidity_filtered": 0,
+        "prediction_market_processed": 0,
+        "prediction_market_applied": 0,
+        "prediction_market_skipped": 0,
+        "prediction_market_errors": 0,
+        "meta_policy_processed": 0,
+        "meta_policy_suppressed": 0,
+        "meta_policy_downsized": 0,
+        "event_risk_live_blocked": 0,
+        "event_risk_live_downsized": 0,
+        "event_risk_live_flagged": 0,
+        "event_risk_shadow_flagged": 0,
+        "event_risk_shadow_would_block": 0,
+        "event_risk_shadow_would_downsize": 0,
+        "exit_manager_partial_done": 0,
     }
 
     breakout_enabled = get_breakout_confirm_enabled(sd)
@@ -396,6 +527,37 @@ def _run_backtest_core(
     forensic_altman_min = float(get_forensic_altman_min(sd))
     pead_enabled = get_pead_enabled(sd)
     pead_lookback_days = int(get_pead_lookback_days(sd))
+    prediction_market_engine = None
+    prediction_market_mode = "off"
+    prediction_market_provider = "off"
+    try:
+        from prediction_market import (
+            PredictionMarketOverlayEngine,
+            apply_overlay_to_signal,
+            build_prediction_market_config,
+            build_provider,
+            load_historical_provider,
+        )
+
+        pm_cfg = build_prediction_market_config(skill_dir=sd)
+        prediction_market_mode = str(pm_cfg.mode)
+        prediction_market_provider = str(pm_cfg.provider)
+        if pm_cfg.enabled and pm_cfg.mode == "live":
+            if prediction_market_snapshot_path:
+                prediction_market_provider = "historical_file"
+                pm_provider = load_historical_provider(prediction_market_snapshot_path)
+                prediction_market_engine = PredictionMarketOverlayEngine(config=pm_cfg, provider=pm_provider)
+            elif os.getenv("BACKTEST_ALLOW_NON_HISTORICAL_PM", "").strip().lower() in {"1", "true", "yes", "on"}:
+                pm_provider = build_provider(pm_cfg)
+                prediction_market_engine = PredictionMarketOverlayEngine(config=pm_cfg, provider=pm_provider)
+            else:
+                prediction_market_mode = "off"
+                LOG.warning(
+                    "Prediction-market backtest disabled: require historical snapshot file for strict PIT evaluation."
+                )
+    except Exception as e:
+        diagnostics["prediction_market_errors"] += 1
+        LOG.warning("Prediction-market backtest setup skipped: %s", e)
 
     # Pre-compute SPY regime (above 200 SMA) for each date
     spy_df = context.sector_perf.get("SPY")
@@ -498,28 +660,123 @@ def _run_backtest_core(
                     LOG.debug("Backtest PEAD check skipped for %s: %s", ticker, e)
             signal["pead_surprise_pct"] = (pead_info or {}).get("surprise_pct")
             signal["pead_beat"] = (pead_info or {}).get("beat")
+            if prediction_market_engine is not None and prediction_market_mode == "live":
+                diagnostics["prediction_market_processed"] += 1
+                try:
+                    entry_dt = pd.Timestamp(df.index[i]).to_pydatetime()
+                    if entry_dt.tzinfo is None:
+                        entry_dt_utc = entry_dt.replace(tzinfo=timezone.utc)
+                    else:
+                        entry_dt_utc = entry_dt.astimezone(timezone.utc)
+                except Exception:
+                    entry_dt_utc = datetime.now(timezone.utc)
+                regime_for_entry = True
+                if spy_regime is not None:
+                    try:
+                        spy_i = spy_regime.index.get_indexer([df.index[i]], method="pad")[0]
+                        if spy_i >= 0:
+                            regime_for_entry = bool(spy_regime.iloc[spy_i])
+                    except Exception:
+                        pass
+                try:
+                    evaluation = prediction_market_engine.evaluate(
+                        ticker=ticker,
+                        as_of=entry_dt_utc,
+                        regime_is_bullish=regime_for_entry,
+                    )
+                    signal = apply_overlay_to_signal(signal=signal, evaluation=evaluation, advisory=None)
+                    if evaluation.status == "ok" and bool(evaluation.overlay.get("applied")):
+                        diagnostics["prediction_market_applied"] += 1
+                    elif evaluation.status == "error":
+                        diagnostics["prediction_market_errors"] += 1
+                    else:
+                        diagnostics["prediction_market_skipped"] += 1
+                except Exception as e:
+                    diagnostics["prediction_market_errors"] += 1
+                    LOG.warning("Backtest prediction-market overlay failed for %s: %s", ticker, e)
             reasons = _evaluate_quality_gates(signal, sd)
             if _quality_mode_should_filter(reasons, sd):
                 diagnostics["quality_gates_filtered"] += 1
                 i += 1
                 continue
 
+            # Intelligence overlays — meta-policy + event-risk gates run in
+            # parallel to (and after) the existing quality gates. They are
+            # opt-in via ``intelligence_overlay`` and behave as no-ops when
+            # the per-overlay mode is "off".
+            meta_size_mult = 1.0
+            event_size_mult = 1.0
+            event_policy = None
+            meta_payload: dict[str, Any] | None = None
+            if overlay_cfg.meta_policy != "off":
+                signal, meta_allow, meta_size_mult = apply_meta_policy_overlay(
+                    signal=signal,
+                    diagnostics=diagnostics,
+                    skill_dir=sd,
+                    mode=overlay_cfg.meta_policy,
+                )
+                meta_payload = signal.get("meta_policy")
+                if not meta_allow:
+                    i += 1
+                    continue
+            if overlay_cfg.event_risk != "off":
+                event_policy = evaluate_event_risk_for_backtest(
+                    ticker=ticker,
+                    entry_date=df.index[i],
+                    pead_info=pead_info,
+                    skill_dir=sd,
+                    mode=overlay_cfg.event_risk,
+                )
+                event_allow, event_size_mult = apply_event_risk_overlay(
+                    policy=event_policy,
+                    diagnostics=diagnostics,
+                    mode=overlay_cfg.event_risk,
+                )
+                signal["event_risk"] = event_policy
+                if not event_allow:
+                    i += 1
+                    continue
+
             entry_price = float(df["close"].iloc[i])
             entry_date = df.index[i]
             day_volume = float(df["volume"].iloc[i]) if "volume" in df.columns else 0.0
             qty = _estimate_order_qty(entry_price, day_volume, max_adv_participation=max_adv_participation)
+            pm_mult = 1.0
+            try:
+                pm_mult = float(signal.get("prediction_market_size_multiplier") or 1.0)
+            except (TypeError, ValueError):
+                pm_mult = 1.0
+            pm_mult = max(0.85, min(1.15, pm_mult))
+            combined_size_mult = pm_mult * float(meta_size_mult) * float(event_size_mult)
+            qty = max(1, int(round(float(qty) * combined_size_mult)))
             if day_volume > 0 and qty > int(day_volume * max_adv_participation):
                 diagnostics["liquidity_filtered"] += 1
                 i += 1
                 continue
             stop_pct_entry = _resolve_stop_pct_for_entry(df, i, skill_dir=sd)
-            exit_price, exit_date, exit_reason = _simulate_exit(df, i, HOLD_DAYS, stop_pct_entry)
+            exit_price, exit_date, exit_reason, exit_info = simulate_exit_with_manager(
+                df,
+                i,
+                HOLD_DAYS,
+                stop_pct_entry,
+                skill_dir=sd,
+                mode=overlay_cfg.exit_manager,
+            )
+            if (exit_info.get("managed") or {}).get("partial_done"):
+                diagnostics["exit_manager_partial_done"] += 1
+            effective_slippage_bps, exec_info = apply_exec_quality_overlay(
+                slippage_bps_per_side=slippage_bps_per_side,
+                day_volume=day_volume,
+                qty=qty,
+                skill_dir=sd,
+                mode=overlay_cfg.exec_quality,
+            )
             ret = (exit_price - entry_price) / entry_price if entry_price > 0 else 0.0
             net_ret, cost_ctx = _net_return_after_costs(
                 entry_price=entry_price,
                 exit_price=exit_price,
                 qty=qty,
-                slippage_bps_per_side=slippage_bps_per_side,
+                slippage_bps_per_side=effective_slippage_bps,
                 fee_per_share=fee_per_share,
                 min_fee_per_order=min_fee_per_order,
             )
@@ -549,6 +806,16 @@ def _run_backtest_core(
                     "slippage_pct": float(cost_ctx["slippage_pct"]),
                     "fees_pct": float(cost_ctx["fees_pct"]),
                     "stop_pct": float(stop_pct_entry),
+                    "prediction_market_status": ((signal.get("prediction_market") or {}).get("status")),
+                    "prediction_market_reason": ((signal.get("prediction_market") or {}).get("reason")),
+                    "prediction_market_size_multiplier": pm_mult,
+                    "meta_policy_decision": (meta_payload or {}).get("decision") if meta_payload else None,
+                    "meta_policy_size_multiplier": float(meta_size_mult),
+                    "event_risk_action": (event_policy or {}).get("action") if event_policy else None,
+                    "event_risk_size_multiplier": float(event_size_mult),
+                    "exit_manager_partial_done": bool((exit_info.get("managed") or {}).get("partial_done")),
+                    "exec_quality_regime": exec_info.get("regime"),
+                    "exec_quality_effective_slippage_bps": exec_info.get("effective_slippage_bps"),
                 }
             )
             diagnostics["entries"] += 1
@@ -574,8 +841,12 @@ def _run_backtest_core(
             "max_drawdown_net_pct": 0.0,
             "diagnostics": diagnostics,
             "quality_gates_mode": quality_mode,
+            "prediction_market_mode": prediction_market_mode,
+            "prediction_market_provider": prediction_market_provider,
+            "intelligence_overlay": overlay_cfg.as_dict(),
             "excluded_tickers": context.excluded_tickers[:50],
             "universe_size": len(context.watchlist),
+            "data_integrity": context.data_integrity,
             "findings": "No trades generated over the requested window.",
             "trades_sample": [],
         }
@@ -613,7 +884,7 @@ def _run_backtest_core(
         f"gross CAGR {100.0 * cagr:.2f}%, net CAGR {100.0 * cagr_net:.2f}%."
     )
 
-    return {
+    out = {
         "start_date": start,
         "end_date": end,
         "total_trades": total,
@@ -642,12 +913,19 @@ def _run_backtest_core(
         "max_adv_participation": float(max_adv_participation),
         "diagnostics": diagnostics,
         "quality_gates_mode": quality_mode,
+        "prediction_market_mode": prediction_market_mode,
+        "prediction_market_provider": prediction_market_provider,
+        "intelligence_overlay": overlay_cfg.as_dict(),
         "excluded_tickers": context.excluded_tickers[:50],
         "excluded_count": len(context.excluded_tickers),
         "universe_size": len(context.watchlist),
+        "data_integrity": context.data_integrity,
         "trades_sample": all_trades[:5],
         "findings": findings,
     }
+    if include_all_trades:
+        out["trades"] = all_trades
+    return out
 
 
 def main() -> None:

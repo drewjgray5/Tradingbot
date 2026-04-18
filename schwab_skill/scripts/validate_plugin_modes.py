@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import os
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -38,6 +37,7 @@ from config import (  # noqa: E402
     get_regime_v2_size_mult_low,
     get_regime_v2_size_mult_med,
 )
+from env_overrides import temporary_env  # noqa: E402
 
 MODE_GETTERS = {
     "EXEC_QUALITY_MODE": get_exec_quality_mode,
@@ -46,6 +46,18 @@ MODE_GETTERS = {
     "CORRELATION_GUARD_MODE": get_correlation_guard_mode,
     "REGIME_V2_MODE": get_regime_v2_mode,
 }
+
+# Promoted defaults (2026-Q2): see docs/RELEASE_NOTES_PLUGIN_PROMOTIONS.md
+# and scripts/promotion_ledger.jsonl. Modes not listed here still default
+# to "off" for safety until they finish their own shadow runs.
+PROMOTED_DEFAULTS = {
+    "EXEC_QUALITY_MODE": "live",
+    "EVENT_RISK_MODE": "live",
+}
+
+
+def _expected_default(env_key: str) -> str:
+    return PROMOTED_DEFAULTS.get(env_key, "off")
 
 THRESHOLD_GETTERS = [
     ("EXEC_QUALITY_MIN_SIGNAL_SCORE", get_exec_quality_min_signal_score, 55),
@@ -65,30 +77,20 @@ THRESHOLD_GETTERS = [
 ]
 
 
-@contextmanager
 def _temporary_env(overrides: dict[str, str]):
-    old: dict[str, str | None] = {}
-    try:
-        for key, value in overrides.items():
-            old[key] = os.environ.get(key)
-            os.environ[key] = str(value)
-        yield
-    finally:
-        for key, previous in old.items():
-            if previous is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = previous
+    return temporary_env(overrides)
 
 
 def main() -> int:
     for env_key, getter in MODE_GETTERS.items():
         os.environ.pop(env_key, None)
-        if getter(EMPTY_ENV_SKILL_DIR) != "off":
-            print(f"FAIL: {env_key} default should resolve to off")
+        expected = _expected_default(env_key)
+        if getter(EMPTY_ENV_SKILL_DIR) != expected:
+            print(f"FAIL: {env_key} default should resolve to {expected}")
             return 1
 
     for env_key, getter in MODE_GETTERS.items():
+        expected_default = _expected_default(env_key)
         with _temporary_env({env_key: "OFF"}):
             if getter(EMPTY_ENV_SKILL_DIR) != "off":
                 print(f"FAIL: {env_key}=OFF should normalize to off")
@@ -102,8 +104,13 @@ def main() -> int:
                 print(f"FAIL: {env_key}=LiVe should normalize to live")
                 return 1
         with _temporary_env({env_key: "not-a-mode"}):
-            if getter(EMPTY_ENV_SKILL_DIR) != "off":
-                print(f"FAIL: {env_key} invalid value should fallback to off")
+            # Invalid values fall back to the operational default for the
+            # mode (which is the safer choice for promoted gates: keep the
+            # gate active rather than silently disabling it).
+            if getter(EMPTY_ENV_SKILL_DIR) != expected_default:
+                print(
+                    f"FAIL: {env_key} invalid value should fallback to {expected_default}",
+                )
                 return 1
 
     for env_key, getter, expected_default in THRESHOLD_GETTERS:

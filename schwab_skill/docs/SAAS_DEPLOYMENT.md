@@ -29,6 +29,30 @@ If you want the shortest path to a safe deploy, do this first:
 
 If these 5 checks pass, the core production baseline is in place.
 
+## Fastest safe path (operator checklist)
+
+Use this sequence for first deploys and incident recovery:
+
+1. Deploy with `render.yaml` (API + worker + Postgres + Redis).
+2. Set all required env vars on API and worker before first boot.
+3. Run schema bootstrap once for empty DB (`SAAS_BOOTSTRAP_SCHEMA=1` once, then unset).
+4. Complete one account OAuth + one market OAuth from the hosted dashboard.
+5. Verify `GET /api/health/live`, `GET /api/health/ready`, then authenticated `GET /api/me`.
+
+If any step fails, stop and fix before enabling live trading or running scans.
+
+## Canonical OAuth flow (SaaS)
+
+1. Platform defines app credentials (`SCHWAB_MARKET_*`, `SCHWAB_ACCOUNT_*`) on API + worker.
+2. User starts **Connect Schwab (market/account)** in dashboard.
+3. Callback persists encrypted OAuth payload to `user_credentials`.
+4. Runtime materializes tenant dir with:
+   - per-user `tokens_account.enc`
+   - per-user `tokens_market.enc` (or controlled platform fallback)
+5. Scan/order jobs run against that materialized tenant runtime.
+
+Keep this flow as the default. It has the lowest drift risk between dashboard state and worker runtime.
+
 ## Stack
 
 - **API:** FastAPI `webapp.main_saas:app`
@@ -53,6 +77,24 @@ If these 5 checks pass, the core production baseline is in place.
 | `SCHWAB_MARKET_CALLBACK_URL` | Redirect URI for the **market** Schwab app — register `https://<api-host>/api/oauth/schwab/market/callback` on the market app |
 | `DATABASE_URL` | SQLAlchemy URL |
 | `REDIS_URL` | Celery + rate limits + scan cooldown |
+
+### Required vs legacy/optional env
+
+Required for standard SaaS path:
+
+- `DATABASE_URL`, `REDIS_URL`
+- `CREDENTIAL_ENCRYPTION_KEY`, `OAUTH_STATE_SECRET`
+- `SUPABASE_JWT_SECRET`, `SUPABASE_JWT_AUDIENCE`, `SUPABASE_JWT_ISSUER`
+- `SCHWAB_MARKET_APP_KEY`, `SCHWAB_MARKET_APP_SECRET`
+- `SCHWAB_ACCOUNT_APP_KEY`, `SCHWAB_ACCOUNT_APP_SECRET`
+- `SCHWAB_CALLBACK_URL`, `SCHWAB_MARKET_CALLBACK_URL`
+
+Legacy/optional:
+
+- `SUPABASE_JWT_SECRET_LEGACY` (temporary key-rotation bridge)
+- `SAAS_PLATFORM_MARKET_SKILL_DIR` (advanced shared-market-token fallback)
+- `SUPABASE_URL`, `SUPABASE_ANON_KEY` (optional browser sign-in UX enhancement)
+- `WEB_INTERNAL_API_KEY` (recommended for private metrics)
 
 ## Web service only (optional browser sign-in)
 
@@ -94,6 +136,24 @@ Users can also POST `/api/credentials/schwab` with:
 - `market_oauth_json` — JSON string from the **market** app token response.
 
 Alternatively: legacy `access_token` + `refresh_token` for the account app **and** set `SAAS_PLATFORM_MARKET_SKILL_DIR` to a directory on the worker/API host that contains a valid `tokens_market.enc` for the market app (shared platform session).
+
+## Legacy path (advanced only)
+
+The following are compatibility paths and should be treated as advanced operations:
+
+- Uploading raw `access_token` / `refresh_token` instead of full OAuth payloads.
+- Using `SAAS_PLATFORM_MARKET_SKILL_DIR` as market-token fallback instead of per-user market OAuth.
+
+These paths remain supported for migration safety, but new tenants should use full per-user market + account OAuth.
+
+## Common misconfigurations
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `ready` is 503 while `live` is 200 | Redis/Celery queue not ready | Verify worker is up and listening on `scan,orders,celery`; check `REDIS_URL` |
+| OAuth callback succeeds but scans fail with market-session error | Missing per-user market token and no platform fallback | Reconnect market OAuth or configure `SAAS_PLATFORM_MARKET_SKILL_DIR` intentionally |
+| JWT accepted locally, rejected in prod | Missing claim config | Set `SUPABASE_JWT_AUDIENCE` and `SUPABASE_JWT_ISSUER` |
+| Browser sign-in UI missing | `SUPABASE_URL`/`SUPABASE_ANON_KEY` not set on web service | Set both on web service or use manual JWT input path |
 
 ## Migrations
 

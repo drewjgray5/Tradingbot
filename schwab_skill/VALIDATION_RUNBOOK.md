@@ -52,17 +52,32 @@ Use this split to keep PR feedback fast while still running heavy improvement lo
    - `python scripts/validate_scanner_parallelization.py`  
    - `python scripts/validate_shadow_mode.py`
 
-2. **Scheduled CI (artifact-producing, weekdays)**  
-   - `python scripts/validate_all.py --profile ci --skip-backtest --strict`  
+2. **Scheduled CI (artifact-producing, weekdays)**
+   - `python scripts/validate_all.py --profile ci --skip-backtest --strict --max-parallel 4 --baseline latest --fail-on-regression`
+   - Restores the previous run's `latest_validation_report.json` from
+     the GitHub Actions cache, runs the suite in parallel, and exits
+     non-zero if any step that was passing yesterday is failing today.
+   - Writes a stable diff artifact at
+     `validation_artifacts/latest_baseline_delta.json` for downstream
+     dashboards / Slack alerts.
    - Upload `validation_artifacts/`
 
 3. **Server heavy cycle (nightly/weekly)**  
    - `python scripts/run_continuous_strategy_cycle.py --strict`
    - Writes `validation_artifacts/continuous_validation_status.json`
 
-4. **Manual promotion only**  
-   - Any `--apply` flow requires: `MANUAL_PROMOTION_APPROVED=1`
-   - Without it, promotion scripts return non-zero and do not apply changes.
+4. **Manual promotion only**
+   - Any `--apply` flow requires a fresh signed entry in
+     `scripts/promotion_ledger.jsonl`:
+     ```
+     python scripts/promotion_ledger.py append --target <name> --reason "<why>"
+     python scripts/promotion_ledger.py check  --target <name>   # optional pre-flight
+     ```
+   - Approval expires 24h after the ledger entry is written.
+   - Legacy `MANUAL_PROMOTION_APPROVED=1` still works during the
+     transition (with a deprecation warning) but should be replaced by
+     ledger entries.
+   - Without either, promotion scripts return non-zero and do not apply.
 
 ## Troubleshooting
 

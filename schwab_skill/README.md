@@ -29,6 +29,42 @@ Dual-API OAuth2, guardrails, Stage 2 logic, and Discord notifications.
 3. `pip install -r requirements.txt`  
    TA-Lib optional: `pip install TA-Lib` (fallback to pandas if missing)
 
+## OAuth quickstart (fastest safe path)
+
+For the lowest-risk local auth setup:
+
+1. Set required env vars in `.env`:
+   - `SCHWAB_MARKET_APP_KEY`, `SCHWAB_MARKET_APP_SECRET`
+   - `SCHWAB_ACCOUNT_APP_KEY`, `SCHWAB_ACCOUNT_APP_SECRET`
+   - `SCHWAB_CALLBACK_URL`
+   - `SCHWAB_MARKET_CALLBACK_URL`
+2. Run `python scripts/fix_schwab_auth.py`.
+3. Complete both browser flows (market, then account).
+4. Verify with `python healthcheck.py`.
+
+Canonical OAuth flow:
+
+1. Validate app credentials and callback config.
+2. Remove stale token files.
+3. Run market OAuth and write `tokens_market.enc`.
+4. Run account OAuth and write `tokens_account.enc`.
+5. Verify both token paths via healthcheck.
+
+Common misconfigurations:
+
+| Symptom | Likely cause | Safe fix |
+|---|---|---|
+| Callback mismatch in browser | Redirect URI mismatch | Ensure Schwab app registration matches env callback URLs exactly |
+| Only one of market/account works | App key/secret mismatch between app registrations | Recheck each `SCHWAB_MARKET_*` and `SCHWAB_ACCOUNT_*` pair |
+| Healthcheck fails after auth | Stale/invalid token files | Re-run `python scripts/fix_schwab_auth.py` to clean + re-auth |
+
+Required vs legacy/optional:
+
+- **Required:** `SCHWAB_MARKET_APP_KEY`, `SCHWAB_MARKET_APP_SECRET`, `SCHWAB_ACCOUNT_APP_KEY`, `SCHWAB_ACCOUNT_APP_SECRET`, `SCHWAB_CALLBACK_URL`, `SCHWAB_MARKET_CALLBACK_URL`
+- **Legacy/optional:** `SCHWAB_TOKEN_ENCRYPTION_KEY`, `SAAS_PLATFORM_MARKET_SKILL_DIR`
+
+Legacy path (advanced only): `python run_dual_auth.py` or manual token injection workflows. Keep this for migrations/debugging; default path should remain `scripts/fix_schwab_auth.py`.
+
 ## Self-Study
 
 The bot learns from trade outcomes: records filled BUY/SELL prices, computes round-trip returns, and analyzes performance by MiroFish conviction band and sector. With enough data (5+ round trips), it suggests a minimum conviction threshold; when `SELF_STUDY_ENABLED=true`, signals below that threshold are filtered out. Runs automatically at 4:00 PM ET; or manually: `python scripts/run_self_study.py`.
@@ -176,6 +212,7 @@ Additional references:
 - `VALIDATION_MATRIX.md` (environment gates and pass/fail criteria)
 - `VALIDATION_RUNBOOK.md` (how to run validations in local/server/container/CI)
 - `CANARY_RUNBOOK.md` (controlled live canary and rollback rules)
+- `docs/AGENT_INTELLIGENCE_IMPLEMENTATION_PLAN.md` (dynamic weighting, meta-policy, uncertainty, and promotion gates)
 
 ## Continuous Strategy Improvement (Hybrid)
 
@@ -211,21 +248,53 @@ Dashboard/API exposure:
 - `GET /api/status` -> `validation_status`
 - `GET /api/validation/status`
 
-### Manual Promotion Guard
+### Promotion Guard (Signed Approval Ledger)
 
-Promotion apply is blocked by default in unattended environments.  
-To explicitly allow apply for a one-off operator run:
+Promotion apply is blocked by default in unattended environments. The
+preferred approval mechanism is the **signed promotion ledger** — an
+append-only, SHA-256-chained JSONL file at
+`scripts/promotion_ledger.jsonl`. Every apply requires a fresh, matching
+ledger entry; the chain is re-verified on every run so a tamper rejects
+the apply outright.
+
+Operator workflow:
 
 ```
-MANUAL_PROMOTION_APPROVED=1 python scripts/decide_strategy_promotion.py --challenger-artifact <artifact> --apply
-MANUAL_PROMOTION_APPROVED=1 python scripts/decide_and_promote_advisory_model.py --apply --strict --promotion
+# 1. Drop a signed approval into the ledger.
+python scripts/promotion_ledger.py append \
+    --target strategy_champion_params \
+    --reason "Sprint 7 walk-forward green; PF +0.04 on 5/5 windows"
+
+# 2. Optional pre-flight (exit 0 iff fresh + chain intact).
+python scripts/promotion_ledger.py check --target strategy_champion_params
+
+# 3. Apply. No env var needed when a recent ledger entry exists.
+python scripts/decide_strategy_promotion.py --challenger-artifact <artifact> --apply
+python scripts/decide_and_promote_advisory_model.py --apply --strict --promotion
 ```
 
-Guarded scripts:
-- `scripts/run_strategy_tune_cycle.py`
-- `scripts/decide_strategy_promotion.py`
-- `scripts/run_advisory_retrain_cycle.py`
-- `scripts/decide_and_promote_advisory_model.py`
+Approvals expire after 24h by default (callers may pass a different
+`max_age_hours`). Inspect or audit the chain anytime:
+
+```
+python scripts/promotion_ledger.py tail --n 20
+python scripts/promotion_ledger.py verify
+```
+
+**Target strings** are how each script binds to its ledger entry. Keep
+them stable and grep-friendly:
+- `scripts/decide_strategy_promotion.py`         → `strategy_champion_params`
+- `scripts/decide_and_promote_advisory_model.py` → `advisory_model`
+- `scripts/run_advisory_retrain_cycle.py`        → `advisory_retrain_cycle`
+- `scripts/run_strategy_tune_cycle.py`           → `strategy_tune_cycle`
+
+**Legacy fallback (deprecated):** `MANUAL_PROMOTION_APPROVED=1` still
+unblocks an apply during the transition window, but emits a deprecation
+warning. Prefer the ledger so the audit trail captures who, what, and
+when. Remove the env var from runbooks once every operator has migrated.
+
+**Local-dev escape hatch:** set `PROMOTION_LEDGER_SKIP=1` to bypass the
+ledger entirely (only safe for local sandboxing — never set in CI).
 
 ## Advisory Model (Phase 1)
 
@@ -301,22 +370,27 @@ Current plugin modes:
 - `CORRELATION_GUARD_MODE` (config-ready)
 - `REGIME_V2_MODE`
 
-Defaults are `off`, so production behavior remains legacy until explicitly enabled.
+Defaults: `EXEC_QUALITY_MODE` and `EVENT_RISK_MODE` were promoted to `live`
+(2026-Q2) — see `docs/RELEASE_NOTES_PLUGIN_PROMOTIONS.md` and the signed
+`scripts/promotion_ledger.jsonl`. All other plugins still default to `off`,
+so production behavior for those remains legacy until explicitly enabled.
 
 ## Recommended Rollout Sequence
 
-1. `EXEC_QUALITY_MODE=shadow` -> `live`
-2. `EVENT_RISK_MODE=shadow` -> `live`
+1. ✅ `EXEC_QUALITY_MODE=shadow` -> `live` (promoted 2026-Q2; bare default is now `live`)
+2. ✅ `EVENT_RISK_MODE=shadow` -> `live` (promoted 2026-Q2; bare default is now `live`)
 3. `REGIME_V2_MODE=shadow` -> `live`
 4. `EXIT_MANAGER_MODE=shadow` -> `live`
 5. Enable `CORRELATION_GUARD_MODE` only after implementation is live-tested.
 
 Promote one plugin at a time, hold for at least one full market week, then proceed.
+Every promotion appends a signed entry to `scripts/promotion_ledger.jsonl`
+(`python scripts/promotion_ledger.py append --target <KEY>=live --reason "<why>"`).
 
 ## Env Var Reference (New Plugins)
 
 Execution Quality:
-- `EXEC_QUALITY_MODE=off|shadow|live` (default `off`)
+- `EXEC_QUALITY_MODE=off|shadow|live` (default `live` — promoted 2026-Q2)
 - `EXEC_SPREAD_MAX_BPS` (default `35`)
 - `EXEC_SLIPPAGE_MAX_BPS` (default `20`)
 - `EXEC_REPRICE_ATTEMPTS` (default `2`)
@@ -331,7 +405,7 @@ Exit Manager:
 - `EXIT_MAX_HOLD_DAYS` (default `12`)
 
 Event Risk:
-- `EVENT_RISK_MODE=off|shadow|live` (default `off`)
+- `EVENT_RISK_MODE=off|shadow|live` (default `live` — promoted 2026-Q2)
 - `EVENT_BLOCK_EARNINGS_DAYS` (default `2`)
 - `EVENT_MACRO_BLACKOUT_ENABLED` (default `false`)
 - `EVENT_ACTION=block|downsize` (default `block`)

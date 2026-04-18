@@ -95,7 +95,9 @@ Each run writes a machine-readable summary:
 - Continuous status: `validation_artifacts/continuous_validation_status.json`
 
 Promotion safety contract:
-- `--apply` actions require `MANUAL_PROMOTION_APPROVED=1`.
+- `--apply` actions require a fresh signed entry in
+  `scripts/promotion_ledger.jsonl` (see README → "Promotion Guard").
+- `MANUAL_PROMOTION_APPROVED=1` is accepted as a deprecated fallback.
 - Default scheduler behavior is report-only (no apply).
 
 Use these artifacts to compare results across local, CI, and server runs.

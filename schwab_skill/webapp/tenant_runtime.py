@@ -104,13 +104,42 @@ def user_can_materialize_for_scan(db: Session, user_id: str) -> tuple[bool, str]
     assert row is not None
     if _market_token_dict(row):
         return True, ""
-    platform_dir = (os.getenv("SAAS_PLATFORM_MARKET_SKILL_DIR") or "").strip()
-    if platform_dir and (Path(platform_dir) / "tokens_market.enc").is_file():
+    if _platform_market_token_file() is not None:
         return True, ""
     return (
         False,
         "Market session missing: provide market_oauth_json on credentials or set "
         "SAAS_PLATFORM_MARKET_SKILL_DIR to a skill dir containing tokens_market.enc.",
+    )
+
+
+def _platform_market_skill_dir() -> Path | None:
+    raw = (os.getenv("SAAS_PLATFORM_MARKET_SKILL_DIR") or "").strip()
+    return Path(raw) if raw else None
+
+
+def _platform_market_token_file() -> Path | None:
+    skill_dir = _platform_market_skill_dir()
+    if skill_dir is None:
+        return None
+    token_path = skill_dir / "tokens_market.enc"
+    if token_path.is_file():
+        return token_path
+    return None
+
+
+def _required_platform_schwab_env() -> dict[str, str]:
+    required = {
+        "SCHWAB_MARKET_APP_KEY": (os.environ.get("SCHWAB_MARKET_APP_KEY") or "").strip(),
+        "SCHWAB_MARKET_APP_SECRET": (os.environ.get("SCHWAB_MARKET_APP_SECRET") or "").strip(),
+        "SCHWAB_ACCOUNT_APP_KEY": (os.environ.get("SCHWAB_ACCOUNT_APP_KEY") or "").strip(),
+        "SCHWAB_ACCOUNT_APP_SECRET": (os.environ.get("SCHWAB_ACCOUNT_APP_SECRET") or "").strip(),
+    }
+    if all(required.values()):
+        return required
+    raise RuntimeError(
+        "Platform Schwab app env missing: set SCHWAB_MARKET_APP_KEY/SECRET and "
+        "SCHWAB_ACCOUNT_APP_KEY/SECRET on the API and worker processes."
     )
 
 
@@ -153,15 +182,9 @@ def materialize_tenant_skill_dir(db: Session, user_id: str, skill_dir: Path) -> 
     if not row:
         raise RuntimeError("No credentials row for user.")
 
-    market_secret = (os.environ.get("SCHWAB_MARKET_APP_SECRET") or "").strip()
-    account_secret = (os.environ.get("SCHWAB_ACCOUNT_APP_SECRET") or "").strip()
-    market_key = (os.environ.get("SCHWAB_MARKET_APP_KEY") or "").strip()
-    account_key = (os.environ.get("SCHWAB_ACCOUNT_APP_KEY") or "").strip()
-    if not all([market_secret, account_secret, market_key, account_key]):
-        raise RuntimeError(
-            "Platform Schwab app env missing: set SCHWAB_MARKET_APP_KEY/SECRET and "
-            "SCHWAB_ACCOUNT_APP_KEY/SECRET on the API and worker processes."
-        )
+    env_cfg = _required_platform_schwab_env()
+    market_secret = env_cfg["SCHWAB_MARKET_APP_SECRET"]
+    account_secret = env_cfg["SCHWAB_ACCOUNT_APP_SECRET"]
 
     skill_dir.mkdir(parents=True, exist_ok=True)
     _write_tenant_env(skill_dir)
@@ -173,14 +196,15 @@ def materialize_tenant_skill_dir(db: Session, user_id: str, skill_dir: Path) -> 
     write_encrypted_token_file(skill_dir / "tokens_account.enc", account, account_secret)
 
     market = _market_token_dict(row)
-    platform_dir = (os.getenv("SAAS_PLATFORM_MARKET_SKILL_DIR") or "").strip()
     if market:
         write_encrypted_token_file(skill_dir / "tokens_market.enc", market, market_secret)
-    elif platform_dir:
-        src = Path(platform_dir) / "tokens_market.enc"
-        if not src.is_file():
+    elif _platform_market_skill_dir() is not None:
+        src = _platform_market_token_file()
+        if src is None:
+            base = _platform_market_skill_dir()
+            assert base is not None
             raise RuntimeError(
-                f"SAAS_PLATFORM_MARKET_SKILL_DIR set but tokens_market.enc missing: {src}"
+                f"SAAS_PLATFORM_MARKET_SKILL_DIR set but tokens_market.enc missing: {base / 'tokens_market.enc'}"
             )
         shutil.copy(src, skill_dir / "tokens_market.enc")
     else:

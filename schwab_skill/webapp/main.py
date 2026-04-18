@@ -5,8 +5,10 @@ import json
 import logging
 import os
 import queue
+import secrets
 import threading
 import time
+import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,27 +16,57 @@ from typing import Any
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from starlette.responses import StreamingResponse
 
 from execution import get_account_status, get_position_size_usd, place_order
 from market_data import extract_schwab_last_price, get_current_quote, get_current_quote_with_status
-from schwab_auth import DualSchwabAuth
+from schwab_auth import DualSchwabAuth, write_encrypted_token_file
 from sector_strength import get_sector_heatmap
 from signal_scanner import scan_for_signals_detailed
 
+from ._shared import (
+    build_portfolio_summary as _shared_build_portfolio_summary,
+)
+from ._shared import (
+    manual_jwt_entry_enabled as _manual_jwt_entry_enabled,
+)
+from ._shared import (
+    quote_health_hint as _quote_health_hint,
+)
+from ._shared import (
+    trade_to_dict as _trade_to_dict,
+)
 from .checklist_language import with_plain_language
 from .cors_config import build_allowed_origins
 from .db import DATABASE_URL, Base, SessionLocal, engine
 from .models import AppState, PendingTrade, User
+from .oauth_schwab import exchange_schwab_code_for_tokens, schwab_authorize_url
 from .preset_catalog import PRESET_PROFILES, build_preset_catalog_payload
 from .recovery_map import map_failure as _map_failure
+from .response_helpers import api_err, json_default
+from .route_helpers import (
+    apply_profile_to_runtime as _shared_apply_profile_to_runtime,
+)
+from .route_helpers import (
+    is_loopback_host as _shared_is_loopback_host,
+)
+from .route_helpers import (
+    ok as _shared_ok,
+)
+from .route_helpers import (
+    request_origin as _shared_request_origin,
+)
+from .route_helpers import (
+    resolve_schwab_redirect_uri as _shared_resolve_schwab_redirect_uri,
+)
 from .routes.learning import router as learning_router
 from .routes.research import router as research_router
 from .scan_payload import parse_scan_run_body, scan_runtime_kwargs
 from .schemas import ApiResponse, ApproveTradeRequest, CreatePendingTrade
+from .security_headers import SecurityHeadersMiddleware
 
 LOCAL_DASHBOARD_USER_ID = (os.getenv("WEB_LOCAL_USER_ID", "local") or "local").strip() or "local"
 
@@ -56,6 +88,7 @@ ONBOARDING_TARGET_MINUTES = 20
 DEFAULT_AUTOMATION_OPT_IN = False
 DEFAULT_UI_MODE = "standard"
 DEFAULT_PROFILE = "balanced"
+_LOCAL_OAUTH_STATE_TTL_SEC = 600
 
 
 def _ensure_local_dashboard_user() -> None:
@@ -127,6 +160,8 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-API-Key", "X-User"],
 )
 
+app.add_middleware(SecurityHeadersMiddleware)
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 app.include_router(research_router)
@@ -161,6 +196,8 @@ _scan_job: dict[str, Any] = {
 
 _sse_subscribers: list[queue.Queue] = []
 _sse_subscribers_lock = threading.Lock()
+_local_oauth_states: dict[str, dict[str, Any]] = {}
+_local_oauth_state_lock = threading.Lock()
 
 
 def _sse_publish(event: str, data: dict[str, Any] | None = None) -> None:
@@ -227,14 +264,12 @@ async def metrics_middleware(request: Request, call_next):
     return response
 
 
-def _json_default(value: Any) -> Any:
-    if isinstance(value, datetime):
-        return value.isoformat()
-    return str(value)
-
-
 def _ok(data: Any = None) -> ApiResponse:
-    return ApiResponse(ok=True, data=data)
+    return _shared_ok(data)
+
+
+def _json_default(value: Any) -> Any:
+    return json_default(value)
 
 
 def _err(endpoint: str, exc: Exception) -> ApiResponse:
@@ -246,7 +281,7 @@ def _err(endpoint: str, exc: Exception) -> ApiResponse:
     err_out = headline
     if raw and raw.lower() not in summary.lower():
         err_out = f"{headline} — {raw[:220]}"
-    return ApiResponse(ok=False, error=err_out, data={"recovery": mapped})
+    return api_err(err_out, {"recovery": mapped})
 
 
 def _read_json_file(path: Path, default: Any) -> Any:
@@ -271,10 +306,7 @@ def _load_ui_settings(db: Session) -> dict[str, Any]:
 
 
 def _apply_profile_to_runtime(profile: str) -> dict[str, str]:
-    payload = PRESET_PROFILES.get(profile, PRESET_PROFILES[DEFAULT_PROFILE])
-    for key, value in payload.items():
-        os.environ[key] = value
-    return payload
+    return _shared_apply_profile_to_runtime(profile)
 
 
 def _token_health() -> dict[str, Any]:
@@ -282,6 +314,45 @@ def _token_health() -> dict[str, Any]:
         "market_token_file": TOKENS_MARKET_PATH.exists(),
         "account_token_file": TOKENS_ACCOUNT_PATH.exists(),
     }
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    return _shared_is_loopback_host(hostname)
+
+
+def _request_origin(request: Request) -> str:
+    return _shared_request_origin(request)
+
+
+def _resolve_schwab_redirect_uri(request: Request, *, market: bool) -> str:
+    return _shared_resolve_schwab_redirect_uri(request, market=market)
+
+
+def _new_local_oauth_state(kind: str) -> str:
+    now = int(time.time())
+    token = secrets.token_urlsafe(32)
+    with _local_oauth_state_lock:
+        for key, payload in list(_local_oauth_states.items()):
+            exp = int(payload.get("exp") or 0)
+            if exp < now:
+                _local_oauth_states.pop(key, None)
+        _local_oauth_states[token] = {"k": str(kind or ""), "exp": now + _LOCAL_OAUTH_STATE_TTL_SEC}
+    return token
+
+
+def _consume_local_oauth_state(token: str) -> str | None:
+    if not token:
+        return None
+    now = int(time.time())
+    with _local_oauth_state_lock:
+        payload = _local_oauth_states.pop(token, None)
+    if not isinstance(payload, dict):
+        return None
+    exp = int(payload.get("exp") or 0)
+    kind = str(payload.get("k") or "").strip().lower()
+    if not kind or exp < now:
+        return None
+    return kind
 
 
 def _build_pretrade_checklist(trade: PendingTrade, signal: dict[str, Any]) -> dict[str, Any]:
@@ -324,88 +395,8 @@ def _build_pretrade_checklist(trade: PendingTrade, signal: dict[str, Any]) -> di
     )
 
 
-def _trade_to_dict(row: PendingTrade) -> dict[str, Any]:
-    return {
-        "id": row.id,
-        "ticker": row.ticker,
-        "qty": row.qty,
-        "price": row.price,
-        "status": row.status,
-        "note": row.note,
-        "signal": json.loads(row.signal_json or "{}"),
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
-    }
-
-
-def _quote_health_hint(meta: dict[str, Any], quote_ok: bool) -> str | None:
-    if quote_ok:
-        return None
-    reason = str(meta.get("reason") or "")
-    detail = str(meta.get("error_detail") or "")
-    if reason == "http_error":
-        return (
-            "Schwab returned an error for the market-data quotes request. "
-            "Run `python healthcheck.py` and re-authenticate the market app if it keeps failing."
-        )
-    if reason == "no_matching_symbol_in_response":
-        return (
-            "The quotes response did not contain the probe symbol. "
-            "Confirm the Schwab API is up and your market token has quotes access."
-        )
-    if reason == "last_price_not_parseable":
-        return (
-            "Quote JSON was received but no usable last/mark/close price was found. "
-            "If this persists after a Schwab API update, extend extract_schwab_last_price in market_data.py."
-        )
-    if "circuit" in detail.lower() or reason == "RuntimeError":
-        return (
-            "Repeated connection failures may have opened the Schwab circuit breaker. "
-            "Wait a minute, check network/DNS, then retry."
-        )
-    if reason:
-        return f"Quote check failed ({reason}). See trading_bot.log for details."
-    return "Quote check failed for an unknown reason. See trading_bot.log for details."
-
-
 def _build_portfolio_summary(account_status: dict[str, Any]) -> dict[str, Any]:
-    accounts = account_status.get("accounts", [])
-    positions: list[dict[str, Any]] = []
-    total_value = 0.0
-
-    for acc in accounts:
-        sec = acc.get("securitiesAccount", acc)
-        for pos in sec.get("positions", []):
-            inst = pos.get("instrument", {})
-            sym = inst.get("symbol", "?")
-            qty = pos.get("longQuantity", 0) or pos.get("shortQuantity", 0) or 0
-            if not qty:
-                continue
-            mkt_val = float(pos.get("marketValue", 0) or 0)
-            day_pl = float(pos.get("currentDayProfitLoss", 0) or 0)
-            avg_cost = float(pos.get("averagePrice", 0) or 0)
-            last = (mkt_val / qty) if qty else 0.0
-            pl_pct = ((last - avg_cost) / avg_cost * 100.0) if avg_cost else 0.0
-            total_value += mkt_val
-            positions.append(
-                {
-                    "symbol": sym,
-                    "qty": int(qty),
-                    "market_value": round(mkt_val, 2),
-                    "day_pl": round(day_pl, 2),
-                    "avg_cost": round(avg_cost, 4),
-                    "last": round(last, 4),
-                    "pl_pct": round(pl_pct, 2),
-                }
-            )
-
-    positions.sort(key=lambda row: abs(float(row.get("market_value", 0))), reverse=True)
-    return {
-        "account_count": len(accounts),
-        "positions_count": len(positions),
-        "total_market_value": round(total_value, 2),
-        "positions": positions,
-    }
+    return _shared_build_portfolio_summary(account_status)
 
 
 def _scan_snapshot() -> dict[str, Any]:
@@ -853,6 +844,15 @@ def health() -> ApiResponse:
     })
 
 
+@app.get("/healthz", response_class=PlainTextResponse, include_in_schema=False)
+def healthz_plaintext() -> PlainTextResponse:
+    """Tiny plaintext liveness probe for uptime monitors and Render health checks.
+
+    Intentionally allocation-free and unauthenticated.
+    """
+    return PlainTextResponse("ok", media_type="text/plain")
+
+
 @app.get("/api/events")
 async def sse_events(
     _auth: dict[str, str] = Depends(require_api_key_if_set),
@@ -902,13 +902,22 @@ def public_config() -> ApiResponse:
         "yes",
         "on",
     )
+    schwab_oauth = bool(
+        (os.getenv("SCHWAB_ACCOUNT_APP_KEY") or "").strip()
+        and (os.getenv("SCHWAB_ACCOUNT_APP_SECRET") or "").strip()
+    )
+    schwab_market_oauth = bool(
+        (os.getenv("SCHWAB_MARKET_APP_KEY") or "").strip()
+        and (os.getenv("SCHWAB_MARKET_APP_SECRET") or "").strip()
+    )
     data: dict[str, Any] = {
         "supabase": supabase,
         "saas_mode": False,
         "scan_transport": "local_thread",
         "sse_enabled": True,
-        "schwab_oauth": False,
-        "manual_jwt_entry_enabled": True,
+        "schwab_oauth": schwab_oauth,
+        "schwab_market_oauth": schwab_market_oauth,
+        "manual_jwt_entry_enabled": _manual_jwt_entry_enabled(default=True),
         "platform_live_trading_kill_switch": plat_kill,
         "api_key_required": bool(os.getenv("WEB_API_KEY", "").strip()),
     }
@@ -916,6 +925,105 @@ def public_config() -> ApiResponse:
     if impl.startswith(("http://", "https://")):
         data["implementation_guide_url"] = impl
     return _ok(data)
+
+
+@app.get("/api/oauth/schwab/authorize-url", response_model=ApiResponse)
+def local_schwab_authorize_url(request: Request) -> ApiResponse:
+    client_id = (os.getenv("SCHWAB_ACCOUNT_APP_KEY") or "").strip()
+    if not client_id:
+        raise HTTPException(status_code=503, detail="Configure SCHWAB_ACCOUNT_APP_KEY for OAuth.")
+    redirect_uri = _resolve_schwab_redirect_uri(request, market=False)
+    state = _new_local_oauth_state("account")
+    url = schwab_authorize_url(client_id, redirect_uri, state)
+    return _ok({"url": url, "state": state})
+
+
+@app.get("/api/oauth/schwab/market/authorize-url", response_model=ApiResponse)
+def local_schwab_market_authorize_url(request: Request) -> ApiResponse:
+    client_id = (os.getenv("SCHWAB_MARKET_APP_KEY") or "").strip()
+    if not client_id:
+        raise HTTPException(status_code=503, detail="Configure SCHWAB_MARKET_APP_KEY for market OAuth.")
+    redirect_uri = _resolve_schwab_redirect_uri(request, market=True)
+    state = _new_local_oauth_state("market")
+    url = schwab_authorize_url(client_id, redirect_uri, state)
+    return _ok({"url": url, "state": state})
+
+
+@app.get("/api/oauth/schwab/callback")
+def local_schwab_oauth_callback(
+    request: Request,
+    code: str = "",
+    state: str = "",
+    error: str = "",
+):
+    def red(qs: str) -> RedirectResponse:
+        return RedirectResponse(f"/?{qs}", status_code=302)
+
+    if error:
+        return red(f"schwab_oauth=error&message={urllib.parse.quote(error)}")
+    kind = _consume_local_oauth_state(state)
+    if kind != "account" or not code.strip():
+        return red("schwab_oauth=error&message=" + urllib.parse.quote("invalid_or_expired_state"))
+
+    client_id = (os.getenv("SCHWAB_ACCOUNT_APP_KEY") or "").strip()
+    client_secret = (os.getenv("SCHWAB_ACCOUNT_APP_SECRET") or "").strip()
+    redirect_uri = _resolve_schwab_redirect_uri(request, market=False)
+    if not client_id or not client_secret:
+        return red("schwab_oauth=error&message=" + urllib.parse.quote("server_oauth_not_configured"))
+    try:
+        tok = exchange_schwab_code_for_tokens(client_id, client_secret, code, redirect_uri)
+    except Exception as e:
+        return red("schwab_oauth=error&message=" + urllib.parse.quote(str(e)[:180]))
+    access = str(tok.get("access_token") or "").strip()
+    refresh = str(tok.get("refresh_token") or "").strip()
+    if not access or not refresh:
+        return red("schwab_oauth=error&message=" + urllib.parse.quote("token_response_missing_tokens"))
+    write_encrypted_token_file(TOKENS_ACCOUNT_PATH, tok, client_secret)
+    _audit_event("oauth_schwab_account_callback", "local-dashboard", {"saved": "tokens_account.enc"})
+    return red("schwab_oauth=ok")
+
+
+@app.get("/api/oauth/schwab/market/callback")
+def local_schwab_market_oauth_callback(
+    request: Request,
+    code: str = "",
+    state: str = "",
+    error: str = "",
+):
+    def red(qs: str) -> RedirectResponse:
+        return RedirectResponse(f"/?{qs}", status_code=302)
+
+    if error:
+        return red(f"schwab_market_oauth=error&message={urllib.parse.quote(error)}")
+    kind = _consume_local_oauth_state(state)
+    if kind != "market" or not code.strip():
+        return red(
+            "schwab_market_oauth=error&message="
+            + urllib.parse.quote("invalid_or_expired_state")
+        )
+
+    client_id = (os.getenv("SCHWAB_MARKET_APP_KEY") or "").strip()
+    client_secret = (os.getenv("SCHWAB_MARKET_APP_SECRET") or "").strip()
+    redirect_uri = _resolve_schwab_redirect_uri(request, market=True)
+    if not client_id or not client_secret:
+        return red(
+            "schwab_market_oauth=error&message="
+            + urllib.parse.quote("server_market_oauth_not_configured")
+        )
+    try:
+        tok = exchange_schwab_code_for_tokens(client_id, client_secret, code, redirect_uri)
+    except Exception as e:
+        return red("schwab_market_oauth=error&message=" + urllib.parse.quote(str(e)[:180]))
+    access = str(tok.get("access_token") or "").strip()
+    refresh = str(tok.get("refresh_token") or "").strip()
+    if not access or not refresh:
+        return red(
+            "schwab_market_oauth=error&message="
+            + urllib.parse.quote("token_response_missing_tokens")
+        )
+    write_encrypted_token_file(TOKENS_MARKET_PATH, tok, client_secret)
+    _audit_event("oauth_schwab_market_callback", "local-dashboard", {"saved": "tokens_market.enc"})
+    return red("schwab_market_oauth=ok")
 
 
 @app.get("/api/health/deep", response_model=ApiResponse)
@@ -1296,6 +1404,12 @@ def create_pending_trade(
                 price=last_price if last_price > 0 else None,
                 skill_dir=SKILL_DIR,
             )
+            try:
+                pm_mult = float(signal.get("prediction_market_size_multiplier") or 1.0)
+            except (TypeError, ValueError):
+                pm_mult = 1.0
+            pm_mult = max(0.85, min(1.15, pm_mult))
+            usd_size = int(round(float(usd_size) * pm_mult))
             qty = max(1, int(usd_size / last_price)) if last_price > 0 else 1
 
         trade_id = uuid.uuid4().hex[:8]

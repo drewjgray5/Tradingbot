@@ -18,10 +18,17 @@
         <p class="eyebrow">Setup</p>
         <h1>Connect your Schwab account</h1>
         <p class="muted">
-          Short steps to link this app to Charles Schwab. You do <strong>not</strong> need a Schwab developer account—your
-          host already registered the app. <a href="/">Back to dashboard</a>
+          Short steps to link this app to Charles Schwab using the Schwab Developer OAuth flow. If you self-host, create and
+          configure your app in <a href="https://developer.schwab.com" target="_blank" rel="noopener">Schwab Developer Portal</a>
+          first. <a href="/">Back to dashboard</a>
           ·
           <a href="/static/legal.html">Legal &amp; risk disclosures</a>
+        </p>
+        <p style="margin-top:12px;">
+          <a class="btn primary" href="/?section=connect">Open the in-app wizard →</a>
+          <span class="muted small" style="margin-left:8px;">
+            Already signed in? The wizard guides you step-by-step and shows live progress.
+          </span>
         </p>
       </header>
 
@@ -29,6 +36,7 @@
         <h2>Before you start</h2>
         <ul class="legal-list">
           <li>Sign in to <strong>this</strong> site first (email/password or the sign-in method your host uses).</li>
+          <li>If you run your own instance, register callback URLs in Schwab Developer Portal before you click Connect.</li>
           <li>Use the same Schwab login you use for brokerage (or paper trading, if that is what you use with this app).</li>
           <li>Allow pop-ups or redirects for this site if your browser blocks them—you will briefly leave this page to approve access on Schwab.</li>
         </ul>
@@ -42,18 +50,16 @@
         <h2>What to do (about two minutes)</h2>
         <ol class="legal-list">
           <li>
-            Open the dashboard <strong>Setup</strong> section (<a href="/#onboardingSection">direct link</a>).
+            Open the in-app wizard: <a href="/?section=connect"><strong>Connect Schwab &amp; setup</strong></a>.
+            The wizard shows a 5-step progress bar and highlights whichever step you’re on.
           </li>
           <li>
-            Click <strong>Connect Schwab (account)</strong>. Sign in at Schwab and approve. You should land back on this site with a
-            success message.
+            Click the big <strong>Next step</strong> button. The first two steps redirect you to Schwab to approve
+            <em>account</em> access and <em>market data</em> access in turn.
           </li>
           <li>
-            Click <strong>Connect Schwab (market)</strong> and complete the second approval the same way.
-          </li>
-          <li>
-            Optional: click <strong>Start Wizard</strong>, then run steps 1–4 to confirm tokens, try a scan, and a paper test (if your
-            plan includes those checks).
+            Steps 3–5 (verify tokens, test scan, paper order) run inline — just keep clicking <strong>Next step</strong>
+            until the bar turns green.
           </li>
         </ol>
 

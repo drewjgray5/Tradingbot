@@ -14,7 +14,10 @@
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/static/styles.css" />
-    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"
+            integrity="sha384-JZigAjwiaZtkUbA44CWkPaT3iBb/mU5pO6QOANp+OqHd4q+1+7MG1kzp2OOP9ZfP"
+            crossorigin="anonymous"
+            referrerpolicy="no-referrer"></script>
   </head>
   <body>
     <a class="skip-link" href="#mainContent">Skip to main content</a>
@@ -444,30 +447,76 @@
             <h2>Connect Schwab &amp; setup</h2>
             <small id="onboardingMeta" class="muted">Target completion: under 20 minutes</small>
           </div>
-          <div class="onboarding-user-hint muted">
-            <p>
-              <strong>Link your brokerage in two steps.</strong> Schwab asks you to approve separately for
-              <em>trading</em> (account) and for <em>market data</em> (quotes). Use both buttons below, then optional checks.
+
+          <ol id="onboardingStepper" class="onboarding-stepper" aria-label="Schwab setup progress">
+            <li data-step="account"><span class="step-num">1</span><span class="step-label">Connect account</span><span class="step-state muted">pending</span></li>
+            <li data-step="market"><span class="step-num">2</span><span class="step-label">Connect market data</span><span class="step-state muted">pending</span></li>
+            <li data-step="verify_token_health"><span class="step-num">3</span><span class="step-label">Verify tokens</span><span class="step-state muted">pending</span></li>
+            <li data-step="test_scan"><span class="step-num">4</span><span class="step-label">Test scan</span><span class="step-state muted">pending</span></li>
+            <li data-step="test_paper_order"><span class="step-num">5</span><span class="step-label">Paper order</span><span class="step-state muted">pending</span></li>
+          </ol>
+
+          <div id="onboardingNextRow" class="onboarding-next-row">
+            <div class="onboarding-next-copy">
+              <p class="onboarding-next-title" id="onboardingNextTitle">Pick up where you left off</p>
+              <p class="onboarding-next-desc muted" id="onboardingNextDesc">Loading status…</p>
+            </div>
+            <div class="onboarding-next-actions">
+              <button id="onboardingNextBtn" class="btn primary" type="button" disabled>Next step</button>
+              <button id="onboardingStartBtn" class="btn secondary small" type="button" title="Start (or restart) the timed setup wizard">Restart wizard</button>
+            </div>
+          </div>
+
+          <details class="onboarding-help" id="onboardingHelp">
+            <summary>Help &amp; FAQ</summary>
+            <div class="onboarding-help-body">
+              <h3>Why two “Connect” buttons?</h3>
+              <p class="muted">
+                Schwab splits API access between <strong>market data</strong> (quotes, history) and your
+                <strong>brokerage account</strong> (balances, positions, orders). This app needs both — that’s why
+                steps 1 and 2 each require a separate Schwab approval.
+              </p>
+              <h3>Before you start</h3>
+              <ul class="onboarding-help-list muted">
+                <li>Sign in to <strong>this</strong> site first.</li>
+                <li>Allow pop-ups / redirects — you’ll briefly leave to approve on Schwab.</li>
+                <li>Use the same Schwab login you use for brokerage (or paper trading).</li>
+              </ul>
+              <h3>If something fails</h3>
+              <ul class="onboarding-help-list muted">
+                <li>Try the failing step again after a full page refresh.</li>
+                <li>Confirm both <em>account</em> and <em>market</em> approvals completed.</li>
+                <li>Check for an error banner after returning from Schwab; copy the message if you contact support.</li>
+              </ul>
+              <p class="muted small">
+                Need the public-facing setup write-up?
+                <a href="/static/connect-schwab-guide.html" target="_blank" rel="noopener noreferrer">Open setup guide ↗</a>
+                ·
+                <a id="implementationGuideLink" class="hidden" href="#" target="_blank" rel="noopener noreferrer">Hosting-provider guide</a>
+              </p>
+            </div>
+          </details>
+
+          <details class="onboarding-advanced">
+            <summary>All steps (advanced)</summary>
+            <div class="inline-form onboarding-connect-row">
+              <button id="onboardingSchwabBtn" class="btn primary small" type="button">Connect Schwab (account)</button>
+              <button id="onboardingSchwabMarketBtn" class="btn primary small" type="button">Connect Schwab (market)</button>
+              <button id="onboardingConnectBtn" class="btn small secondary" title="Records that your Schwab account session is linked">
+                1) Confirm link
+              </button>
+              <button id="onboardingVerifyBtn" class="btn small secondary">2) Verify token health</button>
+              <button id="onboardingScanBtn" class="btn small secondary">3) Test scan</button>
+              <button id="onboardingPaperBtn" class="btn small secondary">4) Test paper order</button>
+            </div>
+            <p class="muted small">
+              Direct OAuth links:
+              <a id="onboardingSchwabLink" href="#">Account</a>
+              ·
+              <a id="onboardingSchwabMarketLink" href="#">Market</a>
             </p>
-          </div>
-          <div class="inline-form onboarding-connect-row">
-            <button id="onboardingSchwabBtn" class="btn primary small" type="button">Connect Schwab (account)</button>
-            <button id="onboardingSchwabMarketBtn" class="btn primary small" type="button">Connect Schwab (market)</button>
-            <a
-              id="implementationGuideLink"
-              class="btn secondary small hidden"
-              href="#"
-              target="_blank"
-              rel="noopener noreferrer"
-              >Schwab setup guide</a>
-            <button id="onboardingStartBtn" class="btn secondary">Start Wizard</button>
-            <button id="onboardingConnectBtn" class="btn small secondary" title="Records that your Schwab account session is linked">
-              1) Confirm link
-            </button>
-            <button id="onboardingVerifyBtn" class="btn small secondary">2) Verify token health</button>
-            <button id="onboardingScanBtn" class="btn small secondary">3) Test scan</button>
-            <button id="onboardingPaperBtn" class="btn small secondary">4) Test paper order</button>
-          </div>
+          </details>
+
           <div id="onboardingOutputHost" class="tool-output-host tool-output-padded">
             <div id="onboardingCards" aria-live="polite">
               <p class="muted">Run the wizard or click individual steps above.</p>
@@ -539,45 +588,36 @@
         <article id="decisionSection" class="card">
           <div class="section-title">
             <h2>Single Trade Decision Card</h2>
-            <small class="muted">Take/Pass decision support in under 30 seconds.</small>
+            <small class="muted">Take/Pass support in under 30 seconds — opens the trade drawer.</small>
           </div>
-          <div class="inline-form">
+          <div class="inline-form trade-drawer-launcher">
             <label class="field-label" for="decisionTickerInput">Ticker</label>
-            <input id="decisionTickerInput" placeholder="AAPL" />
-            <button id="decisionBtn" class="btn secondary">Load Decision Card</button>
+            <input id="decisionTickerInput" placeholder="AAPL" autocomplete="off" />
+            <button id="decisionBtn" class="btn primary" type="button">Open decision card →</button>
           </div>
-          <div id="decisionOutputHost" class="tool-output-host">
-            <p id="decisionPlaceholder" class="muted tool-output-placeholder">Run a scan, then load a ticker decision card.</p>
-            <div id="decisionSummary" class="tool-summary-card hidden" aria-live="polite"></div>
-            <details id="decisionJsonDetails" class="tool-json-details hidden">
-              <summary>Technical details</summary>
-              <pre id="decisionOutput" class="code-block"></pre>
-            </details>
-          </div>
+          <p class="muted small">
+            The decision card now lives in the slide-in <strong>Trade Drawer</strong> alongside Recovery,
+            so any "look at this trade" entry point uses the same UI.
+          </p>
         </article>
         <article id="recoverySection" class="card">
           <div class="section-title">
             <h2>Failure Recovery</h2>
             <small class="muted">Plain-language next steps for auth/data/order errors.</small>
           </div>
-          <div class="inline-form">
+          <div class="inline-form trade-drawer-launcher">
             <label class="field-label" for="recoverySource">Source</label>
             <select id="recoverySource">
               <option value="schwab_auth">schwab_auth</option>
               <option value="market_data">market_data</option>
               <option value="execution">execution</option>
             </select>
-            <input id="recoveryMessage" placeholder="Paste an error message..." />
-            <button id="recoveryBtn" class="btn secondary">Fix It Path</button>
+            <input id="recoveryMessage" placeholder="Paste an error message…" autocomplete="off" />
+            <button id="recoveryBtn" class="btn primary" type="button">Open fix path →</button>
           </div>
-          <div id="recoveryOutputHost" class="tool-output-host">
-            <p id="recoveryPlaceholder" class="muted tool-output-placeholder">Paste an error to map recovery steps.</p>
-            <div id="recoverySummary" class="tool-summary-card hidden" aria-live="polite"></div>
-            <details id="recoveryJsonDetails" class="tool-json-details hidden">
-              <summary>Technical details</summary>
-              <pre id="recoveryOutput" class="code-block"></pre>
-            </details>
-          </div>
+          <p class="muted small">
+            Recovery mapping shares the slide-in <strong>Trade Drawer</strong> with the decision card.
+          </p>
         </article>
       </section>
 
@@ -997,17 +1037,55 @@
       </footer>
     </main>
 
-    <aside id="quickViewPanel" class="quick-view-panel" aria-label="Quick decision panel">
-      <div class="quick-view-header">
-        <h3>Decision Quick View</h3>
-        <button id="closeQuickViewBtn" class="btn small secondary" type="button">Close</button>
+    <div id="tradeDrawerBackdrop" class="trade-drawer-backdrop" hidden></div>
+    <aside id="tradeDrawer" class="trade-drawer" aria-label="Trade decision drawer" hidden>
+      <div class="trade-drawer-header">
+        <h3 id="tradeDrawerTitle">Trade Drawer</h3>
+        <button id="tradeDrawerCloseBtn" class="btn small secondary" type="button" aria-label="Close trade drawer">Close</button>
       </div>
-      <div id="quickViewSummary" class="tool-summary-card hidden" aria-live="polite"></div>
-      <details id="quickViewJsonDetails" class="tool-json-details hidden">
-        <summary>Raw data</summary>
-        <pre id="quickViewOutput" class="code-block"></pre>
-      </details>
-      <p id="quickViewPlaceholder" class="muted tool-output-placeholder">Select Quick View on a task card to preview decision details.</p>
+      <div class="trade-drawer-tabs" role="tablist" aria-label="Trade drawer tabs">
+        <button id="tradeDrawerTabDecision" class="trade-drawer-tab active" role="tab" aria-selected="true" type="button">
+          Decision
+        </button>
+        <button id="tradeDrawerTabRecovery" class="trade-drawer-tab" role="tab" aria-selected="false" tabindex="-1" type="button">
+          Recovery
+        </button>
+      </div>
+      <div id="tradeDrawerPanelDecision" class="trade-drawer-panel" role="tabpanel" aria-labelledby="tradeDrawerTabDecision">
+        <div class="inline-form">
+          <label class="field-label" for="tradeDrawerDecisionTicker">Ticker</label>
+          <input id="tradeDrawerDecisionTicker" placeholder="AAPL" autocomplete="off" />
+          <button id="tradeDrawerDecisionBtn" class="btn primary small" type="button">Load</button>
+        </div>
+        <p id="tradeDrawerDecisionPlaceholder" class="muted tool-output-placeholder">
+          Pick a ticker (or click Quick View on a pending trade) to load a decision card.
+        </p>
+        <div id="tradeDrawerDecisionSummary" class="tool-summary-card hidden" aria-live="polite"></div>
+        <details id="tradeDrawerDecisionJsonDetails" class="tool-json-details hidden">
+          <summary>Raw data</summary>
+          <pre id="tradeDrawerDecisionOutput" class="code-block"></pre>
+        </details>
+      </div>
+      <div id="tradeDrawerPanelRecovery" class="trade-drawer-panel hidden" role="tabpanel" aria-labelledby="tradeDrawerTabRecovery">
+        <div class="inline-form">
+          <label class="field-label" for="tradeDrawerRecoverySource">Source</label>
+          <select id="tradeDrawerRecoverySource">
+            <option value="schwab_auth">schwab_auth</option>
+            <option value="market_data">market_data</option>
+            <option value="execution">execution</option>
+          </select>
+          <input id="tradeDrawerRecoveryMessage" placeholder="Paste an error message…" autocomplete="off" />
+          <button id="tradeDrawerRecoveryBtn" class="btn primary small" type="button">Map fix</button>
+        </div>
+        <p id="tradeDrawerRecoveryPlaceholder" class="muted tool-output-placeholder">
+          Paste an auth, data, or execution error to get a guided fix path.
+        </p>
+        <div id="tradeDrawerRecoverySummary" class="tool-summary-card hidden" aria-live="polite"></div>
+        <details id="tradeDrawerRecoveryJsonDetails" class="tool-json-details hidden">
+          <summary>Raw data</summary>
+          <pre id="tradeDrawerRecoveryOutput" class="code-block"></pre>
+        </details>
+      </div>
     </aside>
 
     <section id="activityDrawer" class="activity-drawer">
@@ -1080,7 +1158,7 @@
     </div>
 
     <script src="/static/auth-jwt-utils.js"></script>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js" type="module"></script>
   </body>
 </html>
 

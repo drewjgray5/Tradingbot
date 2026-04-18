@@ -3,6 +3,7 @@ Market data pipeline using Market Session (Schwab OHLCV) with yfinance fallback.
 
 Fetches daily historical data with exponential backoff on HTTP 429.
 When PREFER_SCHWAB_DATA=true (default), logs warning when yfinance fallback is used.
+Set SCHWAB_ONLY_DATA=true to disable all non-Schwab fallbacks.
 """
 
 import logging
@@ -32,6 +33,11 @@ SKILL_DIR = Path(__file__).resolve().parent
 
 def _empty_ohlcv() -> pd.DataFrame:
     return pd.DataFrame(columns=OHLCV_COLUMNS).rename_axis("date")
+
+
+def _schwab_only_data() -> bool:
+    raw = (os.getenv("SCHWAB_ONLY_DATA") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _get_headers(access_token: str) -> dict:
@@ -117,22 +123,44 @@ def _get_polygon_quote_fallback(ticker: str) -> tuple[dict | None, dict[str, Any
         return None, meta
 
 
+def _maybe_polygon_quote_fallback(ticker: str) -> tuple[dict | None, dict[str, Any]]:
+    if _schwab_only_data():
+        return None, {"provider": "schwab", "reason": "schwab_only_data_mode"}
+    return _get_polygon_quote_fallback(ticker)
+
+
 def _get_daily_history_yfinance(ticker: str, days: int) -> pd.DataFrame:
     """Fallback when Schwab fails (401, etc.). Returns same format as get_daily_history."""
+    df, _reason = _get_daily_history_yfinance_with_reason(ticker, days)
+    return df
+
+
+def _get_daily_history_yfinance_with_reason(ticker: str, days: int) -> tuple[pd.DataFrame, str]:
+    """Like _get_daily_history_yfinance, but returns explicit reason for empty/missing output."""
     try:
         import yfinance as yf
         t = yf.Ticker(ticker.upper())
         period = "2y" if days > 365 else "1y"
-        df = t.history(period=period, auto_adjust=True)
-        if df.empty or len(df) < 2:
-            return _empty_ohlcv()
+        raw = t.history(period=period, auto_adjust=True)
+        if raw is None:
+            return _empty_ohlcv(), "yfinance_history_none"
+        if not isinstance(raw, pd.DataFrame):
+            return _empty_ohlcv(), "yfinance_history_invalid_type"
+        if raw.empty:
+            return _empty_ohlcv(), "yfinance_history_empty"
+        if len(raw) < 2:
+            return _empty_ohlcv(), "yfinance_history_too_short"
+        df = raw
         df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
         df = df[OHLCV_COLUMNS].sort_index().drop_duplicates()
-        df.index = df.index.tz_localize(None).normalize()
+        idx = pd.to_datetime(df.index)
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_localize(None)
+        df.index = idx.normalize()
         df.index.name = "date"
-        return df
-    except Exception:
-        return _empty_ohlcv()
+        return df, "yfinance_ok"
+    except Exception as exc:
+        return _empty_ohlcv(), f"yfinance_exception:{type(exc).__name__}"
 
 
 def get_daily_history_with_meta(
@@ -196,9 +224,15 @@ def get_daily_history_with_meta(
         meta["rows"] = int(len(out))
         return out, meta
     except Exception as e:
+        meta["fallback_reason"] = f"{type(e).__name__}"
+        if _schwab_only_data():
+            LOG.warning("Schwab data failed for %s (%s); SCHWAB_ONLY_DATA enabled, no fallback", ticker, e)
+            meta["provider"] = "schwab"
+            meta["used_fallback"] = False
+            meta["rows"] = 0
+            return _empty_ohlcv(), meta
         meta["provider"] = "yfinance"
         meta["used_fallback"] = True
-        meta["fallback_reason"] = f"{type(e).__name__}"
         # If the circuit breaker is unstable, we'll very likely hit this path.
         # Keep the fallback behavior safe and non-crashing.
         try:
@@ -207,8 +241,9 @@ def get_daily_history_with_meta(
                 LOG.warning("Schwab data failed for %s (%s), using yfinance fallback", ticker, e)
         except ImportError:
             pass
-        out = _get_daily_history_yfinance(ticker, days)
+        out, yf_reason = _get_daily_history_yfinance_with_reason(ticker, days)
         meta["rows"] = int(len(out))
+        meta["fallback_reason"] = f"{meta['fallback_reason']}|{yf_reason}"
         return out, meta
 
 
@@ -324,7 +359,7 @@ def get_current_quote_with_status(
                 ticker_u,
                 meta["error_detail"],
             )
-            fallback_quote, fallback_meta = _get_polygon_quote_fallback(ticker_u)
+            fallback_quote, fallback_meta = _maybe_polygon_quote_fallback(ticker_u)
             if fallback_quote is not None:
                 meta["fallback_provider"] = fallback_meta.get("provider")
                 meta["reason"] = "schwab_fallback_polygon"
@@ -339,7 +374,7 @@ def get_current_quote_with_status(
         quote = _select_schwab_quote_payload(data, ticker_u)
         if quote is None:
             meta["reason"] = "no_matching_symbol_in_response"
-            fallback_quote, fallback_meta = _get_polygon_quote_fallback(ticker_u)
+            fallback_quote, fallback_meta = _maybe_polygon_quote_fallback(ticker_u)
             if fallback_quote is not None:
                 meta["fallback_provider"] = fallback_meta.get("provider")
                 meta["reason"] = "schwab_fallback_polygon"
@@ -352,7 +387,7 @@ def get_current_quote_with_status(
         price = extract_schwab_last_price(quote)
         if price is None:
             meta["reason"] = "last_price_not_parseable"
-            fallback_quote, fallback_meta = _get_polygon_quote_fallback(ticker_u)
+            fallback_quote, fallback_meta = _maybe_polygon_quote_fallback(ticker_u)
             if fallback_quote is not None:
                 meta["fallback_provider"] = fallback_meta.get("provider")
                 meta["reason"] = "schwab_fallback_polygon"
@@ -367,7 +402,7 @@ def get_current_quote_with_status(
         meta["reason"] = type(e).__name__
         meta["error_detail"] = str(e)[:400]
         LOG.warning("get_current_quote failed for %s: %s", ticker_u, e)
-    fallback_quote, fallback_meta = _get_polygon_quote_fallback(ticker_u)
+    fallback_quote, fallback_meta = _maybe_polygon_quote_fallback(ticker_u)
     if fallback_quote is not None:
         meta["fallback_provider"] = fallback_meta.get("provider")
         meta["reason"] = "schwab_fallback_polygon"

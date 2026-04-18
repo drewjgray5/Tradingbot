@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from execution import get_account_status
 
+from ._shared import manual_jwt_entry_enabled as _shared_manual_jwt
 from .audit import log_audit
 from .backtest_queue import create_and_queue_backtest
 from .billing_stripe import (
@@ -38,6 +39,16 @@ from .db import DATABASE_URL, Base, SessionLocal, engine
 from .models import AppState, BacktestRun, Order, Position, ScanResult, User, UserCredential
 from .prometheus_metrics import render_prometheus_text
 from .redaction import safe_exception_message
+from .response_helpers import json_default
+from .route_helpers import (
+    ok as _shared_ok,
+)
+from .route_helpers import (
+    request_id as _shared_request_id,
+)
+from .route_helpers import (
+    simple_err as _shared_simple_err,
+)
 from .saas_redis import acquire_scan_cooldown, fixed_window_rate_limit, redis_ping
 from .scan_payload import parse_scan_run_body
 from .schemas import (
@@ -60,6 +71,7 @@ from .security import (
     require_paid_entitlement,
     utcnow_iso,
 )
+from .security_headers import SecurityHeadersMiddleware
 from .strategy_chat import run_strategy_chat
 from .tasks import celery_app, scan_for_user
 from .tenant_dashboard import _tenant_api_health_snapshot
@@ -126,6 +138,8 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-Request-ID", "Idempotency-Key"],
 )
 
+app.add_middleware(SecurityHeadersMiddleware)
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 app.include_router(tenant_dashboard_router)
@@ -165,15 +179,15 @@ async def request_id_middleware(request: Request, call_next: Any) -> Any:
 
 
 def _request_id(request: Request) -> str | None:
-    return getattr(request.state, "request_id", None)
+    return _shared_request_id(request)
 
 
 def _ok(data: Any = None) -> ApiResponse:
-    return ApiResponse(ok=True, data=data)
+    return _shared_ok(data)
 
 
 def _err(message: str, data: Any = None) -> ApiResponse:
-    return ApiResponse(ok=False, error=message, data=data)
+    return _shared_simple_err(message, data)
 
 
 def _db() -> Session:
@@ -233,9 +247,7 @@ def _clear_auth_session_cookie(response: Response) -> None:
 
 
 def _json_default(value: Any) -> Any:
-    if isinstance(value, datetime):
-        return value.isoformat()
-    return str(value)
+    return json_default(value)
 
 
 def _save_state(db: Session, user_id: str, key: str, payload: dict[str, Any]) -> None:
@@ -485,7 +497,7 @@ def public_config() -> ApiResponse:
         "saas_mode": True,
         "scan_transport": "celery",
         "sse_enabled": False,
-        "manual_jwt_entry_enabled": False,
+        "manual_jwt_entry_enabled": _shared_manual_jwt(default=False),
         "platform_live_trading_kill_switch": plat_kill,
         # Helps hosted dashboards explain “works locally, not on Render” without exposing secrets.
         "auth_setup": {
@@ -573,6 +585,12 @@ def auth_session_status(
 @app.get("/api/health/live", response_model=ApiResponse)
 def health_live() -> ApiResponse:
     return _ok({"status": "live", "time": datetime.now(timezone.utc).isoformat()})
+
+
+@app.get("/healthz", response_class=PlainTextResponse, include_in_schema=False)
+def healthz_plaintext() -> PlainTextResponse:
+    """Tiny plaintext liveness probe for uptime monitors and Render health checks."""
+    return PlainTextResponse("ok", media_type="text/plain")
 
 
 @app.get("/api/health/ready", response_model=ApiResponse)
@@ -881,64 +899,72 @@ def credential_status(user: User = Depends(get_current_user), db: Session = Depe
 @app.get("/api/onboarding/status", response_model=ApiResponse)
 def onboarding_status(user: User = Depends(get_current_user), db: Session = Depends(_db)) -> ApiResponse:
     """Match local `main.py` onboarding payload shape: steps/start/elapsed at top level (not only under `wizard`)."""
-    linked = _is_schwab_linked(db, user.id)
-    api_health = _tenant_api_health_snapshot(db, user.id)
-    target_mins = 20
-    wizard_default: dict[str, Any] = {
-        "started_at": None,
-        "target_minutes": target_mins,
-        "steps": {
-            "connect": {"ok": False},
-            "verify_token_health": {"ok": False},
-            "test_scan": {"ok": False},
-            "test_paper_order": {"ok": False},
-        },
-    }
-    wizard = _load_state(db, user.id, "onboarding_wizard", default=copy.deepcopy(wizard_default))
-    if not isinstance(wizard.get("steps"), dict):
-        wizard["steps"] = dict(wizard_default["steps"])
-    meta = _load_state(
-        db,
-        user.id,
-        "onboarding",
-        default={
-            "linked_at": None,
+    try:
+        linked = _is_schwab_linked(db, user.id)
+        api_health = _tenant_api_health_snapshot(db, user.id)
+        target_mins = 20
+        wizard_default: dict[str, Any] = {
+            "started_at": None,
+            "target_minutes": target_mins,
+            "steps": {
+                "connect": {"ok": False},
+                "verify_token_health": {"ok": False},
+                "test_scan": {"ok": False},
+                "test_paper_order": {"ok": False},
+            },
+        }
+        wizard = _load_state(db, user.id, "onboarding_wizard", default=copy.deepcopy(wizard_default))
+        if not isinstance(wizard.get("steps"), dict):
+            wizard["steps"] = dict(wizard_default["steps"])
+        meta = _load_state(
+            db,
+            user.id,
+            "onboarding",
+            default={
+                "linked_at": None,
+                "schwab_linked": linked,
+                "wizard_required": not linked,
+            },
+        )
+        started_at = wizard.get("started_at")
+        elapsed_minutes = None
+        if isinstance(started_at, str) and started_at:
+            try:
+                dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                elapsed_minutes = round((datetime.now(timezone.utc) - dt).total_seconds() / 60.0, 1)
+            except Exception:
+                elapsed_minutes = None
+        _wsteps = wizard.get("steps")
+        steps: dict[str, Any] = _wsteps if isinstance(_wsteps, dict) else {}
+        completion = (
+            bool((steps.get("connect") or {}).get("ok"))
+            and bool((steps.get("verify_token_health") or {}).get("ok"))
+            and bool((steps.get("test_scan") or {}).get("ok"))
+            and bool((steps.get("test_paper_order") or {}).get("ok"))
+        )
+        tm = int(wizard.get("target_minutes") or target_mins)
+        completed_under_target = bool(completion and elapsed_minutes is not None and elapsed_minutes <= tm)
+        payload: dict[str, Any] = {
+            **meta,
+            "started_at": wizard.get("started_at"),
+            "target_minutes": tm,
+            "steps": steps,
+            "elapsed_minutes": elapsed_minutes,
+            "completed_under_target": completed_under_target,
             "schwab_linked": linked,
-            "wizard_required": not linked,
-        },
-    )
-    started_at = wizard.get("started_at")
-    elapsed_minutes = None
-    if isinstance(started_at, str) and started_at:
-        try:
-            dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-            elapsed_minutes = round((datetime.now(timezone.utc) - dt).total_seconds() / 60.0, 1)
-        except Exception:
-            elapsed_minutes = None
-    _wsteps = wizard.get("steps")
-    steps: dict[str, Any] = _wsteps if isinstance(_wsteps, dict) else {}
-    completion = (
-        bool((steps.get("connect") or {}).get("ok"))
-        and bool((steps.get("verify_token_health") or {}).get("ok"))
-        and bool((steps.get("test_scan") or {}).get("ok"))
-        and bool((steps.get("test_paper_order") or {}).get("ok"))
-    )
-    tm = int(wizard.get("target_minutes") or target_mins)
-    completed_under_target = bool(completion and elapsed_minutes is not None and elapsed_minutes <= tm)
-    payload: dict[str, Any] = {
-        **meta,
-        "started_at": wizard.get("started_at"),
-        "target_minutes": tm,
-        "steps": steps,
-        "elapsed_minutes": elapsed_minutes,
-        "completed_under_target": completed_under_target,
-        "schwab_linked": linked,
-        "onboarding_required": not linked,
-        "connection_status": "connected" if linked else "disconnected",
-        "api_health": api_health,
-        "wizard": wizard,
-    }
-    return _ok(payload)
+            "onboarding_required": not linked,
+            "connection_status": "connected" if linked else "disconnected",
+            "api_health": api_health,
+            "wizard": wizard,
+        }
+        return _ok(payload)
+    except Exception as exc:
+        LOG.warning(
+            "onboarding_status failed for user %s: %s",
+            user.id,
+            safe_exception_message(exc, fallback="onboarding_status_error"),
+        )
+        return _err("Unable to load onboarding status right now.")
 
 
 @app.post("/api/scan", response_model=ApiResponse)

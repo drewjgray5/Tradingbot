@@ -109,9 +109,9 @@ class ExecutionSettings(BaseSettings):
     volatility_atr_mult: float = Field(default=2.0, alias="VOLATILITY_ATR_MULT", gt=0)
     volatility_sizing_enabled: bool = Field(default=False, alias="VOLATILITY_SIZING_ENABLED")
 
-    exec_quality_mode: Literal["off", "shadow", "live"] = Field(default="off", alias="EXEC_QUALITY_MODE")
+    exec_quality_mode: Literal["off", "shadow", "live"] = Field(default="live", alias="EXEC_QUALITY_MODE")
     exit_manager_mode: Literal["off", "shadow", "live"] = Field(default="off", alias="EXIT_MANAGER_MODE")
-    event_risk_mode: Literal["off", "shadow", "live"] = Field(default="off", alias="EVENT_RISK_MODE")
+    event_risk_mode: Literal["off", "shadow", "live"] = Field(default="live", alias="EVENT_RISK_MODE")
     correlation_guard_mode: Literal["off", "shadow", "live"] = Field(default="off", alias="CORRELATION_GUARD_MODE")
     regime_v2_mode: Literal["off", "shadow", "live"] = Field(default="off", alias="REGIME_V2_MODE")
 

@@ -27,9 +27,12 @@ Workers: `SCAN_STAGE_B_MAX_WORKERS` (default 4)
 2. [[forensic-accounting]] — Sloan, Beneish, Altman checks
 3. SEC enrichment — filing analysis and score hints
 4. [[advisory-model]] — calibrated P(up) overlay
-5. [[quality-gates]] — weak signal filtering
-6. Strategy ensemble — breakout + pullback weighted by regime
-7. Breakout confirmation — optional intraday price check
+5. [[mirofish-engine]] — multi-persona votes aggregated into `mirofish_conviction`
+6. [[prediction-market]] — Polymarket overlay (shadow/live; gated by liquidity + spread)
+7. [[quality-gates]] — weak signal filtering
+8. Strategy ensemble — breakout + pullback weighted by regime
+9. Breakout confirmation — optional intraday price check
+10. [[meta-policy]] — final emit / suppress / downweight (via [[agent-intelligence]])
 
 ## Regime Gate
 
@@ -50,6 +53,11 @@ Every scan returns `(signals, diagnostics)` with counters: `stage2_fail`, `vcp_f
 - [[scanner-tunables]] — all env var knobs
 - [[quality-gates]] — quality filtering modes
 - [[system-overview]] — pipeline context
+- [[agent-intelligence]] — dynamic weighting + meta-policy applied to scanner output
+- [[mirofish-engine]] — Stage B persona simulation
+- [[prediction-market]] — Stage B prediction-market overlay
+- [[backtest]] — historical replay that reuses these same Stage A/B rules
+- [[feature-store]] — every emitted signal is recorded here
 
 ---
 

@@ -82,7 +82,7 @@ def _load_env(env_path: Path | None) -> dict:
 
 
 def get_authorization_url(client_id: str, redirect_uri: str) -> str:
-    return f"{AUTH_URL}?{urllib.parse.urlencode({'client_id': client_id, 'redirect_uri': redirect_uri})}"
+    return f"{AUTH_URL}?{urllib.parse.urlencode({'response_type': 'code', 'client_id': client_id, 'redirect_uri': redirect_uri})}"
 
 
 def extract_code_from_redirect(redirect_url: str) -> str | None:

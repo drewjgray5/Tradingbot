@@ -244,6 +244,8 @@ def log_stage_b_signal(
             "sec_risk_tag", "forensic_sloan", "forensic_beneish", "forensic_altman",
             "pead_surprise_pct", "pead_beat", "guidance_signal",
             "mirofish_conviction", "breakout_confirmed",
+            "mirofish_disagreement", "agent_weighting", "meta_policy",
+            "meta_policy_size_multiplier", "prediction_market_size_multiplier",
         }
         raw = {k: v for k, v in signal.items() if k in safe_keys}
         record.raw_features_json = json.dumps(raw, default=str)

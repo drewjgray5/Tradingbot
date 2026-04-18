@@ -461,11 +461,13 @@ class MarketSimulation:
         seed_df=None,
         auth=None,
         skill_dir: Path | None = None,
+        regime_is_bullish: bool | None = None,
     ):
         self.ticker = ticker.upper()
         self.seed_df = seed_df
         self.auth = auth
         self.skill_dir = Path(skill_dir or SKILL_DIR)
+        self.regime_is_bullish = regime_is_bullish
         self._env = _load_env()
 
     def _fetch_seed_data(self) -> tuple[str, Any]:
@@ -581,6 +583,36 @@ class MarketSimulation:
         retail_sentiment = max(-1.0, min(1.0, float(news_proxy)))
         retail_weight = max(0.2, 1.0 + 0.6 * retail_sentiment)
 
+        base_weights = {
+            "institutional_trend": float(inst_weight),
+            "mean_reversion": float(mean_weight),
+            "retail_fomo": float(retail_weight),
+        }
+        try:
+            from agent_intelligence import compute_vote_disagreement, resolve_dynamic_weights
+
+            dynamic_weights, weighting_meta = resolve_dynamic_weights(
+                base_weights=base_weights,
+                skill_dir=self.skill_dir,
+                regime_is_bullish=self.regime_is_bullish,
+            )
+            disagreement = compute_vote_disagreement(agent_votes)
+        except Exception as e:
+            LOG.debug("Dynamic weighting unavailable for %s: %s", self.ticker, e)
+            dynamic_weights = {
+                "institutional_trend": 1.0,
+                "mean_reversion": 1.0,
+                "retail_fomo": 1.0,
+            }
+            weighting_meta = {
+                "version": 1,
+                "mode": "off",
+                "weights": dynamic_weights,
+                "regime_bucket": "unknown",
+                "applied": False,
+            }
+            disagreement = 0.0
+
         def _score_for_agent(agent_name: str) -> int:
             for v in agent_votes:
                 if v.get("name") == agent_name:
@@ -591,13 +623,24 @@ class MarketSimulation:
         mean_score = _score_for_agent("mean_reversion")
         retail_score = _score_for_agent("retail_fomo")
 
-        weight_sum = inst_weight + mean_weight + retail_weight
+        # Legacy weights are used unless MIROFISH_WEIGHTING_MODE=live.
+        legacy_weights = {
+            "institutional_trend": float(inst_weight),
+            "mean_reversion": float(mean_weight),
+            "retail_fomo": float(retail_weight),
+        }
+        use_weights = dynamic_weights if bool(weighting_meta.get("applied")) else legacy_weights
+        weight_sum = sum(use_weights.values())
         if weight_sum <= 0:
             final_score_int = 0
             overall_cont = 0.5
             overall_bull = 0.5
         else:
-            final_score = (inst_weight * inst_score + mean_weight * mean_score + retail_weight * retail_score) / weight_sum
+            final_score = (
+                (use_weights.get("institutional_trend", 0.0) * inst_score)
+                + (use_weights.get("mean_reversion", 0.0) * mean_score)
+                + (use_weights.get("retail_fomo", 0.0) * retail_score)
+            ) / weight_sum
             final_score_int = int(round(max(-100.0, min(100.0, final_score))))
 
             def _p(agent: dict[str, Any], k: str, default: float) -> float:
@@ -610,8 +653,16 @@ class MarketSimulation:
             retail_cont = _p(retail, "continuation_probability", 0.5)
             retail_bull = _p(retail, "bull_trap_probability", 0.5)
 
-            overall_cont = (inst_weight * inst_cont + mean_weight * mean_cont + retail_weight * retail_cont) / weight_sum
-            overall_bull = (inst_weight * inst_bull + mean_weight * mean_bull + retail_weight * retail_bull) / weight_sum
+            overall_cont = (
+                (use_weights.get("institutional_trend", 0.0) * inst_cont)
+                + (use_weights.get("mean_reversion", 0.0) * mean_cont)
+                + (use_weights.get("retail_fomo", 0.0) * retail_cont)
+            ) / weight_sum
+            overall_bull = (
+                (use_weights.get("institutional_trend", 0.0) * inst_bull)
+                + (use_weights.get("mean_reversion", 0.0) * mean_bull)
+                + (use_weights.get("retail_fomo", 0.0) * retail_bull)
+            ) / weight_sum
 
         diff = overall_cont - overall_bull
         if diff >= 0.25 and overall_cont >= 0.6:
@@ -632,6 +683,8 @@ class MarketSimulation:
             "conviction_score": int(final_score_int),
             "summary": summary,
             "agent_votes": agent_votes,
+            "mirofish_disagreement": float(disagreement),
+            "agent_weighting": weighting_meta,
             # Scenario probabilities (useful for scoring & UI).
             "continuation_probability": float(overall_cont),
             "bull_trap_probability": float(overall_bull),
@@ -680,6 +733,8 @@ def cache_conviction(ticker: str, result: dict, skill_dir: Path | None = None) -
         "seed_fingerprint": result.get("seed_fingerprint"),
         "continuation_probability": result.get("continuation_probability"),
         "bull_trap_probability": result.get("bull_trap_probability"),
+        "mirofish_disagreement": result.get("mirofish_disagreement"),
+        "agent_weighting": result.get("agent_weighting"),
         "timestamp": time.time(),
     }
     data["mirofish_scores"] = scores

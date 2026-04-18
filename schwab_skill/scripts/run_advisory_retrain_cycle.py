@@ -14,7 +14,7 @@ SKILL_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = SKILL_DIR / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from promotion_guard import ensure_manual_promotion_approval
+from promotion_guard import ensure_signed_approval
 
 
 def _run(cmd: list[str]) -> int:
@@ -36,7 +36,9 @@ def main() -> int:
         default=str(SKILL_DIR / "artifacts" / "advisory_model_candidate.json"),
     )
     args = parser.parse_args()
-    if not ensure_manual_promotion_approval(args.apply):
+    if not ensure_signed_approval(
+        "advisory_retrain_cycle", apply_requested=args.apply
+    ):
         return 2
 
     train_cmd = [

@@ -9,7 +9,7 @@ import concurrent.futures as cf
 import json
 import logging
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -352,6 +352,13 @@ def _apply_event_risk_policy_to_signals(
 
         if mode == "live" and action == "block":
             diagnostics["event_risk_blocked"] = int(diagnostics.get("event_risk_blocked", 0) or 0) + 1
+            try:
+                from agent_intelligence import log_counterfactual_event
+
+                if log_counterfactual_event(signal=enriched, reason="event_risk_blocked", skill_dir=skill_dir):
+                    diagnostics["counterfactual_logged"] = int(diagnostics.get("counterfactual_logged", 0) or 0) + 1
+            except Exception:
+                pass
             continue
         if (mode == "live" and action == "downsize") or (mode == "shadow" and action == "downsize"):
             diagnostics["event_risk_downsized"] = int(diagnostics.get("event_risk_downsized", 0) or 0) + 1
@@ -426,7 +433,11 @@ def _evaluate_quality_gates(signal: dict[str, Any], skill_dir: Path) -> list[str
     pead_beat = signal.get("pead_beat")
     if pead_surprise is not None:
         try:
-            if pead_beat is False and float(pead_surprise) < -0.05:
+            s = float(pead_surprise)
+            # Symmetric counterpart to the +15% strong-beat boost in stage B.
+            if pead_beat is False and s < -0.15:
+                reasons.append("pead_large_negative_surprise")
+            elif pead_beat is False and s < -0.05:
                 reasons.append("pead_negative_surprise")
         except (TypeError, ValueError):
             pass
@@ -544,6 +555,7 @@ def _scan_stage_a_one(
                 "reason": "df_empty",
                 "provider": provider,
                 "used_fallback": used_fallback,
+                "fallback_reason": history_meta.get("fallback_reason"),
             }
         if len(df) < 50:
             return {
@@ -551,6 +563,7 @@ def _scan_stage_a_one(
                 "reason": "too_few_candles",
                 "provider": provider,
                 "used_fallback": used_fallback,
+                "fallback_reason": history_meta.get("fallback_reason"),
             }
         df = add_indicators(df)
         if not is_stage_2(df, skill_dir):
@@ -559,6 +572,7 @@ def _scan_stage_a_one(
                 "reason": "stage2_fail",
                 "provider": provider,
                 "used_fallback": used_fallback,
+                "fallback_reason": history_meta.get("fallback_reason"),
             }
         vcp_ok = bool(check_vcp_volume(df, skill_dir))
         if not vcp_ok and vcp_gate_mode == "hard":
@@ -567,6 +581,7 @@ def _scan_stage_a_one(
                 "reason": "vcp_fail",
                 "provider": provider,
                 "used_fallback": used_fallback,
+                "fallback_reason": history_meta.get("fallback_reason"),
             }
 
         sector_etf = get_ticker_sector_etf(ticker, skill_dir=skill_dir)
@@ -578,6 +593,7 @@ def _scan_stage_a_one(
                 "reason": "no_sector_etf",
                 "provider": provider,
                 "used_fallback": used_fallback,
+                "fallback_reason": history_meta.get("fallback_reason"),
             }
         if (not sector_unresolved and not sector_winning) and sector_gate_mode == "hard":
             return {
@@ -585,6 +601,7 @@ def _scan_stage_a_one(
                 "reason": "sector_not_winning",
                 "provider": provider,
                 "used_fallback": used_fallback,
+                "fallback_reason": history_meta.get("fallback_reason"),
             }
 
         quote = get_current_quote(ticker, auth=auth, skill_dir=skill_dir)
@@ -612,6 +629,7 @@ def _scan_stage_a_one(
                     "reason": "breakout_not_confirmed",
                     "provider": provider,
                     "used_fallback": used_fallback,
+                    "fallback_reason": history_meta.get("fallback_reason"),
                 }
 
         components = compute_signal_components(df, skill_dir=skill_dir)
@@ -648,7 +666,14 @@ def _scan_stage_a_one(
         return {"ok": True, "candidate": candidate}
     except Exception as e:
         LOG.warning("Scan stage A error for %s: %s", ticker, e)
-        return {"ok": False, "reason": "exceptions", "error": f"{ticker}: {e}"}
+        return {
+            "ok": False,
+            "reason": "exceptions",
+            "error": f"{ticker}: {e}",
+            "provider": "unknown",
+            "used_fallback": False,
+            "fallback_reason": f"stage_a_exception:{type(e).__name__}",
+        }
 
 
 def _scan_stage_b_enrich(
@@ -673,11 +698,16 @@ def _scan_stage_b_enrich(
     pead_score_boost: float,
     pead_score_boost_large: float,
     pead_score_penalty: float,
+    pead_score_penalty_large: float,
     guidance_score_enabled: bool,
     guidance_score_boost: float,
     guidance_score_penalty: float,
     sec_filing_cache_hours: float,
     sec_filing_max_chars: int,
+    prediction_market_engine: Any,
+    prediction_market_mode: str,
+    scan_started_at: datetime,
+    regime_is_bullish: bool | None,
 ) -> dict[str, Any]:
     from stage_analysis import compute_signal_components
 
@@ -706,6 +736,10 @@ def _scan_stage_b_enrich(
         "pead_boosted": 0,
         "pead_penalized": 0,
         "guidance_boosted": 0,
+        "prediction_market_processed": 0,
+        "prediction_market_applied": 0,
+        "prediction_market_skipped": 0,
+        "prediction_market_errors": 0,
         "stage_b_exceptions": 0,
     }
     try:
@@ -734,9 +768,17 @@ def _scan_stage_b_enrich(
                     "simulation_id": cached.get("simulation_id"),
                     "continuation_probability": cached.get("continuation_probability"),
                     "bull_trap_probability": cached.get("bull_trap_probability"),
+                    "mirofish_disagreement": cached.get("mirofish_disagreement"),
+                    "agent_weighting": cached.get("agent_weighting"),
                 }
             else:
-                sim = MarketSimulation(ticker, seed_df=df, auth=auth, skill_dir=skill_dir)
+                sim = MarketSimulation(
+                    ticker,
+                    seed_df=df,
+                    auth=auth,
+                    skill_dir=skill_dir,
+                    regime_is_bullish=regime_is_bullish,
+                )
                 result = sim.run()
                 cache_conviction(ticker, result, skill_dir=skill_dir)
                 mirofish_result = {
@@ -746,6 +788,8 @@ def _scan_stage_b_enrich(
                     "simulation_id": result.get("simulation_id"),
                     "continuation_probability": result.get("continuation_probability"),
                     "bull_trap_probability": result.get("bull_trap_probability"),
+                    "mirofish_disagreement": result.get("mirofish_disagreement"),
+                    "agent_weighting": result.get("agent_weighting"),
                 }
         except Exception as e:
             LOG.warning("MiroFish for %s: %s", ticker, e)
@@ -851,6 +895,8 @@ def _scan_stage_b_enrich(
                             pead_score_delta = float(pead_score_boost_large)
                         elif s > 0.05:
                             pead_score_delta = float(pead_score_boost)
+                        elif s < -0.15:
+                            pead_score_delta = -abs(float(pead_score_penalty_large))
                         elif s < 0:
                             pead_score_delta = -abs(float(pead_score_penalty))
             except Exception as e:
@@ -912,6 +958,8 @@ def _scan_stage_b_enrich(
             "sma_200": candidate.get("sma_200"),
             "mirofish_summary": mirofish_result.get("summary") if mirofish_result else None,
             "mirofish_conviction": mirofish_result.get("conviction_score") if mirofish_result else None,
+            "mirofish_disagreement": mirofish_result.get("mirofish_disagreement") if mirofish_result else None,
+            "agent_weighting": mirofish_result.get("agent_weighting") if mirofish_result else None,
             "mirofish_result": mirofish_result,
             "signal_score": score,
             "score_components": components,
@@ -936,18 +984,9 @@ def _scan_stage_b_enrich(
             "data_provider_primary": bool(candidate.get("data_provider_primary")),
             "used_fallback_data": bool(candidate.get("used_fallback_data")),
             "fallback_reason": candidate.get("fallback_reason"),
+            "_data_quality": candidate.get("data_quality"),
         }
-        try:
-            from strategy_plugins import build_default_strategy_plugins
-
-            signal_row["strategy_plugins"] = build_default_strategy_plugins(
-                signal=signal_row,
-                candidate=candidate,
-                pullback_mode=pullback_mode,
-            )
-        except Exception as e:
-            LOG.debug("Strategy plugin evaluation skipped for %s: %s", ticker, e)
-
+        advisory_payload: dict[str, Any] | None = None
         try:
             from advisory_model import score_signal_advisory
 
@@ -955,6 +994,7 @@ def _scan_stage_b_enrich(
             if advisory is not None:
                 adv_dict = advisory.to_dict()
                 signal_row["advisory"] = adv_dict
+                advisory_payload = adv_dict
                 diag_delta["advisory_scored"] += 1
                 bucket = str(adv_dict.get("confidence_bucket", "low")).lower()
                 if bucket == "high":
@@ -965,6 +1005,109 @@ def _scan_stage_b_enrich(
                     diag_delta["advisory_low_confidence"] += 1
         except Exception as e:
             LOG.debug("Advisory scoring skipped for %s: %s", ticker, e)
+
+        prediction_eval = None
+        if prediction_market_mode != "off" and prediction_market_engine is not None:
+            diag_delta["prediction_market_processed"] += 1
+            try:
+                from config import get_pred_market_min_baseline_score
+                from prediction_market import apply_overlay_to_signal
+
+                prediction_eval = prediction_market_engine.evaluate(
+                    ticker=ticker,
+                    as_of=scan_started_at,
+                    regime_is_bullish=regime_is_bullish,
+                )
+                min_baseline_score = float(get_pred_market_min_baseline_score(skill_dir))
+                if float(score) < min_baseline_score:
+                    signal_row["prediction_market"] = {
+                        "status": "skipped",
+                        "provider": prediction_eval.provider,
+                        "mode": prediction_market_mode,
+                        "reason": "baseline_quality_low",
+                        "matched_event_id": prediction_eval.matched_event_id,
+                        "matched_event_name": prediction_eval.matched_event_name,
+                        "features": prediction_eval.features,
+                        "overlay": {
+                            "mode": prediction_market_mode,
+                            "confidence": 0.0,
+                            "score_delta": 0.0,
+                            "size_multiplier": 1.0,
+                            "advisory_delta": 0.0,
+                            "applied": False,
+                        },
+                        "exclusion_reasons": ["baseline_quality_low"],
+                    }
+                    signal_row["prediction_market_size_multiplier"] = 1.0
+                    diag_delta["prediction_market_skipped"] += 1
+                else:
+                    signal_row = apply_overlay_to_signal(
+                        signal=signal_row,
+                        evaluation=prediction_eval,
+                        advisory=advisory_payload,
+                    )
+                    if prediction_eval.status == "ok" and bool(prediction_eval.overlay.get("applied")):
+                        diag_delta["prediction_market_applied"] += 1
+                    elif prediction_eval.status == "ok":
+                        diag_delta["prediction_market_skipped"] += 1
+                    elif prediction_eval.status == "error":
+                        diag_delta["prediction_market_errors"] += 1
+                        reason = prediction_eval.reason or "unknown"
+                        LOG.warning("Prediction-market enrichment error for %s: %s", ticker, reason)
+                    else:
+                        diag_delta["prediction_market_skipped"] += 1
+            except Exception as e:
+                diag_delta["prediction_market_errors"] += 1
+                LOG.warning("Prediction-market overlay failed for %s: %s", ticker, e)
+                signal_row["prediction_market"] = {
+                    "status": "error",
+                    "provider": "unknown",
+                    "mode": prediction_market_mode,
+                    "reason": "overlay_exception",
+                    "matched_event_id": None,
+                    "matched_event_name": None,
+                    "features": {},
+                    "overlay": {
+                        "mode": prediction_market_mode,
+                        "confidence": 0.0,
+                        "score_delta": 0.0,
+                        "size_multiplier": 1.0,
+                        "advisory_delta": 0.0,
+                        "applied": False,
+                    },
+                    "exclusion_reasons": ["overlay_exception"],
+                }
+        else:
+            signal_row["prediction_market"] = {
+                "status": "disabled",
+                "provider": "off",
+                "mode": "off",
+                "reason": "feature_off",
+                "matched_event_id": None,
+                "matched_event_name": None,
+                "features": {},
+                "overlay": {
+                    "mode": "off",
+                    "confidence": 0.0,
+                    "score_delta": 0.0,
+                    "size_multiplier": 1.0,
+                    "advisory_delta": 0.0,
+                    "applied": False,
+                },
+                "exclusion_reasons": ["feature_off"],
+            }
+            signal_row["prediction_market_size_multiplier"] = 1.0
+
+        try:
+            from strategy_plugins import build_default_strategy_plugins
+
+            signal_row["strategy_plugins"] = build_default_strategy_plugins(
+                signal=signal_row,
+                candidate=candidate,
+                pullback_mode=pullback_mode,
+            )
+        except Exception as e:
+            LOG.debug("Strategy plugin evaluation skipped for %s: %s", ticker, e)
 
         return {"ok": True, "signal": signal_row, "diag": diag_delta}
     except Exception as e:
@@ -987,9 +1130,9 @@ def scan_for_signals_detailed(
     watchlist_override: if set, scan these tickers instead of _load_watchlist.
     """
     if env_overrides:
-        from backtest import _temporary_env
+        from env_overrides import temporary_env
 
-        with _temporary_env(env_overrides):
+        with temporary_env(env_overrides):
             return scan_for_signals_detailed(
                 skill_dir=skill_dir,
                 env_overrides=None,
@@ -1055,6 +1198,18 @@ def scan_for_signals_detailed(
         "stage_b_processed": 0,
         "stage_b_exceptions": 0,
         "stage_b_timeouts": 0,
+        "prediction_market_processed": 0,
+        "prediction_market_applied": 0,
+        "prediction_market_skipped": 0,
+        "prediction_market_errors": 0,
+        "meta_policy_processed": 0,
+        "meta_policy_suppressed": 0,
+        "meta_policy_downsized": 0,
+        "meta_policy_applied": 0,
+        "meta_policy_shadow_actions": 0,
+        "uncertainty_high_count": 0,
+        "uncertainty_medium_count": 0,
+        "counterfactual_logged": 0,
         "scan_stage_a_ms": 0,
         "scan_stage_b_ms": 0,
         "regime_v2_score": None,
@@ -1069,7 +1224,31 @@ def scan_for_signals_detailed(
         "data_provider_primary_count": 0,
         "data_provider_fallback_count": 0,
         "data_provider_unknown_count": 0,
+        "fallback_reason_missing_count": 0,
+        "silent_fallback_count": 0,
         "primary_provider_filtered": 0,
+    }
+    diagnostics["prediction_market"] = {
+        "enabled": False,
+        "mode": "off",
+        "provider": "stub",
+        "processed": 0,
+        "applied": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
+    diagnostics["meta_policy"] = {
+        "enabled": False,
+        "mode": "off",
+        "processed": 0,
+        "suppressed": 0,
+        "downsized": 0,
+        "applied": 0,
+    }
+    diagnostics["uncertainty"] = {
+        "mode": "off",
+        "high_count": 0,
+        "medium_count": 0,
     }
 
     import uuid as _uuid_mod
@@ -1126,6 +1305,8 @@ def scan_for_signals_detailed(
                 "summary": result.get("summary"),
                 "agent_votes": result.get("agent_votes", []),
                 "simulation_id": result.get("simulation_id"),
+                "mirofish_disagreement": result.get("mirofish_disagreement"),
+                "agent_weighting": result.get("agent_weighting"),
             }
         except Exception as e:
             LOG.warning("Demo MiroFish: %s", e)
@@ -1137,6 +1318,8 @@ def scan_for_signals_detailed(
             "sma_200": round(price * 0.95, 2),
             "mirofish_summary": mirofish_result.get("summary") if mirofish_result else None,
             "mirofish_conviction": mirofish_result.get("conviction_score") if mirofish_result else None,
+            "mirofish_disagreement": mirofish_result.get("mirofish_disagreement") if mirofish_result else None,
+            "agent_weighting": mirofish_result.get("agent_weighting") if mirofish_result else None,
             "mirofish_result": mirofish_result,
             "signal_score": 75.0,
             "_demo": True,
@@ -1196,11 +1379,14 @@ def scan_for_signals_detailed(
         get_guidance_score_boost,
         get_guidance_score_enabled,
         get_guidance_score_penalty,
+        get_meta_policy_mode,
         get_pead_enabled,
         get_pead_lookback_days,
         get_pead_score_boost,
         get_pead_score_boost_large,
         get_pead_score_penalty,
+        get_pead_score_penalty_large,
+        get_pred_market_mode,
         get_regime_v2_entry_min_score,
         get_regime_v2_mode,
         get_scan_sector_gate_mode,
@@ -1222,6 +1408,7 @@ def scan_for_signals_detailed(
         get_sec_tagging_enabled,
         get_signal_top_n,
         get_strategy_pullback_mode,
+        get_uncertainty_mode,
     )
 
     sec_enrichment_enabled = get_sec_enrichment_enabled(skill_dir)
@@ -1241,12 +1428,66 @@ def scan_for_signals_detailed(
     pead_score_boost = get_pead_score_boost(skill_dir)
     pead_score_boost_large = get_pead_score_boost_large(skill_dir)
     pead_score_penalty = get_pead_score_penalty(skill_dir)
+    pead_score_penalty_large = get_pead_score_penalty_large(skill_dir)
     guidance_score_enabled = get_guidance_score_enabled(skill_dir)
     guidance_score_boost = get_guidance_score_boost(skill_dir)
     guidance_score_penalty = get_guidance_score_penalty(skill_dir)
     sec_filing_cache_hours = get_sec_filing_cache_hours(skill_dir)
     sec_filing_max_chars = get_sec_filing_max_chars(skill_dir)
     pullback_mode = get_strategy_pullback_mode(skill_dir)
+    meta_policy_mode = get_meta_policy_mode(skill_dir)
+    uncertainty_mode = get_uncertainty_mode(skill_dir)
+    prediction_market_mode = get_pred_market_mode(skill_dir)
+    prediction_market_engine = None
+    scan_started_at = datetime.now(timezone.utc)
+    try:
+        from prediction_market import (
+            PredictionMarketOverlayEngine,
+            build_prediction_market_config,
+            build_provider,
+        )
+
+        pm_cfg = build_prediction_market_config(skill_dir=skill_dir)
+        prediction_market_mode = str(pm_cfg.mode)
+        diagnostics["prediction_market"] = {
+            "enabled": bool(pm_cfg.enabled),
+            "mode": pm_cfg.mode,
+            "provider": pm_cfg.provider,
+            "processed": 0,
+            "applied": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
+        if pm_cfg.enabled and pm_cfg.mode != "off":
+            prediction_market_engine = PredictionMarketOverlayEngine(
+                config=pm_cfg,
+                provider=build_provider(pm_cfg),
+            )
+    except Exception as e:
+        LOG.warning("Prediction-market setup skipped: %s", e)
+        diagnostics["prediction_market"] = {
+            "enabled": False,
+            "mode": "off",
+            "provider": "setup_error",
+            "processed": 0,
+            "applied": 0,
+            "skipped": 0,
+            "errors": 1,
+        }
+        diagnostics["prediction_market_errors"] = int(diagnostics.get("prediction_market_errors", 0) or 0) + 1
+    diagnostics["meta_policy"] = {
+        "enabled": meta_policy_mode != "off",
+        "mode": meta_policy_mode,
+        "processed": 0,
+        "suppressed": 0,
+        "downsized": 0,
+        "applied": 0,
+    }
+    diagnostics["uncertainty"] = {
+        "mode": uncertainty_mode,
+        "high_count": 0,
+        "medium_count": 0,
+    }
 
     if watchlist_override is not None:
         watchlist = [str(t).strip().upper() for t in watchlist_override if str(t).strip()]
@@ -1351,6 +1592,15 @@ def scan_for_signals_detailed(
                         diagnostics["data_provider_unknown_count"] = int(
                             diagnostics.get("data_provider_unknown_count", 0) or 0
                         ) + 1
+                    fb_reason = str(
+                        out.get("fallback_reason")
+                        or (out.get("candidate") or {}).get("fallback_reason")
+                        or ""
+                    ).strip()
+                    if provider == "yfinance" and not fb_reason:
+                        diagnostics["fallback_reason_missing_count"] = int(
+                            diagnostics.get("fallback_reason_missing_count", 0) or 0
+                        ) + 1
                     if out.get("ok"):
                         candidate = out["candidate"]
                         stage_a_candidates.append(candidate)
@@ -1442,11 +1692,16 @@ def scan_for_signals_detailed(
                 pead_score_boost,
                 pead_score_boost_large,
                 pead_score_penalty,
+                pead_score_penalty_large,
                 guidance_score_enabled,
                 guidance_score_boost,
                 guidance_score_penalty,
                 sec_filing_cache_hours,
                 sec_filing_max_chars,
+                prediction_market_engine,
+                prediction_market_mode,
+                scan_started_at,
+                diagnostics.get("regime_bullish"),
             )
             future_map_b[fut] = ticker
         try:
@@ -1461,7 +1716,9 @@ def scan_for_signals_detailed(
                     for k, v in diag_delta.items():
                         diagnostics[k] = int(diagnostics.get(k, 0) or 0) + int(v or 0)
                     if out.get("ok"):
-                        signals.append(out["signal"])
+                        sig = dict(out["signal"])
+                        sig["_data_quality"] = diagnostics.get("data_quality")
+                        signals.append(sig)
                     else:
                         diagnostics["exceptions"] += 1
                         diagnostics["stage_b_exceptions"] += 1
@@ -1479,8 +1736,33 @@ def scan_for_signals_detailed(
             for ticker in pending[:10]:
                 data_failures.append(f"{ticker}: stage_b timeout")
     diagnostics["scan_stage_b_ms"] = int((time.perf_counter() - stage_b_start) * 1000)
+    diagnostics["prediction_market"] = {
+        "enabled": bool((diagnostics.get("prediction_market") or {}).get("enabled", False)),
+        "mode": str((diagnostics.get("prediction_market") or {}).get("mode") or "off"),
+        "provider": str((diagnostics.get("prediction_market") or {}).get("provider") or "stub"),
+        "processed": int(diagnostics.get("prediction_market_processed", 0) or 0),
+        "applied": int(diagnostics.get("prediction_market_applied", 0) or 0),
+        "skipped": int(diagnostics.get("prediction_market_skipped", 0) or 0),
+        "errors": int(diagnostics.get("prediction_market_errors", 0) or 0),
+    }
+    diagnostics["meta_policy"] = {
+        "enabled": bool((diagnostics.get("meta_policy") or {}).get("enabled", False)),
+        "mode": str((diagnostics.get("meta_policy") or {}).get("mode") or "off"),
+        "processed": int(diagnostics.get("meta_policy_processed", 0) or 0),
+        "suppressed": int(diagnostics.get("meta_policy_suppressed", 0) or 0),
+        "downsized": int(diagnostics.get("meta_policy_downsized", 0) or 0),
+        "applied": int(diagnostics.get("meta_policy_applied", 0) or 0),
+    }
+    diagnostics["uncertainty"] = {
+        "mode": str((diagnostics.get("uncertainty") or {}).get("mode") or "off"),
+        "high_count": int(diagnostics.get("uncertainty_high_count", 0) or 0),
+        "medium_count": int(diagnostics.get("uncertainty_medium_count", 0) or 0),
+    }
 
     diagnostics["data_failure_count"] = len(data_failures)
+    diagnostics["silent_fallback_count"] = int(diagnostics.get("data_provider_unknown_count", 0) or 0) + int(
+        diagnostics.get("fallback_reason_missing_count", 0) or 0
+    )
     if data_failures:
         send_alert(
             "Signal scan had data issues (some tickers skipped):\n" + "\n".join(data_failures[:5]),
@@ -1542,6 +1824,13 @@ def scan_for_signals_detailed(
                 if has_forensic_reason:
                     diagnostics["forensic_filtered"] += 1
                 try:
+                    from agent_intelligence import log_counterfactual_event
+
+                    if log_counterfactual_event(signal=s, reason="quality_filtered", skill_dir=skill_dir):
+                        diagnostics["counterfactual_logged"] = int(diagnostics.get("counterfactual_logged", 0) or 0) + 1
+                except Exception:
+                    pass
+                try:
                     from feature_store import log_stage_b_signal
                     log_stage_b_signal(
                         scan_id=_scan_id, signal=s,
@@ -1576,6 +1865,22 @@ def scan_for_signals_detailed(
         )
     except Exception as e:
         LOG.debug("Strategy ensemble evaluation skipped: %s", e)
+
+    # Meta-policy/uncertainty combiner: optional final decision layer.
+    try:
+        from agent_intelligence import apply_meta_policy_to_signal, log_counterfactual_event
+
+        next_signals: list[dict[str, Any]] = []
+        for s in signals:
+            enriched, keep = apply_meta_policy_to_signal(signal=s, diagnostics=diagnostics, skill_dir=skill_dir)
+            if not keep:
+                if log_counterfactual_event(signal=enriched, reason="meta_policy_suppressed", skill_dir=skill_dir):
+                    diagnostics["counterfactual_logged"] = int(diagnostics.get("counterfactual_logged", 0) or 0) + 1
+                continue
+            next_signals.append(enriched)
+        signals = next_signals
+    except Exception as e:
+        LOG.debug("Meta-policy evaluation skipped: %s", e)
 
     # Rank by score and take top N
     top_n = get_signal_top_n(skill_dir)
@@ -1663,6 +1968,17 @@ def send_signal_alert(signal: dict[str, Any], skill_dir: Path) -> None:
     p = signal["price"]
     sector = signal["sector_etf"]
     pos_usd = get_position_size_usd(ticker=t, price=p, skill_dir=skill_dir)
+    try:
+        pm_mult = float(signal.get("prediction_market_size_multiplier") or 1.0)
+    except (TypeError, ValueError):
+        pm_mult = 1.0
+    pm_mult = max(0.85, min(1.15, pm_mult))
+    try:
+        meta_mult = float(signal.get("meta_policy_size_multiplier") or 1.0)
+    except (TypeError, ValueError):
+        meta_mult = 1.0
+    meta_mult = max(0.70, min(1.10, meta_mult))
+    pos_usd = int(round(float(pos_usd) * pm_mult * meta_mult))
     qty = max(1, int(pos_usd / p)) if p > 0 else 10
 
     msg = (

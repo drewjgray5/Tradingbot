@@ -7,10 +7,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
+import statistics
 import sys
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +31,7 @@ from config import (  # noqa: E402
     get_signal_top_n,
     get_signal_universe_target_size,
 )
+from env_overrides import temporary_env  # noqa: E402
 
 
 @dataclass
@@ -42,7 +42,7 @@ class EvalResult:
     reason: str
 
 
-TUNABLE_KEYS = (
+ALL_TUNABLE_KEYS = (
     "QUALITY_GATES_MODE",
     "QUALITY_SOFT_MIN_REASONS",
     "QUALITY_MIN_SIGNAL_SCORE",
@@ -52,6 +52,16 @@ TUNABLE_KEYS = (
     "ADVISORY_CONFIDENCE_LOW",
     "SIGNAL_TOP_N",
     "SIGNAL_UNIVERSE_TARGET_SIZE",
+)
+
+DEFAULT_TUNABLE_KEYS = (
+    "QUALITY_GATES_MODE",
+    "QUALITY_SOFT_MIN_REASONS",
+    "QUALITY_MIN_SIGNAL_SCORE",
+    "QUALITY_BREAKOUT_VOLUME_MIN_RATIO",
+    "QUALITY_REQUIRE_BREAKOUT_VOLUME",
+    "ADVISORY_CONFIDENCE_HIGH",
+    "ADVISORY_CONFIDENCE_LOW",
 )
 
 MUTATION_PLAN: dict[str, list[str]] = {
@@ -137,32 +147,29 @@ def _canonical(params: dict[str, str]) -> str:
     return json.dumps({k: params[k] for k in sorted(params.keys())}, sort_keys=True)
 
 
-@contextmanager
 def _temporary_env(overrides: dict[str, str]):
-    old: dict[str, str | None] = {}
-    try:
-        for k, v in overrides.items():
-            old[k] = os.environ.get(k)
-            os.environ[k] = str(v)
-        yield
-    finally:
-        for k, prev in old.items():
-            if prev is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = prev
+    return temporary_env(overrides)
 
 
-def _objective(metrics: dict[str, Any], min_trades: int) -> float:
+def _objective(
+    metrics: dict[str, Any],
+    *,
+    min_trades: int,
+    w_pf: float,
+    w_win_rate: float,
+    w_expectancy: float,
+    w_starvation_penalty: float,
+    w_drawdown_penalty: float,
+) -> float:
     pf_net = float(metrics.get("profit_factor_net", 0) or 0)
     wr_net = float(metrics.get("win_rate_net", metrics.get("win_rate", 0)) or 0)
     expectancy = float(metrics.get("avg_return_net_pct", metrics.get("avg_return_pct", 0)) or 0)
     drawdown = float(metrics.get("max_drawdown_net_pct", metrics.get("max_drawdown_pct", 0)) or 0)
     trades = int(metrics.get("total_trades", 0) or 0)
     drawdown_mag = abs(min(0.0, drawdown))
-    starvation_penalty = max(0, min_trades - trades) * 0.6
-    drawdown_penalty = max(0.0, drawdown_mag - 25.0) * 1.8
-    return (120.0 * pf_net) + (0.7 * wr_net) + (28.0 * expectancy) - starvation_penalty - drawdown_penalty
+    starvation_penalty = max(0, min_trades - trades) * float(w_starvation_penalty)
+    drawdown_penalty = max(0.0, drawdown_mag - 25.0) * float(w_drawdown_penalty)
+    return (float(w_pf) * pf_net) + (float(w_win_rate) * wr_net) + (float(w_expectancy) * expectancy) - starvation_penalty - drawdown_penalty
 
 
 def _default_tickers(n: int) -> list[str]:
@@ -175,13 +182,28 @@ def _default_tickers(n: int) -> list[str]:
     return base[: max(10, min(n, len(base)))]
 
 
-def _evaluate_single(params: dict[str, str], tickers: list[str], start_date: str, skip_mirofish: bool, min_trades: int) -> dict[str, Any]:
+def _evaluate_single(
+    params: dict[str, str],
+    tickers: list[str],
+    start_date: str,
+    skip_mirofish: bool,
+    min_trades: int,
+    objective_weights: dict[str, float],
+) -> dict[str, Any]:
     with _temporary_env(params | ({"BACKTEST_SKIP_MIROFISH": "true"} if skip_mirofish else {})):
         metrics = run_backtest(tickers=tickers, start_date=start_date)
     return {
         "start_date": start_date,
         "ticker_count": len(tickers),
-        "objective": _objective(metrics, min_trades=min_trades),
+        "objective": _objective(
+            metrics,
+            min_trades=min_trades,
+            w_pf=float(objective_weights["w_pf"]),
+            w_win_rate=float(objective_weights["w_win_rate"]),
+            w_expectancy=float(objective_weights["w_expectancy"]),
+            w_starvation_penalty=float(objective_weights["w_starvation_penalty"]),
+            w_drawdown_penalty=float(objective_weights["w_drawdown_penalty"]),
+        ),
         "total_trades": int(metrics.get("total_trades", 0) or 0),
         "profit_factor_net": float(metrics.get("profit_factor_net", metrics.get("profit_factor", 0)) or 0),
         "avg_return_net_pct": float(metrics.get("avg_return_net_pct", metrics.get("avg_return_pct", 0)) or 0),
@@ -190,11 +212,25 @@ def _evaluate_single(params: dict[str, str], tickers: list[str], start_date: str
     }
 
 
-def _evaluate_walk_forward(params: dict[str, str], ticker_pool: list[str], skip_mirofish: bool, min_trades: int) -> dict[str, Any]:
+def _evaluate_walk_forward(
+    params: dict[str, str],
+    ticker_pool: list[str],
+    skip_mirofish: bool,
+    min_trades: int,
+    objective_weights: dict[str, float],
+    stability_penalty_weight: float,
+) -> dict[str, Any]:
     splits: list[dict[str, Any]] = []
     for split in WALK_FORWARD_SPLITS:
         tickers = ticker_pool[: int(split["tickers"])]
-        row = _evaluate_single(params, tickers, str(split["start"]), skip_mirofish, min_trades)
+        row = _evaluate_single(
+            params,
+            tickers,
+            str(split["start"]),
+            skip_mirofish,
+            min_trades,
+            objective_weights,
+        )
         row["name"] = str(split["name"])
         row["is_oos"] = bool(split["is_oos"])
         splits.append(row)
@@ -204,11 +240,18 @@ def _evaluate_walk_forward(params: dict[str, str], ticker_pool: list[str], skip_
     dd_vals = [float(s["max_drawdown_net_pct"]) for s in splits]
     obj_vals = [float(s["objective"]) for s in splits]
     trades = [int(s["total_trades"]) for s in splits]
+    pf_std = statistics.pstdev(pf_vals) if len(pf_vals) > 1 else 0.0
+    exp_std = statistics.pstdev(exp_vals) if len(exp_vals) > 1 else 0.0
+    stability_penalty = (float(stability_penalty_weight) * pf_std) + (0.5 * float(stability_penalty_weight) * exp_std)
     oos_row = oos[-1] if oos else splits[-1]
     return {
         "splits": splits,
         "aggregates": {
             "objective_mean": round(sum(obj_vals) / len(obj_vals), 4),
+            "pf_std": round(float(pf_std), 5),
+            "expectancy_std": round(float(exp_std), 5),
+            "stability_penalty": round(float(stability_penalty), 5),
+            "regularized_objective": round((sum(obj_vals) / len(obj_vals)) - stability_penalty, 4),
             "pf_mean": round(sum(pf_vals) / len(pf_vals), 4),
             "expectancy_mean": round(sum(exp_vals) / len(exp_vals), 4),
             "drawdown_worst": round(min(dd_vals), 4),
@@ -281,6 +324,7 @@ def _run_robustness_probes(
     ticker_pool: list[str],
     skip_mirofish: bool,
     min_trades: int,
+    objective_weights: dict[str, float],
 ) -> dict[str, Any]:
     """
     Extra guardrails against overfitting:
@@ -295,6 +339,7 @@ def _run_robustness_probes(
         start_date="2021-01-01",
         skip_mirofish=skip_mirofish,
         min_trades=min_trades,
+            objective_weights=objective_weights,
     )
 
     perturb_pf: list[float] = []
@@ -310,6 +355,7 @@ def _run_robustness_probes(
             start_date="2022-01-01",
             skip_mirofish=skip_mirofish,
             min_trades=min_trades,
+            objective_weights=objective_weights,
         )
         perturb_pf.append(float(row.get("profit_factor_net", 0) or 0))
         perturb_objectives.append(float(row.get("objective", 0) or 0))
@@ -340,8 +386,13 @@ def _apply_mutation(params: dict[str, str], key: str, op: str) -> tuple[dict[str
     return out, f"{key}: {before} -> {out[key]}"
 
 
-def _propose_next(best_params: dict[str, str], tried: set[str], round_idx: int) -> tuple[dict[str, str] | None, str]:
-    key_order = list(TUNABLE_KEYS)
+def _propose_next(
+    best_params: dict[str, str],
+    tried: set[str],
+    round_idx: int,
+    tunable_keys: list[str],
+) -> tuple[dict[str, str] | None, str]:
+    key_order = list(tunable_keys)
     offset = round_idx % len(key_order)
     key_order = key_order[offset:] + key_order[:offset]
     for key in key_order:
@@ -352,6 +403,14 @@ def _propose_next(best_params: dict[str, str], tried: set[str], round_idx: int) 
                 continue
             return cand, desc
     return None, "no_untried_neighbor"
+
+
+def _param_change_count(baseline_params: dict[str, str], candidate_params: dict[str, str]) -> int:
+    changed = 0
+    for k in ALL_TUNABLE_KEYS:
+        if str(baseline_params.get(k)) != str(candidate_params.get(k)):
+            changed += 1
+    return changed
 
 
 def _write_markdown_report(path: Path, run_id: str, baseline: EvalResult, best: EvalResult, history: list[dict[str, Any]]) -> None:
@@ -397,11 +456,34 @@ def main() -> int:
     parser.add_argument("--min-oos-pf", type=float, default=float(ROBUST_BASELINE_POLICY["min_oos_pf"]))
     parser.add_argument("--min-oos-pf-margin", type=float, default=float(ROBUST_BASELINE_POLICY["min_oos_pf_margin"]))
     parser.add_argument("--include-mirofish", action="store_true")
+    parser.add_argument("--tunable-keys", default=",".join(DEFAULT_TUNABLE_KEYS))
+    parser.add_argument("--w-pf", type=float, default=120.0)
+    parser.add_argument("--w-win-rate", type=float, default=0.7)
+    parser.add_argument("--w-expectancy", type=float, default=28.0)
+    parser.add_argument("--w-starvation-penalty", type=float, default=0.6)
+    parser.add_argument("--w-drawdown-penalty", type=float, default=1.8)
+    parser.add_argument("--stability-penalty-weight", type=float, default=16.0)
+    parser.add_argument("--complexity-penalty-per-change", type=float, default=1.1)
     args = parser.parse_args()
 
     random.seed(args.seed)
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     ticker_pool = _default_tickers(args.tickers)
+
+    tunable_keys = [
+        k.strip()
+        for k in str(args.tunable_keys).split(",")
+        if k.strip() in ALL_TUNABLE_KEYS
+    ]
+    if not tunable_keys:
+        tunable_keys = list(DEFAULT_TUNABLE_KEYS)
+    objective_weights = {
+        "w_pf": float(args.w_pf),
+        "w_win_rate": float(args.w_win_rate),
+        "w_expectancy": float(args.w_expectancy),
+        "w_starvation_penalty": float(args.w_starvation_penalty),
+        "w_drawdown_penalty": float(args.w_drawdown_penalty),
+    }
 
     baseline_params = _default_params()
     baseline_wf = _evaluate_walk_forward(
@@ -409,14 +491,17 @@ def main() -> int:
         ticker_pool=ticker_pool,
         skip_mirofish=not args.include_mirofish,
         min_trades=args.min_trades,
+        objective_weights=objective_weights,
+        stability_penalty_weight=float(args.stability_penalty_weight),
     )
     baseline_probes = _run_robustness_probes(
         baseline_params,
         ticker_pool=ticker_pool,
         skip_mirofish=not args.include_mirofish,
         min_trades=args.min_trades,
+            objective_weights=objective_weights,
     )
-    baseline_obj = float(baseline_wf["aggregates"]["objective_mean"])
+    baseline_obj = float(baseline_wf["aggregates"]["regularized_objective"])
     best = EvalResult(params=baseline_params, walk_forward=baseline_wf, objective=baseline_obj, reason="baseline")
 
     history: list[dict[str, Any]] = [
@@ -424,11 +509,11 @@ def main() -> int:
     ]
     tried: set[str] = {_canonical(best.params)}
     stall = 0
-    min_explore = min(max(1, args.rounds), max(1, len(TUNABLE_KEYS)))
+    min_explore = min(max(1, args.rounds), max(1, len(tunable_keys)))
     print(f"Baseline objective={best.objective:.4f} oos_pf={best.walk_forward['aggregates']['oos_pf']:.3f}")
 
     for r in range(1, max(1, args.rounds) + 1):
-        candidate_params, mutation = _propose_next(best.params, tried, r)
+        candidate_params, mutation = _propose_next(best.params, tried, r, tunable_keys)
         if candidate_params is None:
             print(f"Round {r}: no untried neighbors remain.")
             break
@@ -438,8 +523,12 @@ def main() -> int:
             ticker_pool=ticker_pool,
             skip_mirofish=not args.include_mirofish,
             min_trades=args.min_trades,
+            objective_weights=objective_weights,
+            stability_penalty_weight=float(args.stability_penalty_weight),
         )
-        cand_obj = float(cand_wf["aggregates"]["objective_mean"])
+        cand_obj_raw = float(cand_wf["aggregates"]["regularized_objective"])
+        complexity_penalty = float(args.complexity_penalty_per_change) * float(_param_change_count(baseline_params, candidate_params))
+        cand_obj = cand_obj_raw - complexity_penalty
         ok, reason = _review_candidate(
             best.walk_forward,
             cand_wf,
@@ -459,6 +548,7 @@ def main() -> int:
                 ticker_pool=ticker_pool,
                 skip_mirofish=not args.include_mirofish,
                 min_trades=args.min_trades,
+                objective_weights=objective_weights,
             )
             baseline_alt_pf = float((baseline_probes.get("alt_subset") or {}).get("profit_factor_net", 0) or 0)
             candidate_alt_pf = float((candidate_probes.get("alt_subset") or {}).get("profit_factor_net", 0) or 0)
@@ -503,6 +593,8 @@ def main() -> int:
                 "accepted": accepted,
                 "reason": best.reason if accepted else (reason if not ok else "rejected: objective_not_improved"),
                 "objective": round(cand_obj, 4),
+                "objective_raw_regularized": round(cand_obj_raw, 4),
+                "complexity_penalty": round(complexity_penalty, 4),
                 "aggregates": cand_wf["aggregates"],
                 "split_outperformance_count": split_wins,
                 "robustness_probes": candidate_probes,
@@ -531,6 +623,12 @@ def main() -> int:
             "max_drawdown_degrade": float(args.max_drawdown_degrade),
             "min_oos_pf": float(args.min_oos_pf),
             "min_oos_pf_margin": float(args.min_oos_pf_margin),
+        },
+        "objective_weights": objective_weights,
+        "regularization": {
+            "stability_penalty_weight": float(args.stability_penalty_weight),
+            "complexity_penalty_per_change": float(args.complexity_penalty_per_change),
+            "tunable_keys": tunable_keys,
         },
         "baseline_policy_defaults": ROBUST_BASELINE_POLICY,
     }

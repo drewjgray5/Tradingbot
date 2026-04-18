@@ -21,7 +21,7 @@ ARCHIVE_DIR = SKILL_DIR / "artifacts" / "champion_archive"
 sys.path.insert(0, str(SKILL_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from promotion_guard import ensure_manual_promotion_approval
+from promotion_guard import ensure_signed_approval
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -82,7 +82,7 @@ def main() -> int:
     parser.add_argument("--max-brier-delta", type=float, default=0.0)
     parser.add_argument("--require-walkforward-gain", action="store_true")
     args = parser.parse_args()
-    if not ensure_manual_promotion_approval(args.apply):
+    if not ensure_signed_approval("advisory_model", apply_requested=args.apply):
         return 2
 
     challenger_path = _resolve_model_path(args.challenger_model_path)

@@ -421,6 +421,23 @@ def test_scan_lifecycle_idle_with_last_scan(saas_client: TestClient, test_db: se
         db.close()
 
 
+def test_onboarding_status_returns_json_error_when_internal_probe_fails(
+    saas_client: TestClient,
+    test_db: sessionmaker,
+) -> None:
+    db = test_db()
+    try:
+        _seed_user_with_schwab(db)
+    finally:
+        db.close()
+    with patch("webapp.main_saas._tenant_api_health_snapshot", side_effect=RuntimeError("boom")):
+        resp = saas_client.get("/api/onboarding/status", headers=_auth_header())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body.get("ok") is False
+    assert "Unable to load onboarding status right now." in (body.get("error") or "")
+
+
 def test_scan_task_status_requires_user_binding(saas_client: TestClient, test_db: sessionmaker) -> None:
     db = test_db()
     try:

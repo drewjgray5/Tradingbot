@@ -468,3 +468,63 @@ class TestHealthAndStatus:
         for path in ["/", "/simple", "/login"]:
             resp = client.get(path)
             assert resp.status_code == 200
+
+
+class TestLocalOAuthEndpoints:
+    def test_local_authorize_url_returns_schwab_oauth_link(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SCHWAB_ACCOUNT_APP_KEY", "ak")
+        monkeypatch.setenv("SCHWAB_ACCOUNT_APP_SECRET", "as")
+        monkeypatch.setenv("SCHWAB_CALLBACK_URL", "http://testserver/api/oauth/schwab/callback")
+        resp = client.get("/api/oauth/schwab/authorize-url")
+        data = resp.json()
+        assert data["ok"] is True
+        url = (data.get("data") or {}).get("url") or ""
+        assert "response_type=code" in url
+        assert "client_id=ak" in url
+        assert "state=" in url
+
+    def test_local_authorize_url_rewrites_legacy_loopback_callback(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SCHWAB_ACCOUNT_APP_KEY", "ak")
+        monkeypatch.setenv("SCHWAB_ACCOUNT_APP_SECRET", "as")
+        monkeypatch.setenv("SCHWAB_CALLBACK_URL", "https://127.0.0.1:8182")
+        resp = client.get("/api/oauth/schwab/authorize-url")
+        data = resp.json()
+        assert data["ok"] is True
+        url = (data.get("data") or {}).get("url") or ""
+        assert "redirect_uri=http%3A%2F%2Ftestserver%2Fapi%2Foauth%2Fschwab%2Fcallback" in url
+
+    @patch("webapp.main.write_encrypted_token_file")
+    @patch(
+        "webapp.main.exchange_schwab_code_for_tokens",
+        return_value={"access_token": "a", "refresh_token": "r", "token_type": "Bearer"},
+    )
+    def test_local_account_callback_writes_token_file(
+        self,
+        _exchange_mock,
+        write_mock,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SCHWAB_ACCOUNT_APP_KEY", "ak")
+        monkeypatch.setenv("SCHWAB_ACCOUNT_APP_SECRET", "as")
+        monkeypatch.setenv("SCHWAB_CALLBACK_URL", "http://testserver/api/oauth/schwab/callback")
+        auth_resp = client.get("/api/oauth/schwab/authorize-url").json()
+        state = ((auth_resp.get("data") or {}).get("state") or "").strip()
+        callback = client.get(
+            "/api/oauth/schwab/callback",
+            params={"code": "code123", "state": state},
+            follow_redirects=False,
+        )
+        assert callback.status_code == 302
+        assert "schwab_oauth=ok" in (callback.headers.get("location") or "")
+        write_mock.assert_called_once()
+        out_path = str(write_mock.call_args.args[0]).replace("\\", "/")
+        assert out_path.endswith("tokens_account.enc")

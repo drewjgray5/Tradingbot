@@ -34,6 +34,15 @@ from sec_filing_compare import compare_ticker_over_time, compare_ticker_vs_ticke
 from sector_strength import get_sector_heatmap
 from signal_scanner import scan_for_signals_detailed
 
+from ._shared import (
+    build_portfolio_summary as _build_portfolio_summary,  # noqa: F401  (re-export)
+)
+from ._shared import (
+    quote_health_hint as _quote_health_hint,  # noqa: F401  (re-export)
+)
+from ._shared import (
+    trade_to_dict as _trade_to_dict,  # noqa: F401  (re-export)
+)
 from .audit import log_audit
 from .billing_stripe import user_has_paid_entitlement
 from .checklist_language import with_plain_language
@@ -60,6 +69,30 @@ from .oauth_schwab import (
 from .preset_catalog import PRESET_PROFILES, build_preset_catalog_payload
 from .recovery_map import map_failure
 from .redaction import safe_exception_message
+from .route_helpers import (
+    apply_profile_to_runtime as _shared_apply_profile_to_runtime,
+)
+from .route_helpers import (
+    is_loopback_host as _shared_is_loopback_host,
+)
+from .route_helpers import (
+    ok as _shared_ok,
+)
+from .route_helpers import (
+    request_id as _shared_request_id,
+)
+from .route_helpers import (
+    request_origin as _shared_request_origin,
+)
+from .route_helpers import (
+    resolve_schwab_redirect_uri as _shared_resolve_schwab_redirect_uri,
+)
+from .route_helpers import (
+    saas_error_response as _shared_saas_error_response,
+)
+from .route_helpers import (
+    simple_err as _shared_simple_err,
+)
 from .schemas import ApiResponse, ApproveTradeRequest, CreatePendingTrade
 from .security import (
     decrypt_secret,
@@ -98,17 +131,15 @@ def _json_default(value: Any) -> Any:
 
 
 def _ok(data: Any = None) -> ApiResponse:
-    return ApiResponse(ok=True, data=data)
+    return _shared_ok(data)
 
 
 def _err(message: str, data: Any = None) -> ApiResponse:
-    return ApiResponse(ok=False, error=message, data=data)
+    return _shared_simple_err(message, data)
 
 
 def _saas_error_response(exc: Exception, *, source: str, fallback: str) -> ApiResponse:
-    safe = safe_exception_message(exc, fallback=fallback)
-    mapped = map_failure(safe, source=source)
-    return _err(fallback, {"recovery": mapped, "error_excerpt": mapped.get("raw_error")})
+    return _shared_saas_error_response(exc, source=source, fallback=fallback)
 
 
 def _save_state(db: OrmSession, user_id: str, key: str, payload: dict[str, Any]) -> None:
@@ -241,78 +272,8 @@ def _challenger_summary(db: OrmSession, user_id: str) -> dict[str, Any]:
     }
 
 
-def _trade_to_dict(row: PendingTrade) -> dict[str, Any]:
-    return {
-        "id": row.id,
-        "ticker": row.ticker,
-        "qty": row.qty,
-        "price": row.price,
-        "status": row.status,
-        "note": row.note,
-        "signal": json.loads(row.signal_json or "{}"),
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
-    }
-
-
-def _build_portfolio_summary(account_status: dict[str, Any]) -> dict[str, Any]:
-    accounts = account_status.get("accounts", [])
-    positions: list[dict[str, Any]] = []
-    total_value = 0.0
-
-    for acc in accounts:
-        sec = acc.get("securitiesAccount", acc)
-        for pos in sec.get("positions", []):
-            inst = pos.get("instrument", {})
-            sym = inst.get("symbol", "?")
-            qty = pos.get("longQuantity", 0) or pos.get("shortQuantity", 0) or 0
-            if not qty:
-                continue
-            mkt_val = float(pos.get("marketValue", 0) or 0)
-            day_pl = float(pos.get("currentDayProfitLoss", 0) or 0)
-            avg_cost = float(pos.get("averagePrice", 0) or 0)
-            last = (mkt_val / qty) if qty else 0.0
-            pl_pct = ((last - avg_cost) / avg_cost * 100.0) if avg_cost else 0.0
-            total_value += mkt_val
-            positions.append(
-                {
-                    "symbol": sym,
-                    "qty": int(qty),
-                    "market_value": round(mkt_val, 2),
-                    "day_pl": round(day_pl, 2),
-                    "avg_cost": round(avg_cost, 4),
-                    "last": round(last, 4),
-                    "pl_pct": round(pl_pct, 2),
-                }
-            )
-
-    positions.sort(key=lambda row: abs(float(row.get("market_value", 0))), reverse=True)
-    return {
-        "account_count": len(accounts),
-        "positions_count": len(positions),
-        "total_market_value": round(total_value, 2),
-        "positions": positions,
-    }
-
-
-def _quote_health_hint(meta: dict[str, Any], quote_ok: bool) -> str | None:
-    if quote_ok:
-        return None
-    reason = str(meta.get("reason") or "")
-    if reason == "http_error":
-        return "Schwab returned an error for the market-data quotes request. Re-authenticate the market app if it keeps failing."
-    if reason == "no_matching_symbol_in_response":
-        return "The quotes response did not contain the probe symbol. Confirm your market token has quotes access."
-    if reason:
-        return f"Quote check failed ({reason})."
-    return "Quote check failed for an unknown reason."
-
-
 def _apply_profile_to_runtime(profile: str) -> dict[str, str]:
-    active = PRESET_PROFILES.get(profile, PRESET_PROFILES[DEFAULT_PROFILE])
-    for k, v in active.items():
-        os.environ[k] = str(v)
-    return dict(active)
+    return _shared_apply_profile_to_runtime(profile)
 
 
 def _saas_pretrade_checklist(trade: PendingTrade, signal: dict[str, Any]) -> dict[str, Any]:
@@ -383,38 +344,19 @@ def _tenant_api_health_snapshot(db: OrmSession, user_id: str) -> dict[str, Any]:
 
 
 def _request_id(request: Request) -> str | None:
-    return getattr(request.state, "request_id", None)
+    return _shared_request_id(request)
 
 
 def _is_loopback_host(hostname: str) -> bool:
-    host = str(hostname or "").strip().lower()
-    return host in {"127.0.0.1", "localhost", "::1"}
+    return _shared_is_loopback_host(hostname)
 
 
 def _request_origin(request: Request) -> str:
-    # Respect reverse-proxy forwarded headers first, then fall back to request URL.
-    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http").split(",")[0].strip()
-    host = (request.headers.get("x-forwarded-host") or request.url.netloc or "").split(",")[0].strip()
-    if host:
-        return f"{proto}://{host}".rstrip("/")
-    return str(request.base_url).rstrip("/")
+    return _shared_request_origin(request)
 
 
 def _resolve_schwab_redirect_uri(request: Request, *, market: bool) -> str:
-    env_key = "SCHWAB_MARKET_CALLBACK_URL" if market else "SCHWAB_CALLBACK_URL"
-    configured = (os.getenv(env_key) or "").strip()
-    suffix = "/api/oauth/schwab/market/callback" if market else "/api/oauth/schwab/callback"
-    inferred = f"{_request_origin(request)}{suffix}"
-    if not configured:
-        return inferred
-
-    parsed = urllib.parse.urlparse(configured)
-    configured_host = str(parsed.hostname or "").strip().lower()
-    inferred_host = str(urllib.parse.urlparse(inferred).hostname or "").strip().lower()
-    # Avoid hosted flows breaking when local loopback callback env leaks into SaaS.
-    if _is_loopback_host(configured_host) and not _is_loopback_host(inferred_host):
-        return inferred
-    return configured
+    return _shared_resolve_schwab_redirect_uri(request, market=market)
 
 
 def _global_live_trading_kill_switch_on() -> bool:
