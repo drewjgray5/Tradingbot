@@ -49,6 +49,7 @@ tags: [config, saas, infrastructure]
 | `SAAS_BOOTSTRAP_SCHEMA` | 0 | Auto-create schema on first boot |
 | `SAAS_RUN_ALEMBIC` | 0 | Auto-run alembic upgrade head |
 | `SAAS_HEALTH_REQUIRE_REDIS` | 1 | Require Redis for readiness |
+| `SAAS_HEALTH_REQUIRE_WORKERS` | 1 | Require Celery workers + scan/orders queues for readiness (set 0 in CI/local smoke when no worker is running) |
 
 ## Related Pages
 

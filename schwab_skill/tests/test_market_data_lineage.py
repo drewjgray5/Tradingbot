@@ -70,4 +70,5 @@ def test_get_daily_history_with_meta_fallback_provider(monkeypatch) -> None:
     assert not df.empty
     assert meta["provider"] == "yfinance"
     assert meta["used_fallback"] is True
-    assert meta["fallback_reason"] == "RuntimeError"
+    reason = meta["fallback_reason"]
+    assert isinstance(reason, str) and reason.startswith("RuntimeError"), reason

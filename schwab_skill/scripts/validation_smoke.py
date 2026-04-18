@@ -82,8 +82,13 @@ def _check_web_health() -> tuple[bool, str]:
 def _check_saas_web_health() -> tuple[bool, str]:
     from fastapi.testclient import TestClient
 
-    prev = os.environ.get("SAAS_HEALTH_REQUIRE_REDIS")
-    os.environ["SAAS_HEALTH_REQUIRE_REDIS"] = "0"
+    overrides = {
+        "SAAS_HEALTH_REQUIRE_REDIS": "0",
+        "SAAS_HEALTH_REQUIRE_WORKERS": "0",
+    }
+    prev: dict[str, str | None] = {k: os.environ.get(k) for k in overrides}
+    for k, v in overrides.items():
+        os.environ[k] = v
     try:
         from webapp.main_saas import app as saas_app
 
@@ -98,10 +103,11 @@ def _check_saas_web_health() -> tuple[bool, str]:
             if ready.status_code != 200:
                 return False, f"saas /api/health/ready status {ready.status_code}"
     finally:
-        if prev is None:
-            os.environ.pop("SAAS_HEALTH_REQUIRE_REDIS", None)
-        else:
-            os.environ["SAAS_HEALTH_REQUIRE_REDIS"] = prev
+        for k, original in prev.items():
+            if original is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = original
     return True, "saas health contract"
 
 

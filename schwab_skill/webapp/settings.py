@@ -148,6 +148,7 @@ class SaaSSettings(BaseSettings):
     saas_rate_order_per_min: int = Field(default=30, alias="SAAS_RATE_ORDER_PER_MIN", ge=1)
     saas_rate_backtest_per_hour: int = Field(default=6, alias="SAAS_RATE_BACKTEST_PER_HOUR", ge=1)
     saas_health_require_redis: bool = Field(default=True, alias="SAAS_HEALTH_REQUIRE_REDIS")
+    saas_health_require_workers: bool = Field(default=True, alias="SAAS_HEALTH_REQUIRE_WORKERS")
     saas_bootstrap_schema: bool = Field(default=False, alias="SAAS_BOOTSTRAP_SCHEMA")
 
     schwab_account_app_key: str = Field(default="", alias="SCHWAB_ACCOUNT_APP_KEY")

@@ -611,7 +611,13 @@ def health_ready(response: Response) -> ApiResponse:
     required_queues = {"scan", "orders"}
     queues_ok = required_queues.issubset({str(q) for q in worker.get("queues", [])})
     require_redis = os.getenv("SAAS_HEALTH_REQUIRE_REDIS", "1").lower() in ("1", "true", "yes")
-    ready = db_ok and (redis_ok if require_redis else True) and worker_ok and queues_ok
+    require_workers = os.getenv("SAAS_HEALTH_REQUIRE_WORKERS", "1").lower() in ("1", "true", "yes")
+    ready = (
+        db_ok
+        and (redis_ok if require_redis else True)
+        and (worker_ok if require_workers else True)
+        and (queues_ok if require_workers else True)
+    )
     if not ready:
         response.status_code = 503
     return _ok(
@@ -623,6 +629,8 @@ def health_ready(response: Response) -> ApiResponse:
             "required_queues": sorted(required_queues),
             "worker_ok": worker_ok,
             "queues_ok": queues_ok,
+            "require_redis": require_redis,
+            "require_workers": require_workers,
             "time": datetime.now(timezone.utc).isoformat(),
         }
     )
