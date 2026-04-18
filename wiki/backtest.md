@@ -1,8 +1,8 @@
 ---
 source: schwab_skill/backtest.py
 created: 2026-04-17
-updated: 2026-04-17
-tags: [backtest, validation, scanner]
+updated: 2026-04-18
+tags: [backtest, validation, scanner, portfolio-sim]
 ---
 
 # Backtest Harness
@@ -58,6 +58,44 @@ Defaults that mirror the live execution profile:
 | `DEFAULT_MAX_ADV_PARTICIPATION` | 2% | Liquidity cap |
 
 Override via env vars (see [[scanner-tunables]]).
+
+## Portfolio equity simulator
+
+Per-trade `net_return` from `_net_return_after_costs` is a per-share %
+return normalised to ~$10K target notional. The legacy aggregator
+chained those returns as `(1+r).cumprod()`, which is mathematically
+equivalent to "100% of equity into trade 1, then 100% of resulting
+equity into trade 2, ..." and produced fictional -94% to -99%
+drawdowns on the Schwab universe.
+
+`backtest._simulate_portfolio_equity` replays the trade list through a
+shared equity book with a hard concurrency cap and risk-based (or
+fixed-%) sizing. Profit factor is **unchanged** (it is sizing-invariant
+under equal-weight); `total_return_net_pct`, `max_drawdown_net_pct`,
+and `cagr_net_pct` are now real, deployable numbers.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `BACKTEST_PORTFOLIO_ENABLED` | `true` | Master switch. `false` = legacy aggregator (only for repro). |
+| `BACKTEST_PORTFOLIO_STARTING_EQUITY` | `100000` | Notional starting capital. |
+| `BACKTEST_PORTFOLIO_MAX_POSITIONS` | `10` | Concurrent-position cap. Trades arriving when the book is full are dropped and counted under `portfolio_capacity_filtered`. |
+| `BACKTEST_POSITION_SIZE_PCT` | `0.05` | Fallback fixed allocation per trade (used when no stop distance available). |
+| `BACKTEST_RISK_PER_TRADE_PCT` | `0.0075` | Per-trade equity risk for stop-distance sizing (Minervini/O'Neil convention). Set `0` to force fixed-%. |
+
+Each backtest result now exposes a `portfolio_summary` block with
+`avg_concurrent`, `peak_concurrent`, `capacity_filtered`,
+`risk_sized_count`, `fixed_sized_count`, and `ending_equity`.
+
+The Schwab-only multi-era runner
+(`scripts/run_multi_era_backtest_schwab_only.py`) consumes the same
+helper inside `_aggregate_era`. Chunks now persist `entry_date` and
+`stop_pct` so the simulator can compute accurate concurrency and
+risk-based sizing across the full universe; pre-patch chunks fall back
+to instantaneous closes and fixed-% sizing.
+
+See `validation_artifacts/phase0_sizing_audit_*.md` for the
+before/after comparison that confirmed the legacy DDs were aggregator
+artifacts, not strategy risk.
 
 ## Validation entry points
 

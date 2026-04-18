@@ -46,22 +46,6 @@ def _load_universe_tickers() -> list[str]:
     return _fallback_watchlist()
 
 
-def _max_drawdown_pct(returns: list[float]) -> float:
-    if not returns:
-        return 0.0
-    equity = 1.0
-    peak = 1.0
-    worst = 0.0
-    for r in returns:
-        equity *= (1.0 + float(r))
-        if equity > peak:
-            peak = equity
-        dd = (equity / peak) - 1.0
-        if dd < worst:
-            worst = dd
-    return round(100.0 * worst, 2)
-
-
 def _aggregate_era(
     *,
     name: str,
@@ -70,6 +54,14 @@ def _aggregate_era(
     chunk_payloads: list[dict[str, Any]],
     universe_size: int,
 ) -> dict[str, Any]:
+    from backtest import _simulate_portfolio_equity
+    from config import (
+        get_backtest_portfolio_max_positions,
+        get_backtest_portfolio_starting_equity,
+        get_backtest_position_size_pct,
+        get_backtest_risk_per_trade_pct,
+    )
+
     trades: list[dict[str, Any]] = []
     excluded_total = 0
     for p in chunk_payloads:
@@ -79,10 +71,12 @@ def _aggregate_era(
                 {
                     "return": float(t.get("return", 0.0) or 0.0),
                     "net_return": float(t.get("net_return", 0.0) or 0.0),
+                    "entry_date": str(t.get("entry_date") or ""),
                     "exit_date": str(t.get("exit_date") or ""),
+                    "stop_pct": float(t.get("stop_pct", 0.0) or 0.0),
                 }
             )
-    trades.sort(key=lambda t: t["exit_date"])
+    trades.sort(key=lambda t: (t.get("entry_date") or t.get("exit_date") or "", t.get("exit_date") or ""))
     ret_net = [float(t["net_return"]) for t in trades]
     total = len(trades)
     if total == 0:
@@ -97,26 +91,39 @@ def _aggregate_era(
             "total_trades": 0,
             "universe_size": universe_size,
             "excluded_count": excluded_total,
+            "portfolio_summary": None,
         }
     wins_net = sum(1 for r in ret_net if r > 0)
     gp = sum(r for r in ret_net if r > 0)
     gl = abs(sum(r for r in ret_net if r <= 0))
     pf_net = (gp / gl) if gl > 0 else float("inf")
-    total_ret_net = 1.0
-    for r in ret_net:
-        total_ret_net *= (1.0 + r)
-    total_ret_net -= 1.0
+    portfolio = _simulate_portfolio_equity(
+        trades,
+        starting_equity=get_backtest_portfolio_starting_equity(),
+        max_concurrent_positions=get_backtest_portfolio_max_positions(),
+        position_size_pct=get_backtest_position_size_pct(),
+        risk_per_trade_pct=get_backtest_risk_per_trade_pct(),
+    )
     return {
         "era": name,
         "start": start_date,
         "end": end_date,
         "profit_factor_net": round(float(pf_net), 3) if pf_net != float("inf") else "inf",
-        "total_return_net_pct": round(100.0 * total_ret_net, 2),
-        "max_drawdown_net_pct": _max_drawdown_pct(ret_net),
+        "total_return_net_pct": float(portfolio["total_return_net_pct"]),
+        "max_drawdown_net_pct": float(portfolio["max_drawdown_net_pct"]),
         "win_rate_net": round(100.0 * wins_net / total, 2),
         "total_trades": total,
         "universe_size": universe_size,
         "excluded_count": excluded_total,
+        "portfolio_summary": {
+            "capacity_filtered": int(portfolio["capacity_filtered"]),
+            "avg_concurrent": float(portfolio["avg_concurrent"]),
+            "peak_concurrent": int(portfolio["peak_concurrent"]),
+            "risk_sized_count": int(portfolio["risk_sized_count"]),
+            "fixed_sized_count": int(portfolio["fixed_sized_count"]),
+            "starting_equity": float(portfolio["starting_equity"]),
+            "ending_equity": float(portfolio["ending_equity"]),
+        },
     }
 
 
@@ -145,7 +152,9 @@ def _run_single_chunk(
         {
             "return": float(t.get("return", 0.0) or 0.0),
             "net_return": float(t.get("net_return", 0.0) or 0.0),
+            "entry_date": str(t.get("entry_date") or ""),
             "exit_date": str(t.get("exit_date") or ""),
+            "stop_pct": float(t.get("stop_pct", 0.0) or 0.0),
         }
         for t in trades_in
     ]

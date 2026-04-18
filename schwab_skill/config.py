@@ -369,6 +369,41 @@ def get_vol_target_annualized(skill_dir: Path | None = None) -> float:
     return _get_float("VOL_TARGET_ANNUALIZED", 0.20, skill_dir)
 
 
+# ---------------------------------------------------------------------------
+# Backtest portfolio simulator
+# ---------------------------------------------------------------------------
+# Replays per-trade returns through a shared equity book with a hard
+# concurrency cap and risk-based (or fixed %) sizing. Replaces the legacy
+# (1+r).cumprod() aggregator that treated every trade as a sequential
+# 100%-of-equity roll and produced fictional -95% to -99% drawdowns.
+def get_backtest_portfolio_enabled(skill_dir: Path | None = None) -> bool:
+    """Master switch for the portfolio-level equity simulator (default on)."""
+    return _get_bool("BACKTEST_PORTFOLIO_ENABLED", True, skill_dir)
+
+
+def get_backtest_portfolio_starting_equity(skill_dir: Path | None = None) -> float:
+    """Notional starting capital for the portfolio simulator."""
+    return _get_float("BACKTEST_PORTFOLIO_STARTING_EQUITY", 100_000.0, skill_dir)
+
+
+def get_backtest_portfolio_max_positions(skill_dir: Path | None = None) -> int:
+    """Hard cap on simultaneous open positions in the portfolio simulator."""
+    return max(1, _get_int("BACKTEST_PORTFOLIO_MAX_POSITIONS", 10, skill_dir))
+
+
+def get_backtest_position_size_pct(skill_dir: Path | None = None) -> float:
+    """Fallback fixed allocation (fraction of current equity) per entry when
+    risk-based sizing cannot be computed (e.g. missing stop distance)."""
+    return max(0.001, _get_float("BACKTEST_POSITION_SIZE_PCT", 0.05, skill_dir))
+
+
+def get_backtest_risk_per_trade_pct(skill_dir: Path | None = None) -> float:
+    """Fraction of current equity risked per trade when stop distance is
+    available. Default 0.0075 = 0.75% Minervini/O'Neil convention. Set to
+    0 to force fixed-% sizing only."""
+    return max(0.0, _get_float("BACKTEST_RISK_PER_TRADE_PCT", 0.0075, skill_dir))
+
+
 def get_alert_min_conviction(skill_dir: Path | None = None) -> int:
     """Minimum conviction to send any alert (below = suppressed)."""
     return _get_int("ALERT_MIN_CONVICTION", 20, skill_dir)

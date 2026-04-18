@@ -35,6 +35,11 @@ from backtest_intelligence import (
 from config import (
     get_adaptive_stop_base_pct,
     get_adaptive_stop_enabled,
+    get_backtest_portfolio_enabled,
+    get_backtest_portfolio_max_positions,
+    get_backtest_portfolio_starting_equity,
+    get_backtest_position_size_pct,
+    get_backtest_risk_per_trade_pct,
     get_breakout_confirm_enabled,
     get_forensic_altman_min,
     get_forensic_beneish_max,
@@ -407,7 +412,160 @@ def _net_return_after_costs(
     return float(net), {"slippage_pct": float(slippage_pct), "fees_pct": float(fees_pct), "gross_return": float(gross)}
 
 
+def _simulate_portfolio_equity(
+    trades: list[dict[str, Any]],
+    *,
+    starting_equity: float,
+    max_concurrent_positions: int,
+    position_size_pct: float,
+    risk_per_trade_pct: float,
+) -> dict[str, Any]:
+    """Replay per-trade returns through a shared equity book.
+
+    Each trade carries ``entry_date``, ``exit_date``, ``net_return`` (per-share
+    %), and optionally ``stop_pct`` for risk-based sizing. Trades arriving while
+    the book already holds ``max_concurrent_positions`` open positions are
+    dropped and counted under ``capacity_filtered`` — they remain in the PF
+    numerator/denominator (PF is signal quality, sizing-invariant) but do not
+    contribute to the equity curve.
+
+    Sizing per accepted trade:
+      * If ``risk_per_trade_pct > 0`` AND ``stop_pct`` is finite & positive,
+        allocate ``equity * risk_per_trade_pct / stop_pct`` (capped at 100%
+        of equity to avoid implicit leverage).
+      * Otherwise fall back to ``equity * position_size_pct``.
+
+    Returns a dict with ``equity_curve`` (list of ``(timestamp, equity)``),
+    ``total_return_net_pct``, ``max_drawdown_net_pct``, ``capacity_filtered``,
+    ``avg_concurrent``, ``peak_concurrent``, ``risk_sized_count``,
+    ``fixed_sized_count``.
+    """
+    if not trades:
+        return {
+            "equity_curve": [],
+            "total_return_net_pct": 0.0,
+            "max_drawdown_net_pct": 0.0,
+            "capacity_filtered": 0,
+            "avg_concurrent": 0.0,
+            "peak_concurrent": 0,
+            "risk_sized_count": 0,
+            "fixed_sized_count": 0,
+            "starting_equity": float(starting_equity),
+            "ending_equity": float(starting_equity),
+        }
+
+    parsed: list[dict[str, Any]] = []
+    for t in trades:
+        try:
+            ed = pd.Timestamp(t.get("entry_date") or t.get("exit_date"))
+            xd = pd.Timestamp(t.get("exit_date") or t.get("entry_date"))
+        except Exception:
+            continue
+        if pd.isna(ed) or pd.isna(xd):
+            continue
+        if xd < ed:
+            ed, xd = xd, ed
+        parsed.append({
+            "entry_date": ed,
+            "exit_date": xd,
+            "net_return": float(t.get("net_return", 0.0) or 0.0),
+            "stop_pct": float(t.get("stop_pct", 0.0) or 0.0),
+        })
+    if not parsed:
+        return {
+            "equity_curve": [],
+            "total_return_net_pct": 0.0,
+            "max_drawdown_net_pct": 0.0,
+            "capacity_filtered": 0,
+            "avg_concurrent": 0.0,
+            "peak_concurrent": 0,
+            "risk_sized_count": 0,
+            "fixed_sized_count": 0,
+            "starting_equity": float(starting_equity),
+            "ending_equity": float(starting_equity),
+        }
+
+    parsed.sort(key=lambda t: (t["entry_date"], t["exit_date"]))
+    equity = float(starting_equity)
+    peak = equity
+    worst_dd = 0.0
+    open_positions: list[dict[str, Any]] = []
+    capacity_filtered = 0
+    risk_sized = 0
+    fixed_sized = 0
+    concurrent_samples: list[int] = []
+    peak_concurrent = 0
+    curve: list[tuple[str, float]] = [(parsed[0]["entry_date"].isoformat(), equity)]
+
+    def _close_due(now: pd.Timestamp) -> None:
+        nonlocal equity, peak, worst_dd
+        still_open: list[dict[str, Any]] = []
+        ready = [p for p in open_positions if p["exit_date"] <= now]
+        ready.sort(key=lambda p: p["exit_date"])
+        for p in ready:
+            equity += p["allocated"] * p["net_return"]
+            if equity > peak:
+                peak = equity
+            if peak > 0:
+                dd = (equity / peak) - 1.0
+                if dd < worst_dd:
+                    worst_dd = dd
+            curve.append((p["exit_date"].isoformat(), equity))
+        for p in open_positions:
+            if p["exit_date"] > now:
+                still_open.append(p)
+        open_positions[:] = still_open
+
+    for t in parsed:
+        _close_due(t["entry_date"])
+        if len(open_positions) >= max_concurrent_positions:
+            capacity_filtered += 1
+            continue
+        if risk_per_trade_pct > 0 and t["stop_pct"] > 0:
+            allocated = min(equity, equity * risk_per_trade_pct / t["stop_pct"])
+            risk_sized += 1
+        else:
+            allocated = equity * position_size_pct
+            fixed_sized += 1
+        if allocated <= 0 or equity <= 0:
+            capacity_filtered += 1
+            continue
+        open_positions.append({
+            "exit_date": t["exit_date"],
+            "net_return": t["net_return"],
+            "allocated": allocated,
+        })
+        concurrent_samples.append(len(open_positions))
+        if len(open_positions) > peak_concurrent:
+            peak_concurrent = len(open_positions)
+
+    if open_positions:
+        last = max(p["exit_date"] for p in open_positions)
+        _close_due(last + pd.Timedelta(days=1))
+
+    total_return = (equity / starting_equity) - 1.0 if starting_equity > 0 else 0.0
+    avg_concurrent = (
+        sum(concurrent_samples) / len(concurrent_samples) if concurrent_samples else 0.0
+    )
+    return {
+        "equity_curve": curve,
+        "total_return_net_pct": round(100.0 * total_return, 4),
+        "max_drawdown_net_pct": round(100.0 * worst_dd, 4),
+        "capacity_filtered": int(capacity_filtered),
+        "avg_concurrent": round(float(avg_concurrent), 3),
+        "peak_concurrent": int(peak_concurrent),
+        "risk_sized_count": int(risk_sized),
+        "fixed_sized_count": int(fixed_sized),
+        "starting_equity": float(starting_equity),
+        "ending_equity": float(equity),
+    }
+
+
 def _max_drawdown(returns: pd.Series) -> float:
+    """Legacy single-asset drawdown helper retained ONLY for callers that
+    explicitly opt out of the portfolio simulator. Treats the trade list as a
+    sequential 100%-of-equity roll, which is **not** a real portfolio metric;
+    do not surface its output as a deployable risk number."""
     if returns.empty:
         return 0.0
     equity = (1.0 + returns).cumprod()
@@ -869,19 +1027,47 @@ def _run_backtest_core(
     gross_loss_net = abs(float(ret_net[ret_net <= 0].sum())) if (ret_net <= 0).any() else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
     profit_factor_net = (gross_profit_net / gross_loss_net) if gross_loss_net > 0 else float("inf")
-    total_ret = float((1.0 + ret).prod() - 1.0)
-    total_ret_net = float((1.0 + ret_net).prod() - 1.0)
+
+    portfolio_enabled = get_backtest_portfolio_enabled(sd)
+    if portfolio_enabled:
+        portfolio = _simulate_portfolio_equity(
+            all_trades,
+            starting_equity=get_backtest_portfolio_starting_equity(sd),
+            max_concurrent_positions=get_backtest_portfolio_max_positions(sd),
+            position_size_pct=get_backtest_position_size_pct(sd),
+            risk_per_trade_pct=get_backtest_risk_per_trade_pct(sd),
+        )
+        portfolio_gross = _simulate_portfolio_equity(
+            [{**t, "net_return": t.get("return", 0.0)} for t in all_trades],
+            starting_equity=get_backtest_portfolio_starting_equity(sd),
+            max_concurrent_positions=get_backtest_portfolio_max_positions(sd),
+            position_size_pct=get_backtest_position_size_pct(sd),
+            risk_per_trade_pct=get_backtest_risk_per_trade_pct(sd),
+        )
+        total_ret_net = float(portfolio["total_return_net_pct"]) / 100.0
+        total_ret = float(portfolio_gross["total_return_net_pct"]) / 100.0
+        max_dd_net = float(portfolio["max_drawdown_net_pct"]) / 100.0
+        max_dd = float(portfolio_gross["max_drawdown_net_pct"]) / 100.0
+        diagnostics["portfolio_capacity_filtered"] = int(portfolio.get("capacity_filtered", 0))
+        diagnostics["portfolio_avg_concurrent"] = float(portfolio.get("avg_concurrent", 0.0))
+        diagnostics["portfolio_peak_concurrent"] = int(portfolio.get("peak_concurrent", 0))
+        diagnostics["portfolio_risk_sized_count"] = int(portfolio.get("risk_sized_count", 0))
+        diagnostics["portfolio_fixed_sized_count"] = int(portfolio.get("fixed_sized_count", 0))
+    else:
+        portfolio = None
+        total_ret = float((1.0 + ret).prod() - 1.0)
+        total_ret_net = float((1.0 + ret_net).prod() - 1.0)
+        max_dd = _max_drawdown(ret)
+        max_dd_net = _max_drawdown(ret_net)
     years = max(1e-9, (pd.Timestamp(end) - pd.Timestamp(start)).days / 365.25)
     cagr = float((1.0 + total_ret) ** (1.0 / years) - 1.0) if total_ret > -1.0 else -1.0
     cagr_net = float((1.0 + total_ret_net) ** (1.0 / years) - 1.0) if total_ret_net > -1.0 else -1.0
-    max_dd = _max_drawdown(ret)
-    max_dd_net = _max_drawdown(ret_net)
 
     findings = (
         f"Live-parity backtest generated {total} trades across {len(context.watchlist)} symbols. "
         f"Gross win rate {100.0 * wins / total:.1f}%, net win rate {100.0 * wins_net / total:.1f}%, "
-        f"gross return {100.0 * total_ret:.2f}%, net return {100.0 * total_ret_net:.2f}%, "
-        f"gross CAGR {100.0 * cagr:.2f}%, net CAGR {100.0 * cagr_net:.2f}%."
+        f"portfolio net return {100.0 * total_ret_net:.2f}% with max DD {100.0 * max_dd_net:.2f}%, "
+        f"net PF {profit_factor_net if profit_factor_net == float('inf') else round(float(profit_factor_net), 3)}."
     )
 
     out = {
@@ -904,6 +1090,23 @@ def _run_backtest_core(
         "profit_factor_net": round(float(profit_factor_net), 3) if profit_factor_net != float("inf") else "inf",
         "max_drawdown_pct": round(100.0 * max_dd, 2),
         "max_drawdown_net_pct": round(100.0 * max_dd_net, 2),
+        "portfolio_enabled": bool(portfolio_enabled),
+        "portfolio_summary": (
+            {
+                k: portfolio[k]
+                for k in (
+                    "capacity_filtered",
+                    "avg_concurrent",
+                    "peak_concurrent",
+                    "risk_sized_count",
+                    "fixed_sized_count",
+                    "starting_equity",
+                    "ending_equity",
+                )
+            }
+            if portfolio
+            else None
+        ),
         "avg_holding_days": HOLD_DAYS,
         "trailing_stop_pct": round(100.0 * stop_pct_base, 2),
         "adaptive_stop_enabled": bool(adaptive_stop_enabled),

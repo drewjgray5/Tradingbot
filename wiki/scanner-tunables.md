@@ -63,13 +63,27 @@ tags: [config, scanner, tunables]
 | `SIGNAL_UNIVERSE_MODE` | broad | `broad` or `focused` |
 | `SIGNAL_SCAN_FULL_UNIVERSE` | true | Skip prefiltering |
 
+## Backtest Portfolio Simulator
+
+Replay-time only. Replaces the legacy `(1+r).cumprod()` chain that
+produced fictional drawdowns. See [[backtest]] for full context.
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `BACKTEST_PORTFOLIO_ENABLED` | true | Master switch; `false` reverts to legacy aggregator (repro only) |
+| `BACKTEST_PORTFOLIO_STARTING_EQUITY` | 100000 | Notional starting capital for the equity book |
+| `BACKTEST_PORTFOLIO_MAX_POSITIONS` | 10 | Hard cap on simultaneous open positions |
+| `BACKTEST_POSITION_SIZE_PCT` | 0.05 | Fallback fixed allocation per trade when no stop distance available |
+| `BACKTEST_RISK_PER_TRADE_PCT` | 0.0075 | Per-trade equity risk for stop-distance sizing (0 to disable) |
+
 ## Related Pages
 
 - [[signal-scanner]] — how the scanner works
 - [[stage-2-analysis]], [[vcp-detection]] — what the thresholds mean
 - [[quality-gates]] — quality gate tunables
+- [[backtest]] — portfolio simulator + harness behaviour
 - [[feature-flags]] — other config domains
 
 ---
 
-*Last compiled: 2026-04-13*
+*Last compiled: 2026-04-18*
