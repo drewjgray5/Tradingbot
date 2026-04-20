@@ -988,9 +988,11 @@ async function loadConfig() {
           message: "Brokerage side linked (balances, positions, orders). If you have not yet, also connect market data.",
           severity: "success",
         });
+        try { showToast("Schwab account linked.", "success", 4000); } catch { /* ignore */ }
       } else {
         logEvent({ kind: "system", severity: "error", message: `Schwab OAuth: ${msg || "failed"}` });
         updateActionCenter({ title: "Schwab OAuth", message: msg || "Connection failed.", severity: "error" });
+        try { showToast(`Schwab OAuth: ${msg || "failed"}`, "error", 6000); } catch { /* ignore */ }
       }
     }
     if (marketOauthSt) {
@@ -1001,6 +1003,7 @@ async function loadConfig() {
           message: "Market data linked (quotes and history for scans).",
           severity: "success",
         });
+        try { showToast("Schwab market data linked.", "success", 4000); } catch { /* ignore */ }
       } else {
         logEvent({ kind: "system", severity: "error", message: `Schwab market OAuth: ${msg || "failed"}` });
         updateActionCenter({
@@ -1008,7 +1011,21 @@ async function loadConfig() {
           message: msg || "Connection failed.",
           severity: "error",
         });
+        try { showToast(`Schwab market OAuth: ${msg || "failed"}`, "error", 6000); } catch { /* ignore */ }
       }
+    }
+
+    // After any Schwab OAuth callback, the server has updated /api/onboarding/status
+    // (schwab_linked, wizard_required, etc.). Re-pull it so the wizard stepper, CTA,
+    // and connection meta line reflect the new state instead of the cached pre-link view.
+    try {
+      await refreshOnboarding();
+    } catch (err) {
+      logEvent({
+        kind: "system",
+        severity: "warn",
+        message: `Could not refresh onboarding after OAuth: ${err?.message || err}`,
+      });
     }
   }
 }
