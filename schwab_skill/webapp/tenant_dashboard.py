@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import struct
@@ -104,6 +105,8 @@ from .security import (
     utcnow_iso,
 )
 from .tenant_runtime import tenant_skill_dir, user_has_account_session
+
+LOG = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -1744,30 +1747,39 @@ def schwab_oauth_callback(
     if not access or not refresh:
         return red("schwab_oauth=error&message=" + urllib.parse.quote("token_response_missing_tokens"))
 
-    row = db.query(UserCredential).filter(UserCredential.user_id == user_id).first()
-    if not row:
-        row = UserCredential(user_id=user_id)
-        db.add(row)
+    try:
+        row = db.query(UserCredential).filter(UserCredential.user_id == user_id).first()
+        if not row:
+            row = UserCredential(user_id=user_id)
+            db.add(row)
 
-    row.access_token_enc = encrypt_secret(access)
-    row.refresh_token_enc = encrypt_secret(refresh)
-    row.token_type = (str(tok.get("token_type") or "Bearer").strip() or "Bearer")
-    exp_in = tok.get("expires_in")
-    if exp_in is not None:
+        row.access_token_enc = encrypt_secret(access)
+        row.refresh_token_enc = encrypt_secret(refresh)
+        row.token_type = (str(tok.get("token_type") or "Bearer").strip() or "Bearer")
+        exp_in = tok.get("expires_in")
+        if exp_in is not None:
+            try:
+                row.expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(exp_in))
+            except Exception:
+                row.expires_at = None
+        scope_raw = tok.get("scope")
+        if isinstance(scope_raw, str) and scope_raw.strip():
+            parts = [p.strip() for p in scope_raw.replace(",", " ").split() if p.strip()]
+            row.scopes = parse_scopes(parts)
+        else:
+            row.scopes = parse_scopes(None)
+        row.account_token_payload_enc = encrypt_secret(json.dumps(tok, default=_json_default))
+
+        db.commit()
+        db.refresh(row)
+    except Exception as exc:
         try:
-            row.expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(exp_in))
+            db.rollback()
         except Exception:
-            row.expires_at = None
-    scope_raw = tok.get("scope")
-    if isinstance(scope_raw, str) and scope_raw.strip():
-        parts = [p.strip() for p in scope_raw.replace(",", " ").split() if p.strip()]
-        row.scopes = parse_scopes(parts)
-    else:
-        row.scopes = parse_scopes(None)
-    row.account_token_payload_enc = encrypt_secret(json.dumps(tok, default=_json_default))
-
-    db.commit()
-    db.refresh(row)
+            pass
+        LOG.exception("schwab_oauth_callback: failed to persist tokens for user_id=%s", user_id)
+        safe_error = safe_exception_message(exc, fallback="token_storage_failed")
+        return red("schwab_oauth=error&message=" + urllib.parse.quote(safe_error[:180]))
 
     _save_state(
         db,
@@ -1841,15 +1853,26 @@ def schwab_market_oauth_callback(
             + urllib.parse.quote("token_response_missing_tokens")
         )
 
-    row = db.query(UserCredential).filter(UserCredential.user_id == user_id).first()
-    if not row:
-        row = UserCredential(user_id=user_id)
-        db.add(row)
+    try:
+        row = db.query(UserCredential).filter(UserCredential.user_id == user_id).first()
+        if not row:
+            row = UserCredential(user_id=user_id)
+            db.add(row)
 
-    row.market_token_payload_enc = encrypt_secret(json.dumps(tok, default=_json_default))
+        row.market_token_payload_enc = encrypt_secret(json.dumps(tok, default=_json_default))
 
-    db.commit()
-    db.refresh(row)
+        db.commit()
+        db.refresh(row)
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        LOG.exception(
+            "schwab_market_oauth_callback: failed to persist tokens for user_id=%s", user_id
+        )
+        safe_error = safe_exception_message(exc, fallback="token_storage_failed")
+        return red("schwab_market_oauth=error&message=" + urllib.parse.quote(safe_error[:180]))
 
     log_audit(
         db,
