@@ -325,11 +325,11 @@ def _tenant_api_health_snapshot(db: OrmSession, user_id: str) -> dict[str, Any]:
     if linked:
         try:
             with tenant_skill_dir(db, user_id) as skill_dir:
-                auth = DualSchwabAuth(skill_dir=skill_dir)
-                market_ok = bool(auth.get_market_token())
-                account_ok = bool(auth.get_account_token())
-                quote, qmeta = get_current_quote_with_status("AAPL", auth=auth, skill_dir=skill_dir)
-                quote_ok = extract_schwab_last_price(quote) is not None
+                with DualSchwabAuth(skill_dir=skill_dir, auto_refresh=False) as auth:
+                    market_ok = bool(auth.get_market_token())
+                    account_ok = bool(auth.get_account_token())
+                    quote, qmeta = get_current_quote_with_status("AAPL", auth=auth, skill_dir=skill_dir)
+                    quote_ok = extract_schwab_last_price(quote) is not None
         except Exception as exc:
             return {
                 "schwab_linked": True,
@@ -668,10 +668,10 @@ def tenant_health_deep(user: User = Depends(get_current_user), db: OrmSession = 
         if not quote_ok and snap.get("schwab_linked"):
             try:
                 with tenant_skill_dir(db, user.id) as skill_dir:
-                    auth = DualSchwabAuth(skill_dir=skill_dir)
-                    _quote, qmeta = get_current_quote_with_status("AAPL", auth=auth, skill_dir=skill_dir)
-                    qh["operator_hint"] = _quote_health_hint(qmeta, quote_ok)
-                    qh["reason"] = qmeta.get("reason")
+                    with DualSchwabAuth(skill_dir=skill_dir, auto_refresh=False) as auth:
+                        _quote, qmeta = get_current_quote_with_status("AAPL", auth=auth, skill_dir=skill_dir)
+                        qh["operator_hint"] = _quote_health_hint(qmeta, quote_ok)
+                        qh["reason"] = qmeta.get("reason")
             except Exception:
                 pass
         return _ok(
@@ -713,7 +713,8 @@ def tenant_sectors(user: User = Depends(get_current_user), db: OrmSession = Depe
         return _err("Link Schwab account before loading sectors.")
     try:
         with tenant_skill_dir(db, user.id) as skill_dir:
-            heatmap = get_sector_heatmap(auth=DualSchwabAuth(skill_dir=skill_dir), skill_dir=skill_dir)
+            with DualSchwabAuth(skill_dir=skill_dir, auto_refresh=False) as auth:
+                heatmap = get_sector_heatmap(auth=auth, skill_dir=skill_dir)
         return _ok(heatmap)
     except Exception as exc:
         return _saas_error_response(exc, source="sectors", fallback="Unable to load sector heatmap right now.")
@@ -749,18 +750,18 @@ def tenant_create_pending(
         ticker = payload.ticker.upper().strip()
         signal = payload.signal or {}
         with tenant_skill_dir(db, user.id) as skill_dir:
-            auth = DualSchwabAuth(skill_dir=skill_dir)
-            quote = get_current_quote(ticker, auth=auth, skill_dir=skill_dir)
-            last_price = payload.price or extract_schwab_last_price(quote) or float(signal.get("price", 0) or 0)
+            with DualSchwabAuth(skill_dir=skill_dir, auto_refresh=False) as auth:
+                quote = get_current_quote(ticker, auth=auth, skill_dir=skill_dir)
+                last_price = payload.price or extract_schwab_last_price(quote) or float(signal.get("price", 0) or 0)
 
-            qty = payload.qty
-            if qty is None:
-                usd_size = get_position_size_usd(
-                    ticker=ticker,
-                    price=last_price if last_price > 0 else None,
-                    skill_dir=skill_dir,
-                )
-                qty = max(1, int(usd_size / last_price)) if last_price > 0 else 1
+                qty = payload.qty
+                if qty is None:
+                    usd_size = get_position_size_usd(
+                        ticker=ticker,
+                        price=last_price if last_price > 0 else None,
+                        skill_dir=skill_dir,
+                    )
+                    qty = max(1, int(usd_size / last_price)) if last_price > 0 else 1
 
         trade_id = uuid.uuid4().hex[:8]
         row = PendingTrade(
@@ -1020,8 +1021,8 @@ def tenant_check_ticker(
         return _err("Link Schwab account before running a quick check.")
     try:
         with tenant_skill_dir(db, user.id) as skill_dir:
-            auth = DualSchwabAuth(skill_dir=skill_dir)
-            data = quick_check(ticker.upper().strip(), auth=auth, skill_dir=skill_dir)
+            with DualSchwabAuth(skill_dir=skill_dir, auto_refresh=False) as auth:
+                data = quick_check(ticker.upper().strip(), auth=auth, skill_dir=skill_dir)
         return _ok(data)
     except Exception as exc:
         return _saas_error_response(exc, source="quick_check", fallback="Quick ticker check failed.")
@@ -1040,24 +1041,24 @@ def tenant_report_ticker(
         return _err("Link Schwab account before loading a full report.")
     try:
         with tenant_skill_dir(db, user.id) as skill_dir:
-            auth = DualSchwabAuth(skill_dir=skill_dir)
-            section_key = None
-            if section:
-                section_key = REPORT_SECTION_MAP.get(section.lower().strip())
-                if not section_key:
-                    return ApiResponse(
-                        ok=False,
-                        error=(
-                            f"Invalid section '{section}'. Use: tech, dcf, comps, health, edgar, mirofish."
-                        ),
-                    )
-            report = generate_full_report(
-                ticker.upper().strip(),
-                skip_mirofish=skip_mirofish,
-                skip_edgar=skip_edgar,
-                auth=auth,
-                skill_dir=skill_dir,
-            )
+            with DualSchwabAuth(skill_dir=skill_dir, auto_refresh=False) as auth:
+                section_key = None
+                if section:
+                    section_key = REPORT_SECTION_MAP.get(section.lower().strip())
+                    if not section_key:
+                        return ApiResponse(
+                            ok=False,
+                            error=(
+                                f"Invalid section '{section}'. Use: tech, dcf, comps, health, edgar, mirofish."
+                            ),
+                        )
+                report = generate_full_report(
+                    ticker.upper().strip(),
+                    skip_mirofish=skip_mirofish,
+                    skip_edgar=skip_edgar,
+                    auth=auth,
+                    skill_dir=skill_dir,
+                )
             data = json.loads(report_to_json(report))
             section_verdicts = _build_report_verdicts(data)
             if section_key:
@@ -1629,17 +1630,17 @@ def tenant_onboarding_step(
             os.environ["EXECUTION_SHADOW_MODE"] = "1"
             try:
                 with tenant_skill_dir(db, user.id) as skill_dir:
-                    auth = DualSchwabAuth(skill_dir=skill_dir)
-                    quote = get_current_quote("AAPL", auth=auth, skill_dir=skill_dir)
-                    price = extract_schwab_last_price(quote) or 100.0
-                    result = place_order(
-                        ticker="AAPL",
-                        qty=1,
-                        side="BUY",
-                        order_type="MARKET",
-                        price_hint=price,
-                        skill_dir=skill_dir,
-                    )
+                    with DualSchwabAuth(skill_dir=skill_dir, auto_refresh=False) as auth:
+                        quote = get_current_quote("AAPL", auth=auth, skill_dir=skill_dir)
+                        price = extract_schwab_last_price(quote) or 100.0
+                        result = place_order(
+                            ticker="AAPL",
+                            qty=1,
+                            side="BUY",
+                            order_type="MARKET",
+                            price_hint=price,
+                            skill_dir=skill_dir,
+                        )
                 ok = isinstance(result, dict) and bool(result.get("shadow_mode"))
                 steps["test_paper_order"] = {
                     "ok": ok,

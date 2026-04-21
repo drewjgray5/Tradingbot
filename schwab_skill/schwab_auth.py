@@ -137,6 +137,7 @@ class SchwabSession:
         redirect_uri: str,
         token_path: Path,
         skill_dir: Path,
+        auto_refresh: bool | None = None,
     ):
         self.session_name = session_name
         self.client_id = client_id
@@ -144,6 +145,20 @@ class SchwabSession:
         self.redirect_uri = redirect_uri
         self.token_path = token_path
         self.skill_dir = skill_dir
+        # When False, do NOT spawn the 25-min background refresh thread on token
+        # load. Used by SaaS code paths that build an ephemeral DualSchwabAuth
+        # per request: leaving the thread alive after the request finishes
+        # leaks orphan threads that race on Schwab's single-use refresh tokens
+        # and cause `400 unsupported_token_type` storms. If `auto_refresh` is
+        # None (the default), the value is taken from the env var
+        # SCHWAB_AUTO_REFRESH (set to "0"/"false" to disable globally).
+        if auto_refresh is None:
+            env_val = (os.environ.get("SCHWAB_AUTO_REFRESH") or "").strip().lower()
+            if env_val in ("0", "false", "no", "off"):
+                auto_refresh = False
+            else:
+                auto_refresh = True
+        self.auto_refresh = auto_refresh
         self._tokens: dict | None = None
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -203,11 +218,20 @@ class SchwabSession:
                     log.warning("Token refresh failed for %s: %s", self.session_name, e)
 
     def _start_refresh(self) -> None:
+        if not self.auto_refresh:
+            return
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._refresh_loop, daemon=True)
         self._thread.start()
+
+    def stop_refresh(self) -> None:
+        """Signal the background refresh thread to exit. Safe to call multiple times."""
+        try:
+            self._stop.set()
+        except Exception:
+            pass
 
     def get_access_token(self) -> str | None:
         with self._lock:
@@ -258,7 +282,11 @@ class DualSchwabAuth:
     Dual-session manager: Market Session + Account Session.
     """
 
-    def __init__(self, skill_dir: Path | str | None = None):
+    def __init__(
+        self,
+        skill_dir: Path | str | None = None,
+        auto_refresh: bool | None = None,
+    ):
         self.skill_dir = Path(skill_dir or Path(__file__).resolve().parent)
         env = _load_env(self.skill_dir / ".env")
 
@@ -277,6 +305,7 @@ class DualSchwabAuth:
             redirect_uri=market_callback,
             token_path=self.skill_dir / "tokens_market.enc",
             skill_dir=self.skill_dir,
+            auto_refresh=auto_refresh,
         )
         self.account_session = SchwabSession(
             session_name="account",
@@ -285,7 +314,25 @@ class DualSchwabAuth:
             redirect_uri=account_callback,
             token_path=self.skill_dir / "tokens_account.enc",
             skill_dir=self.skill_dir,
+            auto_refresh=auto_refresh,
         )
+
+    def close(self) -> None:
+        """Stop background refresh threads on both sessions. Idempotent."""
+        try:
+            self.market_session.stop_refresh()
+        except Exception:
+            pass
+        try:
+            self.account_session.stop_refresh()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "DualSchwabAuth":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def get_market_token(self) -> str:
         return self.market_session.ensure_authenticated()

@@ -122,6 +122,16 @@ def _validate_startup_configuration() -> None:
         raise RuntimeError(f"Missing required production configuration: {joined}")
 
 
+# SaaS workers and API processes use ephemeral, per-request DualSchwabAuth
+# instances backed by tokens materialised from the per-tenant DB row. The
+# 25-min background refresh thread that SchwabSession spawns by default leaks
+# orphan threads across requests that race on Schwab's single-use refresh
+# tokens and produce `400 unsupported_token_type` storms (which then degrade
+# market quotes for the user). Disable the background refresh loop globally
+# for SaaS processes; tokens get refreshed on demand via `force_refresh()`
+# inside `get_current_quote_with_status()` and friends.
+os.environ.setdefault("SCHWAB_AUTO_REFRESH", "0")
+
 app = FastAPI(
     title="TradingBot SaaS API",
     version="1.0.0",

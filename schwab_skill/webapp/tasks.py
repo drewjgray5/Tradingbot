@@ -23,6 +23,13 @@ from .tenant_runtime import tenant_skill_dir
 
 LOG = logging.getLogger(__name__)
 
+# Celery worker uses ephemeral per-tenant DualSchwabAuth (built inside scanner /
+# execution call sites) — disable the SchwabSession background refresh thread
+# globally to prevent orphan threads racing on Schwab's single-use refresh
+# tokens (root cause of `400 unsupported_token_type` storms that degrade
+# market quotes on the dashboard).
+os.environ.setdefault("SCHWAB_AUTO_REFRESH", "0")
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 celery_app = Celery(
