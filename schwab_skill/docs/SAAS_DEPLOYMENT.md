@@ -27,6 +27,10 @@ If you want the shortest path to a safe deploy, do this first:
    - `GET /api/health/ready` -> 200 (returns 503 when not ready)
    - authenticated `GET /api/me`
 
+Render web service health check path should point to `GET /healthz` (liveness),
+not `/api/health/ready` (deep readiness), so transient worker/Redis issues do
+not cancel deploys or restart an otherwise healthy API process.
+
 If these 5 checks pass, the core production baseline is in place.
 
 ## Fastest safe path (operator checklist)
@@ -211,6 +215,7 @@ celery -A webapp.tasks worker -Q scan,orders,celery --loglevel=info
 | `SAAS_RATE_ORDER_PER_MIN` | `30` | Order enqueue per user per window |
 | `SAAS_RATE_LIMIT_WINDOW_SEC` | `60` | Fixed window for rate limits |
 | `SAAS_HEALTH_REQUIRE_REDIS` | `1` | If `0`, readiness skips Redis |
+| `SAAS_RATE_LIMIT_FAIL_OPEN` | `0` | If `1`, scan/order cooldown + rate-limit checks fail open when Redis is temporarily unavailable (recommended on free Redis to reduce false 5xx/429-style blocking during restarts) |
 | `WEB_ALLOWED_ORIGINS` | (required in production) | CORS allowlist (comma-separated). In production-like mode this should be explicitly set. |
 | `WEB_INTERNAL_API_KEY` | (recommended) | Required for `/metrics` access from non-local hosts; send header `X-Internal-Key`. |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` / `DB_POOL_TIMEOUT` | `5` / `10` / `30` | Postgres pool (non-SQLite) |

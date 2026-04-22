@@ -536,13 +536,13 @@ async function waitSaaS(taskId) {
     if (celery === "pending" || celery === "received") {
       headline.textContent = "Scan queued…";
       setProgress(0.12, "Waiting for worker");
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 5000));
       continue;
     }
     if (celery === "started" || celery === "retry") {
       headline.textContent = "Scan running…";
       setProgress(0.55, "Running");
-      await new Promise((r) => setTimeout(r, 3000));
+      await new Promise((r) => setTimeout(r, 7000));
       continue;
     }
     if (celery === "success") {
@@ -590,7 +590,7 @@ async function waitSaaS(taskId) {
       setProgress(0, "");
       return;
     }
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 5000));
   }
   setMessage("Scan still running — open the full dashboard or retry later.", "warn");
 }

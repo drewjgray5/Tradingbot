@@ -24,7 +24,9 @@ services:
     rootDir: schwab_skill
     dockerfilePath: ./Dockerfile.saas
     dockerContext: .
-    healthCheckPath: /api/health/ready
+    # Keep Render deploy health independent of Redis/worker blips.
+    # Deep readiness remains available at /api/health/ready for operators.
+    healthCheckPath: /healthz
     envVars:
       - key: DATABASE_URL
         fromDatabase:
@@ -36,6 +38,10 @@ services:
           type: keyvalue
           property: connectionString
       - key: SAAS_HEALTH_REQUIRE_REDIS
+        value: "1"
+      # Free Redis can restart and lose ephemeral keys; fail open for
+      # rate-limit/cooldown guards so temporary cache outages do not hard-stop API.
+      - key: SAAS_RATE_LIMIT_FAIL_OPEN
         value: "1"
       - key: SAAS_RUN_ALEMBIC
         value: "1"

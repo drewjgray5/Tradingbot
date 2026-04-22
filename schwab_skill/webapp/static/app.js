@@ -1442,7 +1442,7 @@ async function waitForSaaScanCompletion(taskId) {
           severity: "info",
         });
       }
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 5000));
       continue;
     }
     firstPendingAt = null;
@@ -1454,7 +1454,7 @@ async function waitForSaaScanCompletion(taskId) {
         message: "Scan task is executing. Results will appear below when finished.",
         severity: "info",
       });
-      await new Promise((r) => setTimeout(r, 4000));
+      await new Promise((r) => setTimeout(r, 7000));
       continue;
     }
     if (celeryStatus === "success") {
@@ -1530,7 +1530,7 @@ async function waitForSaaScanCompletion(taskId) {
       setJobProgress("scanJobProgress", "scanJobProgressLabel", 0, "");
       return;
     }
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 5000));
   }
   metaEl.textContent = "Scan still running. Use Refresh to check progress.";
   updateTopStrategyChip(null);

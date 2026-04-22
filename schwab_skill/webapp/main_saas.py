@@ -88,6 +88,9 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 _ALEMBIC_INI = APP_DIR.parent / "alembic.ini"
 LOG = logging.getLogger("webapp.saas")
+_CELERY_INSPECT_CACHE_TTL_SEC = max(0.0, float(os.getenv("SAAS_CELERY_INSPECT_CACHE_SEC", "6")))
+_CELERY_QUEUE_ESTIMATE_CACHE: tuple[float, dict[str, Any]] | None = None
+_CELERY_WORKER_HEALTH_CACHE: tuple[float, dict[str, Any]] | None = None
 
 if os.getenv("SAAS_BOOTSTRAP_SCHEMA", "").lower() in ("1", "true", "yes"):
     Base.metadata.create_all(bind=engine)
@@ -402,28 +405,50 @@ def _scan_daily_limit_check(user_id: str, user: User) -> tuple[int, int]:
 
 
 def _celery_queue_estimate() -> dict[str, Any]:
+    global _CELERY_QUEUE_ESTIMATE_CACHE
+    now = time.monotonic()
+    cached = _CELERY_QUEUE_ESTIMATE_CACHE
+    if cached and (now - cached[0]) < _CELERY_INSPECT_CACHE_TTL_SEC:
+        return cached[1]
     try:
         insp = celery_app.control.inspect(timeout=0.75)
         if not insp:
-            return {"inspect_available": False}
+            out = {"inspect_available": False}
+            _CELERY_QUEUE_ESTIMATE_CACHE = (now, out)
+            return out
         reserved = insp.reserved() or {}
         scheduled = insp.scheduled() or {}
         active = insp.active() or {}
-        return {
+        out = {
             "inspect_available": True,
             "reserved_total": sum(len(v) for v in reserved.values()),
             "scheduled_total": sum(len(v) for v in scheduled.values()),
             "active_total": sum(len(v) for v in active.values()),
         }
+        _CELERY_QUEUE_ESTIMATE_CACHE = (now, out)
+        return out
     except Exception:
-        return {"inspect_available": False}
+        if cached:
+            return {
+                **cached[1],
+                "inspect_cached": True,
+                "inspect_error": True,
+            }
+        return {"inspect_available": False, "inspect_error": True}
 
 
 def _celery_worker_health() -> dict[str, Any]:
+    global _CELERY_WORKER_HEALTH_CACHE
+    now = time.monotonic()
+    cached = _CELERY_WORKER_HEALTH_CACHE
+    if cached and (now - cached[0]) < _CELERY_INSPECT_CACHE_TTL_SEC:
+        return cached[1]
     try:
         insp = celery_app.control.inspect(timeout=0.75)
         if not insp:
-            return {"reachable": False, "workers": 0, "queues": []}
+            out = {"reachable": False, "workers": 0, "queues": []}
+            _CELERY_WORKER_HEALTH_CACHE = (now, out)
+            return out
         ping = insp.ping() or {}
         active_queues = insp.active_queues() or {}
         queues: set[str] = set()
@@ -436,13 +461,21 @@ def _celery_worker_health() -> dict[str, Any]:
                 name = str(queue.get("name") or "").strip()
                 if name:
                     queues.add(name)
-        return {
+        out = {
             "reachable": bool(ping),
             "workers": len(ping),
             "queues": sorted(queues),
         }
+        _CELERY_WORKER_HEALTH_CACHE = (now, out)
+        return out
     except Exception:
-        return {"reachable": False, "workers": 0, "queues": []}
+        if cached:
+            return {
+                **cached[1],
+                "inspect_cached": True,
+                "inspect_error": True,
+            }
+        return {"reachable": False, "workers": 0, "queues": [], "inspect_error": True}
 
 
 def _order_rate_limit(user_id: str) -> None:

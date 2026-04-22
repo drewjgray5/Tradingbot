@@ -45,6 +45,10 @@ _celery_conf: dict[str, Any] = {
     "accept_content": ["json"],
     "result_serializer": "json",
     "timezone": "UTC",
+    # Keep broker pressure lower on small/free Redis footprints.
+    "worker_prefetch_multiplier": 1,
+    "broker_pool_limit": int(os.getenv("CELERY_BROKER_POOL_LIMIT", "5")),
+    "result_expires": int(os.getenv("CELERY_RESULT_EXPIRES_SEC", "3600")),
     "task_routes": {
         "webapp.scan_for_user": {"queue": "scan"},
         "webapp.execute_order_for_user": {"queue": "orders"},
