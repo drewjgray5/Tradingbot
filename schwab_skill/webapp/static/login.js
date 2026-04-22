@@ -61,6 +61,25 @@ function clearStoredApiJwt() {
   clearLegacyApiJwtKeys();
 }
 
+async function copyTextToClipboard(text) {
+  const value = String(text || "");
+  if (!value) return false;
+  if (navigator?.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return true;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = value;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "absolute";
+  ta.style.left = "-9999px";
+  document.body.appendChild(ta);
+  ta.select();
+  const ok = document.execCommand("copy");
+  document.body.removeChild(ta);
+  return ok;
+}
+
 async function createCookieSession(token) {
   const clean = normalizeUserJwt(token);
   if (!clean || !AuthJwt.isProbablyAccessJwt(clean)) return;
@@ -190,6 +209,19 @@ async function main() {
       void clearCookieSession();
       clearStoredApiJwt();
       setMessage("Token cleared.");
+    }
+  });
+  document.getElementById("loginJwtCopy")?.addEventListener("click", async () => {
+    const val = normalizeUserJwt(jwtInput?.value || readStoredApiJwt());
+    if (!val) {
+      setMessage("No token found to copy.");
+      return;
+    }
+    try {
+      const ok = await copyTextToClipboard(val);
+      setMessage(ok ? "Token copied." : "Copy blocked by browser.");
+    } catch {
+      setMessage("Copy failed. Browser denied clipboard access.");
     }
   });
 

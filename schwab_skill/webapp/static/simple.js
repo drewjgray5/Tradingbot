@@ -80,6 +80,25 @@ function setMessage(text, kind = "muted") {
   else if (kind === "ok") el.classList.add("ok");
 }
 
+async function copyTextToClipboard(text) {
+  const value = String(text || "");
+  if (!value) return false;
+  if (navigator?.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return true;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = value;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "absolute";
+  ta.style.left = "-9999px";
+  document.body.appendChild(ta);
+  ta.select();
+  const ok = document.execCommand("copy");
+  document.body.removeChild(ta);
+  return ok;
+}
+
 function setProgress(fraction, label) {
   const bar = document.getElementById("simpleProgress");
   const lbl = document.getElementById("simpleProgressLabel");
@@ -701,6 +720,19 @@ function wireJwt() {
       void clearCookieSession();
     }
     setMessage(v ? "Token saved." : "Cleared — enter a token to save.", v ? "ok" : "warn");
+  });
+  document.getElementById("simpleJwtCopy")?.addEventListener("click", async () => {
+    const v = AuthJwt.normalizeUserJwt(document.getElementById("simpleJwt")?.value || readStoredApiJwt());
+    if (!v) {
+      setMessage("No token found to copy.", "warn");
+      return;
+    }
+    try {
+      const ok = await copyTextToClipboard(v);
+      setMessage(ok ? "Token copied." : "Copy blocked by browser.", ok ? "ok" : "warn");
+    } catch {
+      setMessage("Copy failed. Browser denied clipboard access.", "error");
+    }
   });
 }
 

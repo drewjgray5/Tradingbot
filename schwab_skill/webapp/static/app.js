@@ -862,9 +862,29 @@ function applySchwabConnectButtonVisibility() {
   document.getElementById("onboardingSchwabMarketLink")?.classList.toggle("hidden", !pc.schwab_market_oauth);
 }
 
+async function copyTextToClipboard(text) {
+  const value = String(text || "");
+  if (!value) return false;
+  if (navigator?.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return true;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = value;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "absolute";
+  ta.style.left = "-9999px";
+  document.body.appendChild(ta);
+  ta.select();
+  const ok = document.execCommand("copy");
+  document.body.removeChild(ta);
+  return ok;
+}
+
 async function loadConfig() {
   const tokenInput = document.getElementById("jwtInput");
   const saveBtn = document.getElementById("saveJwtBtn");
+  const copyBtn = document.getElementById("copyJwtBtn");
   const manualDetails = document.getElementById("manualJwtDetails");
   const manualSummary = document.getElementById("manualJwtSummary");
   const supabaseBlock = document.getElementById("supabaseAuthBlock");
@@ -950,6 +970,27 @@ async function loadConfig() {
         clearStoredApiJwt();
         void clearCookieAuthSession();
         logEvent({ kind: "system", severity: "warn", message: "JWT token cleared." });
+      }
+    });
+  }
+  if (copyBtn) {
+    copyBtn.disabled = !manualJwtAllowed;
+    copyBtn.addEventListener("click", async () => {
+      if (!manualJwtAllowed) return;
+      const token = normalizeUserJwt(tokenInput?.value || readStoredApiJwt());
+      if (!token) {
+        logEvent({ kind: "system", severity: "warn", message: "No JWT token found to copy." });
+        return;
+      }
+      try {
+        const ok = await copyTextToClipboard(token);
+        logEvent({
+          kind: "system",
+          severity: ok ? "info" : "warn",
+          message: ok ? "JWT token copied to clipboard." : "Copy was blocked by this browser.",
+        });
+      } catch {
+        logEvent({ kind: "system", severity: "error", message: "Copy failed. Browser denied clipboard access." });
       }
     });
   }
