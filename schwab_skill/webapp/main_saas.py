@@ -73,10 +73,11 @@ from .security import (
 from .security_headers import SecurityHeadersMiddleware
 from .static_assets import NoCacheStaticFiles, render_versioned_html
 from .strategy_chat import run_strategy_chat
-from .tasks import celery_app, scan_for_user
+from .tasks import celery_app, phase2_stage1_for_user, scan_for_user
 from .tenant_dashboard import _tenant_api_health_snapshot
 from .tenant_dashboard import router as tenant_dashboard_router
 from .tenant_runtime import (
+    scan_runtime_prerequisite_errors,
     tenant_skill_dir,
     user_can_materialize_for_scan,
     user_has_account_session,
@@ -997,6 +998,9 @@ def run_scan(
     ok_scan, reason = user_can_materialize_for_scan(db, user.id)
     if not ok_scan:
         raise HTTPException(status_code=409, detail=reason)
+    runtime_errors = scan_runtime_prerequisite_errors()
+    if runtime_errors:
+        raise HTTPException(status_code=503, detail="; ".join(runtime_errors))
     try:
         scan_opts = parse_scan_run_body(body)
     except ValueError as e:
@@ -1384,6 +1388,48 @@ def backtest_run_task_status(
         payload["error_message"] = row.error_message
         if row.result_json:
             payload["result"] = parse_json(row.result_json, {})
+    if task.ready():
+        tr = task.result
+        payload["task_result"] = tr if isinstance(tr, dict) else {"raw_result": str(tr)}
+    return _ok(payload)
+
+
+@app.post("/api/phase2/stage1-runs", response_model=ApiResponse)
+def queue_phase2_stage1_run(
+    request: Request,
+    user: User = Depends(require_paid_entitlement),
+    db: Session = Depends(_db),
+) -> ApiResponse:
+    if not _is_schwab_linked(db, user.id):
+        raise HTTPException(status_code=409, detail="Link Schwab account before running Stage 1.")
+    ok_scan, reason = user_can_materialize_for_scan(db, user.id)
+    if not ok_scan:
+        raise HTTPException(status_code=409, detail=reason)
+    _backtest_rate_limit(user.id)
+    task = phase2_stage1_for_user.apply_async(args=[user.id], queue="scan")
+    _save_user_task_binding(db, user.id, "phase2_stage1", task.id)
+    log_audit(
+        db,
+        action="phase2_stage1_queued",
+        user_id=user.id,
+        detail={"task_id": task.id},
+        request_id=_request_id(request),
+    )
+    return _ok({"task_id": task.id, "status": "queued"})
+
+
+@app.get("/api/phase2/stage1-runs/tasks/{task_id}", response_model=ApiResponse)
+def phase2_stage1_status(
+    task_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(_db),
+) -> ApiResponse:
+    _require_user_task_binding(db, user.id, "phase2_stage1", task_id)
+    task = AsyncResult(task_id, app=celery_app)
+    payload: dict[str, Any] = {"task_id": task_id, "celery_status": task.status.lower()}
+    row = db.query(AppState).filter(AppState.user_id == user.id, AppState.key == "phase2_stage1_status").first()
+    if row and row.value_json:
+        payload["status"] = parse_json(row.value_json, {})
     if task.ready():
         tr = task.result
         payload["task_result"] = tr if isinstance(tr, dict) else {"raw_result": str(tr)}

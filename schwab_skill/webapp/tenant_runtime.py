@@ -168,6 +168,35 @@ def _copy_platform_advisory_model_if_available(skill_dir: Path) -> bool:
     return True
 
 
+def scan_runtime_prerequisite_errors(skill_dir: Path | None = None) -> list[str]:
+    """
+    Platform-level prerequisites required for SaaS scan enrichment.
+
+    Returns a list of human-readable error strings. Empty list means runtime is
+    ready to produce real MiroFish/advisory outputs.
+    """
+    errors: list[str] = []
+    if not (
+        (os.getenv("MIROFISH_API_KEY") or "").strip()
+        or (os.getenv("OPENAI_API_KEY") or "").strip()
+    ):
+        errors.append("LLM key missing: set MIROFISH_API_KEY or OPENAI_API_KEY on the worker.")
+
+    advisory_enabled = (os.getenv("ADVISORY_MODEL_ENABLED") or "1").strip().lower() in ("1", "true", "yes", "on")
+    if advisory_enabled:
+        raw = (os.getenv("ADVISORY_MODEL_PATH") or "").strip() or "artifacts/advisory_model_v1.json"
+        model_path = Path(raw)
+        if not model_path.is_absolute():
+            base = skill_dir if skill_dir is not None else _platform_skill_root()
+            model_path = base / model_path
+        if not model_path.is_file():
+            errors.append(
+                "Advisory model artifact missing: expected ADVISORY_MODEL_PATH "
+                f"at {model_path}."
+            )
+    return errors
+
+
 def _required_platform_schwab_env() -> dict[str, str]:
     required = {
         "SCHWAB_MARKET_APP_KEY": (os.environ.get("SCHWAB_MARKET_APP_KEY") or "").strip(),
