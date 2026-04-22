@@ -731,19 +731,10 @@ function renderScanRows(signals = []) {
     const ticker = sig.ticker || sig.symbol || "?";
     const topLive = safeText(sig?.strategy_attribution?.top_live || "—");
     const score = safeNum(sig.signal_score ?? sig.score, null);
+    const conviction = safeNum(sig.mirofish_conviction, null);
     const advisory = sig.advisory || {};
-    const pUpRaw = safeNum(advisory.p_up_10d, null);
-    const pUp = pUpRaw !== null ? pUpRaw : fallbackPUpFromScore(score);
-    const confRaw = safeText(advisory.confidence_bucket || "");
-    const conf = confRaw
-      ? confRaw.toUpperCase()
-      : pUp !== null
-        ? fallbackConfidenceBucket(pUp).toUpperCase()
-        : "—";
-    const convictionRaw = safeNum(sig.mirofish_conviction, null);
-    const conviction = convictionRaw !== null
-      ? maybeFallbackConviction(sig, score, convictionRaw)
-      : fallbackConvictionFromScore(score);
+    const pUp = safeNum(advisory.p_up_10d, null);
+    const conf = safeText(advisory.confidence_bucket || "—").toUpperCase();
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><strong>${safeText(ticker)}</strong></td>
@@ -780,43 +771,6 @@ function meterFromScore(score) {
 
 function meterFromConviction(conviction) {
   return clampPct((safeNum(conviction, 0) + 100) / 2);
-}
-
-function fallbackPUpFromScore(score) {
-  const s = safeNum(score, null);
-  if (s === null) return null;
-  // Heuristic fallback only: map score bands into a bounded probability.
-  return clampPct(50 + (s - 50) * 0.4) / 100;
-}
-
-function fallbackConfidenceBucket(pUp) {
-  const p = safeNum(pUp, null);
-  if (p === null) return "unknown";
-  if (p >= 0.62) return "high";
-  if (p >= 0.52) return "medium";
-  return "low";
-}
-
-function fallbackConvictionFromScore(score) {
-  const s = safeNum(score, null);
-  if (s === null) return null;
-  const v = Math.round((s - 50) * 2);
-  return Math.max(-100, Math.min(100, v));
-}
-
-function maybeFallbackConviction(sig, score, conviction) {
-  // If Mirofish is running without API keys, backend returns neutral 0.5/0.5
-  // probabilities and conviction=0. In that specific case, show a score-based
-  // estimate so the table is still informative.
-  const c = safeNum(conviction, null);
-  if (c === null) return fallbackConvictionFromScore(score);
-  const cont = safeNum(sig?.mirofish_result?.continuation_probability, null);
-  const trap = safeNum(sig?.mirofish_result?.bull_trap_probability, null);
-  if (c === 0 && cont !== null && trap !== null && Math.abs(cont - 0.5) < 1e-6 && Math.abs(trap - 0.5) < 1e-6) {
-    const est = fallbackConvictionFromScore(score);
-    return est !== null ? est : c;
-  }
-  return c;
 }
 
 function renderPendingContext(row) {

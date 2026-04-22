@@ -8,6 +8,7 @@ modules (DualSchwabAuth, signal_scanner, execution) work unchanged.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -22,6 +23,8 @@ from schwab_auth import write_encrypted_token_file
 from .models import User, UserCredential
 from .security import decrypt_secret
 
+LOG = logging.getLogger(__name__)
+
 # Optional platform overrides forwarded into each tenant .env when set in process env.
 _ENV_OPTIONAL_FOR_TENANT = (
     "PAPER_TRADING_ENABLED",
@@ -29,6 +32,17 @@ _ENV_OPTIONAL_FOR_TENANT = (
     "MAX_SECTOR_ACCOUNT_FRACTION",
     "HYPOTHESIS_LEDGER_ENABLED",
     "HYPOTHESIS_SELF_STUDY_MERGE",
+    # MiroFish/LLM keys + routing options used by engine_analysis._call_llm().
+    "MIROFISH_API_KEY",
+    "OPENAI_API_KEY",
+    "LLM_BASE_URL",
+    "LLM_MODEL_NAME",
+    # Advisory model runtime knobs.
+    "ADVISORY_MODEL_ENABLED",
+    "ADVISORY_MODEL_PATH",
+    "ADVISORY_CONFIDENCE_HIGH",
+    "ADVISORY_CONFIDENCE_LOW",
+    "ADVISORY_REQUIRE_MODEL",
 )
 
 # Env keys written into tenant .env (platform must supply Schwab app registration).
@@ -128,6 +142,32 @@ def _platform_market_token_file() -> Path | None:
     return None
 
 
+def _platform_skill_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _copy_platform_advisory_model_if_available(skill_dir: Path) -> bool:
+    """
+    Materialize advisory model artifact into tenant runtime when available.
+
+    Tenant scans resolve ADVISORY_MODEL_PATH relative to the tenant skill dir,
+    so a platform-level artifact at schwab_skill/artifacts/... must be copied
+    into each temp skill dir to keep advisory scoring available in SaaS mode.
+    """
+    raw = (os.getenv("ADVISORY_MODEL_PATH") or "").strip() or "artifacts/advisory_model_v1.json"
+    rel_path = Path(raw)
+    if rel_path.is_absolute():
+        # Absolute model paths remain valid without copying.
+        return rel_path.is_file()
+    src = _platform_skill_root() / rel_path
+    if not src.is_file():
+        return False
+    dst = skill_dir / rel_path
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(src, dst)
+    return True
+
+
 def _required_platform_schwab_env() -> dict[str, str]:
     required = {
         "SCHWAB_MARKET_APP_KEY": (os.environ.get("SCHWAB_MARKET_APP_KEY") or "").strip(),
@@ -211,6 +251,15 @@ def materialize_tenant_skill_dir(db: Session, user_id: str, skill_dir: Path) -> 
         raise RuntimeError(
             "Market OAuth not configured: upload market_oauth_json or set SAAS_PLATFORM_MARKET_SKILL_DIR."
         )
+
+    advisory_enabled = (os.getenv("ADVISORY_MODEL_ENABLED") or "1").strip().lower() in ("1", "true", "yes", "on")
+    if advisory_enabled:
+        copied = _copy_platform_advisory_model_if_available(skill_dir)
+        if not copied:
+            LOG.warning(
+                "Advisory model enabled but artifact unavailable for tenant runtime "
+                "(expected ADVISORY_MODEL_PATH or artifacts/advisory_model_v1.json)."
+            )
 
 
 @contextmanager

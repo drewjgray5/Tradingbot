@@ -156,9 +156,13 @@ def _get_news_seed(ticker: str) -> str:
 
 def _call_llm(prompt: str, system: str, env: dict) -> str:
     """Call LLM (OpenAI/Qwen) following env config."""
-    api_key = env.get("MIROFISH_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+    api_key = (
+        env.get("MIROFISH_API_KEY")
+        or os.environ.get("MIROFISH_API_KEY", "")
+        or os.environ.get("OPENAI_API_KEY", "")
+    )
     base_url = (env.get("LLM_BASE_URL") or os.environ.get("LLM_BASE_URL") or "").strip()
-    model = env.get("LLM_MODEL_NAME", "gpt-4o-mini")
+    model = env.get("LLM_MODEL_NAME") or os.environ.get("LLM_MODEL_NAME") or "gpt-4o-mini"
     if not api_key:
         LOG.warning("MIROFISH_API_KEY / OPENAI_API_KEY not set, using fallback score")
         return ""
