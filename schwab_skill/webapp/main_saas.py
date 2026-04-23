@@ -1100,15 +1100,28 @@ def scan_task_status(
     db: Session = Depends(_db),
 ) -> ApiResponse:
     _require_user_task_binding(db, user.id, "scan", task_id)
-    task = AsyncResult(task_id, app=celery_app)
-    payload: dict[str, Any] = {
-        "task_id": task_id,
-        "status": task.status.lower(),
-        "worker_queue": _celery_queue_estimate(),
-    }
-    if task.ready():
-        result = task.result if isinstance(task.result, dict) else {"raw_result": str(task.result)}
-        payload["result"] = result
+    try:
+        task = AsyncResult(task_id, app=celery_app)
+        task_status = str(task.status or "unknown").lower()
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "status": task_status,
+            "worker_queue": _celery_queue_estimate(),
+        }
+        if task.ready():
+            result = task.result if isinstance(task.result, dict) else {"raw_result": str(task.result)}
+            payload["result"] = result
+    except Exception as exc:
+        # Keep this endpoint JSON-stable even when broker/backend is flaky.
+        LOG.warning("scan_task_status unavailable task_id=%s: %s", task_id, safe_exception_message(exc, fallback="scan_task_status_error"))
+        return _ok(
+            {
+                "task_id": task_id,
+                "status": "unknown",
+                "worker_queue": {"inspect_available": False, "inspect_error": True},
+                "status_error": safe_exception_message(exc, fallback="scan_task_status_error"),
+            }
+        )
     if include_recent:
         recent = (
             db.query(ScanResult)
@@ -1141,18 +1154,30 @@ def scan_lifecycle(
     tid = (task_id or "").strip()
     if tid:
         _require_user_task_binding(db, user.id, "scan", tid)
-        task = AsyncResult(tid, app=celery_app)
-        result = None
-        if task.ready():
-            result = task.result if isinstance(task.result, dict) else {"raw_result": str(task.result)}
-        return _ok(
-            _scan_lifecycle_payload(
-                tid,
-                task.status,
-                worker_queue=worker_queue,
-                task_result=result,
+        try:
+            task = AsyncResult(tid, app=celery_app)
+            result = None
+            if task.ready():
+                result = task.result if isinstance(task.result, dict) else {"raw_result": str(task.result)}
+            return _ok(
+                _scan_lifecycle_payload(
+                    tid,
+                    task.status,
+                    worker_queue=worker_queue,
+                    task_result=result,
+                )
             )
-        )
+        except Exception as exc:
+            LOG.warning("scan_lifecycle unavailable task_id=%s: %s", tid, safe_exception_message(exc, fallback="scan_lifecycle_error"))
+            # Return a degradable payload instead of bubbling non-JSON gateway errors.
+            return _ok(
+                _scan_lifecycle_payload(
+                    tid,
+                    "unknown",
+                    worker_queue={"inspect_available": False, "inspect_error": True},
+                    task_result={"ok": False, "error": safe_exception_message(exc, fallback="scan_lifecycle_error")},
+                )
+            )
     last_scan = _load_state(
         db,
         user.id,

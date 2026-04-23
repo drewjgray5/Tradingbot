@@ -469,9 +469,70 @@ function diagnosticsHeadline(diagOrSummary = null) {
   return "";
 }
 
+function formatStrategyLabel(value) {
+  const raw = safeText(value || "").trim();
+  if (!raw || raw === "—") return "—";
+  return raw
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b[a-z]/g, (ch) => ch.toUpperCase());
+}
+
+function optionalNum(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === "—") return null;
+  }
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeProbability(value) {
+  const n = optionalNum(value);
+  if (n === null) return null;
+  // Backward compatibility for older payloads that persisted percent points (e.g. 62.4).
+  const ratio = n > 1 && n <= 100 ? n / 100 : n;
+  return Math.max(0, Math.min(1, ratio));
+}
+
+function formatConfidenceLabel(value) {
+  const raw = safeText(value || "").trim();
+  if (!raw || raw === "—") return "—";
+  const lowered = raw.toLowerCase();
+  if (lowered === "unknown" || lowered === "none" || lowered === "null") return "—";
+  return raw.replace(/[_-]+/g, " ").toUpperCase();
+}
+
+function asObject(value) {
+  if (!value) return null;
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string") return null;
+  const raw = value.trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeScanSignal(rawSignal) {
+  const base = asObject(rawSignal) || {};
+  const nested = asObject(base.signal) || {};
+  const signal = { ...base, ...nested };
+  signal.advisory = asObject(signal.advisory) || {};
+  signal.mirofish_result = asObject(signal.mirofish_result) || {};
+  signal.strategy_attribution = asObject(signal.strategy_attribution) || {};
+  signal.prediction_market = asObject(signal.prediction_market) || {};
+  return signal;
+}
+
 function formatStrategySummary(summary = null) {
   if (!summary || typeof summary !== "object") return "";
-  const dominant = safeText(summary.dominant_live_strategy || "");
+  const dominant = formatStrategyLabel(summary.dominant_live_strategy || "");
   const total = safeNum(summary.total_ranked, 0);
   const count = safeNum(summary.dominant_count, 0);
   if (!dominant || dominant === "—" || total <= 0 || count <= 0) return "";
@@ -481,7 +542,7 @@ function formatStrategySummary(summary = null) {
 function updateTopStrategyChip(summary = null) {
   const el = document.getElementById("scanTopStrategy");
   if (!el) return;
-  const dominant = safeText(summary?.dominant_live_strategy || "—");
+  const dominant = formatStrategyLabel(summary?.dominant_live_strategy || "—");
   const total = safeNum(summary?.total_ranked, 0);
   const count = safeNum(summary?.dominant_count, 0);
   if (dominant === "—" || total <= 0 || count <= 0) {
@@ -727,33 +788,58 @@ function renderScanRows(signals = []) {
     return;
   }
 
+  let pupCount = 0;
+  let confCount = 0;
+  let convictionCount = 0;
   signals.forEach((sig, idx) => {
-    const ticker = sig.ticker || sig.symbol || "?";
-    const topLive = safeText(sig?.strategy_attribution?.top_live || "—");
-    const score = safeNum(sig.signal_score ?? sig.score, null);
-    const conviction = safeNum(sig.mirofish_conviction, null);
-    const advisory = sig.advisory || {};
-    const pUp = safeNum(advisory.p_up_10d, null);
-    const conf = safeText(advisory.confidence_bucket || "—").toUpperCase();
+    const row = normalizeScanSignal(sig);
+    const ticker = row.ticker || row.symbol || "?";
+    const topLive = formatStrategyLabel(row?.strategy_attribution?.top_live || "—");
+    const score = safeNum(row.signal_score ?? row.score, null);
+    const advisory = row.advisory;
+    const conviction = optionalNum(row.mirofish_conviction ?? row.conviction_score ?? row?.mirofish_result?.conviction_score);
+    const pUp = normalizeProbability(advisory.p_up_10d ?? advisory.p_up_10d_raw ?? row.p_up_10d ?? row.advisory_p_up);
+    const conf = formatConfidenceLabel(advisory.confidence_bucket ?? row.confidence_bucket ?? row.advisory_confidence);
+    const convictionText = conviction === null ? "—" : (Number.isInteger(conviction) ? `${conviction}` : conviction.toFixed(1));
+    if (pUp !== null) pupCount += 1;
+    if (conf !== "—") confCount += 1;
+    if (conviction !== null) convictionCount += 1;
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><strong>${safeText(ticker)}</strong></td>
       <td><span class="pill info strategy-badge">${topLive}</span></td>
-      <td>${sig.price || sig.current_price ? formatMoney(sig.price || sig.current_price) : "—"}</td>
+      <td>${row.price || row.current_price ? formatMoney(row.price || row.current_price) : "—"}</td>
       <td>${score !== null ? `${score.toFixed(1)}` : "—"}</td>
       <td>${pUp !== null ? pct(pUp, 1) : "—"}</td>
       <td>${conf}</td>
-      <td>${conviction !== null ? `${conviction}` : "—"}</td>
-      <td>${safeText(sig.sector_etf || "—")}</td>
+      <td>${convictionText}</td>
+      <td>${safeText(row.sector_etf || "—")}</td>
       <td><button type="button" class="btn small secondary" data-idx="${idx}">Stage…</button></td>
     `;
     body.appendChild(tr);
   });
+  if (signals.length && pupCount === 0 && confCount === 0 && convictionCount === 0 && !state.scanMissingEnrichmentWarned) {
+    state.scanMissingEnrichmentWarned = true;
+    logEvent({
+      kind: "scan",
+      severity: "warn",
+      message:
+        "Scan payload has no advisory/conviction fields. This usually means enrichment is disabled or failing upstream.",
+    });
+    updateActionCenter({
+      title: "Scan Enrichment Missing",
+      message: "No P(up), confidence, or conviction values were returned for this scan run.",
+      severity: "warn",
+    });
+  } else if (pupCount > 0 || confCount > 0 || convictionCount > 0) {
+    state.scanMissingEnrichmentWarned = false;
+  }
 
   body.querySelectorAll("button[data-idx]").forEach((btn) => {
     btn.addEventListener("click", (e) => {
       const idx = Number(e.currentTarget.getAttribute("data-idx"));
-      const sig = state.latestSignals[idx];
+      // Prefer freshly rendered row data; fallback to global state during async refreshes.
+      const sig = normalizeScanSignal(signals[idx] || state.latestSignals[idx]);
       openQueueScanDialog(sig);
     });
   });
@@ -1404,20 +1490,60 @@ function strategySummaryFromSignals(signals) {
 }
 
 async function waitForSaaScanCompletion(taskId) {
+  const isGatewayLikeFailure = (out) => {
+    const err = safeText(out?.error || "").toLowerCase();
+    const statusCode = Number(out?.status || 0);
+    return statusCode === 502 || err.includes("invalid json response (502)") || err.includes("bad gateway");
+  };
+  const pollScanStatus = async () => {
+    const primary = await api.get(`/api/scan-lifecycle?task_id=${encodeURIComponent(taskId)}`);
+    if (primary.ok) return primary;
+    const fallback = await api.get(`/api/scan/${encodeURIComponent(taskId)}`);
+    if (fallback.ok) {
+      const d = fallback.data || {};
+      return {
+        ok: true,
+        data: {
+          status: d.status,
+          result: d.result,
+          worker_queue: d.worker_queue,
+        },
+      };
+    }
+    const errParts = [primary.error, fallback.error].filter(Boolean);
+    return {
+      ok: false,
+      status: primary.status || fallback.status,
+      error: errParts.join(" | ") || "Scan status unavailable.",
+    };
+  };
   const maxPolls = 400;
   const metaEl = document.getElementById("scanMeta");
   let firstPendingAt = null;
   let workerHintShown = false;
+  let transientGatewayFailures = 0;
   setJobProgress("scanJobProgress", "scanJobProgressLabel", 0.05, "Queued…");
   for (let i = 0; i < maxPolls; i++) {
-    const status = await api.get(`/api/scan-lifecycle?task_id=${encodeURIComponent(taskId)}`);
+    const status = await pollScanStatus();
     if (!status.ok) {
+      if (isGatewayLikeFailure(status) && transientGatewayFailures < 12) {
+        transientGatewayFailures += 1;
+        metaEl.textContent = "Scan status endpoint temporarily unavailable… retrying.";
+        updateActionCenter({
+          title: "Scan Polling Retrying",
+          message: "Temporary gateway error while checking task status. Retrying automatically.",
+          severity: "warn",
+        });
+        await new Promise((r) => setTimeout(r, Math.min(2000 * transientGatewayFailures, 12000)));
+        continue;
+      }
       metaEl.textContent = "Scan failed.";
       updateTopStrategyChip(null);
       logEvent({ kind: "scan", severity: "error", message: `Scan task status failed: ${status.error}` });
       updateActionCenter({ title: "Scan Failed", message: status.error, severity: "error" });
       return;
     }
+    transientGatewayFailures = 0;
     const data = status.data || {};
     const celeryStatus = safeText(data.status || "").toLowerCase();
     if (celeryStatus === "pending" || celeryStatus === "received") {

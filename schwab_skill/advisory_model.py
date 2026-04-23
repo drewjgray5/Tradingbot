@@ -830,6 +830,38 @@ def _model_path(skill_dir: Path, override: str | None = None) -> Path:
     return p if p.is_absolute() else (skill_dir / p)
 
 
+def _model_candidate_paths(skill_dir: Path, override: str | None = None) -> list[Path]:
+    """
+    Candidate advisory model locations in priority order.
+
+    Keeps existing ADVISORY_MODEL_PATH behavior first, but falls back to the
+    common repository locations to avoid silent "no advisory" when a deploy
+    references an outdated relative path.
+    """
+    from config import get_advisory_model_path
+
+    candidates: list[Path] = []
+
+    def _add(p: Path) -> None:
+        if p not in candidates:
+            candidates.append(p)
+
+    # Highest priority: explicit override argument.
+    if override:
+        p = Path(override)
+        _add(p if p.is_absolute() else (skill_dir / p))
+
+    # Next: configured env/model path.
+    raw = get_advisory_model_path(skill_dir)
+    cfg = Path(raw)
+    _add(cfg if cfg.is_absolute() else (skill_dir / cfg))
+
+    # Compatibility fallbacks used by prior deploy layouts.
+    _add(skill_dir / DEFAULT_MODEL_FILE)
+    _add(skill_dir / "artifacts" / DEFAULT_MODEL_FILE)
+    return candidates
+
+
 def save_model_artifact(artifact: dict[str, Any], skill_dir: Path | str | None = None, path: str | None = None) -> Path:
     skill_dir = Path(skill_dir or SKILL_DIR)
     out = _model_path(skill_dir, override=path)
@@ -842,20 +874,21 @@ def save_model_artifact(artifact: dict[str, Any], skill_dir: Path | str | None =
 
 def load_model_artifact(skill_dir: Path | str | None = None, path: str | None = None) -> dict[str, Any] | None:
     skill_dir = Path(skill_dir or SKILL_DIR)
-    model_path = _model_path(skill_dir, override=path)
-    if _MODEL_CACHE.get("path") == str(model_path) and isinstance(_MODEL_CACHE.get("artifact"), dict):
-        return _MODEL_CACHE["artifact"]
-    if not model_path.exists():
-        return None
-    try:
-        data = json.loads(model_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(data, dict) or "coef" not in data:
-        return None
-    _MODEL_CACHE["path"] = str(model_path)
-    _MODEL_CACHE["artifact"] = data
-    return data
+    for model_path in _model_candidate_paths(skill_dir, override=path):
+        if _MODEL_CACHE.get("path") == str(model_path) and isinstance(_MODEL_CACHE.get("artifact"), dict):
+            return _MODEL_CACHE["artifact"]
+        if not model_path.exists():
+            continue
+        try:
+            data = json.loads(model_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict) or "coef" not in data:
+            continue
+        _MODEL_CACHE["path"] = str(model_path)
+        _MODEL_CACHE["artifact"] = data
+        return data
+    return None
 
 
 def _confidence_bucket(p: float, skill_dir: Path) -> str:

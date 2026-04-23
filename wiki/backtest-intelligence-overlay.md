@@ -1,7 +1,7 @@
 ---
 source: schwab_skill/backtest_intelligence.py
 created: 2026-04-17
-updated: 2026-04-17
+updated: 2026-04-18
 tags: [backtest, plugins, promotion, intelligence, validation]
 ---
 
@@ -62,10 +62,48 @@ result = run_backtest(
 )
 ```
 
-The `intelligence_overlay` parameter accepts either a `BacktestIntelligenceConfig`
-or a plain `dict[str, str]`. Default of `None` means *all overlays off*, which
-preserves the legacy behaviour byte-for-byte (verified by
-`test_exit_manager_off_matches_legacy_simulate_exit`).
+The `intelligence_overlay` parameter accepts either a `BacktestIntelligenceConfig`,
+a plain `dict[str, str]`, or `None`.
+
+**Default semantics (post 2026-04-18 core fix):** `intelligence_overlay=None`
+resolves at runtime to `BacktestIntelligenceConfig.from_env(skill_dir)`, so
+the backtest matches the **live code path** (which means `event_risk=live`
+and `exec_quality=live` by default per `config.py`). Callers that need a
+strict overlays-off baseline must pass `BacktestIntelligenceConfig.all_off()`
+explicitly. The byte-identical guarantee is preserved by
+`test_exit_manager_off_matches_legacy_simulate_exit` when overlays are
+explicitly off.
+
+> **Historical note — 2026-04-18 wiring bug:** prior to the core fix,
+> `intelligence_overlay=None` resolved to `BacktestIntelligenceConfig.all_off()`,
+> meaning every caller that didn't forward an explicit overlay silently
+> disabled all four plugins regardless of `*_MODE` env vars. Affected
+> scripts: `scripts/run_multi_era_backtest_schwab_only.py`,
+> `scripts/validate_pf_robustness.py`, `scripts/validate_backtest.py`,
+> `scripts/optimize_strategy_loop.py`, `webapp/backtest_spec.py`,
+> `prediction_market_experiment.py`. Every multi-era artifact written before
+> 2026-04-18 — including the `PF≈1.04` cross-era champion baseline at
+> `multi_era_backtest_schwab_only_20260417T174813Z.json` — measured the
+> strategy with all four overlays forced off, even though `event_risk` and
+> `exec_quality` default to `live` in production. Those numbers remain
+> valid as a "legacy / overlays-off" baseline but **must not be compared
+> directly to overlay-on results**. See
+> `validation_artifacts/phase1_prologue_overlay_wiring_bug.md` for the smoke
+> evidence and `validation_artifacts/phase1_callsite_audit.md` for the full
+> callsite audit.
+
+### Audit checklist for any new caller of `run_backtest()`
+
+If you are adding a script that calls `run_backtest()`:
+
+1. **Production parity (default):** pass nothing — the new default
+   `from_env(skill_dir)` matches live. Or pass it explicitly for clarity.
+2. **Controlled experiments:** pass an explicit `BacktestIntelligenceConfig`
+   with the modes you want (e.g. `BacktestIntelligenceConfig(exit_manager="live")`).
+3. **Strict overlays-off baseline:** pass `BacktestIntelligenceConfig.all_off()`
+   explicitly. Do not rely on `None`.
+4. Cite the `intelligence_overlay` block emitted into the JSON result so
+   readers can verify which overlays were active.
 
 ## Comparison script
 
@@ -121,4 +159,4 @@ These rules are enforced narratively today; codifying them into
 
 ---
 
-*Last compiled: 2026-04-17*
+*Last compiled: 2026-04-18*

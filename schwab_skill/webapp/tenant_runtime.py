@@ -41,6 +41,7 @@ _ENV_OPTIONAL_FOR_TENANT = (
     # MiroFish/LLM keys + routing options used by engine_analysis._call_llm().
     "MIROFISH_API_KEY",
     "OPENAI_API_KEY",
+    "OPENAI_KEY",
     "LLM_BASE_URL",
     "LLM_MODEL_NAME",
     # Advisory model runtime knobs.
@@ -161,17 +162,26 @@ def _copy_platform_advisory_model_if_available(skill_dir: Path) -> bool:
     into each temp skill dir to keep advisory scoring available in SaaS mode.
     """
     raw = (os.getenv("ADVISORY_MODEL_PATH") or "").strip() or "advisory_model_v1.json"
-    rel_path = Path(raw)
-    if rel_path.is_absolute():
+    configured = Path(raw)
+    if configured.is_absolute():
         # Absolute model paths remain valid without copying.
-        return rel_path.is_file()
-    src = _platform_skill_root() / rel_path
-    if not src.is_file():
-        return False
-    dst = skill_dir / rel_path
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy(src, dst)
-    return True
+        return configured.is_file()
+
+    root = _platform_skill_root()
+    candidates = [
+        configured,
+        Path("advisory_model_v1.json"),
+        Path("artifacts") / "advisory_model_v1.json",
+    ]
+    for rel in candidates:
+        src = root / rel
+        if not src.is_file():
+            continue
+        dst = skill_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, dst)
+        return True
+    return False
 
 
 def scan_runtime_prerequisite_errors(

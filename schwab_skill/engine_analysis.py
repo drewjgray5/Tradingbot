@@ -165,7 +165,7 @@ def _call_llm(prompt: str, system: str, env: dict) -> str:
     base_url = (env.get("LLM_BASE_URL") or os.environ.get("LLM_BASE_URL") or "").strip()
     model = env.get("LLM_MODEL_NAME") or os.environ.get("LLM_MODEL_NAME") or "gpt-4o-mini"
     if not api_key:
-        LOG.warning("MIROFISH_API_KEY / OPENAI_API_KEY not set, using fallback score")
+        LOG.warning("MIROFISH_API_KEY / OPENAI_API_KEY / OPENAI_KEY not set, using fallback score")
         return ""
     try:
         from openai import OpenAI

@@ -319,7 +319,10 @@ def test_backtest_signature_accepts_overlay_argument():
 
     sig = inspect.signature(run_backtest)
     assert "intelligence_overlay" in sig.parameters
-    # Default must be None so existing call sites are unaffected.
+    # Signature default is None; runtime resolution (in _run_backtest_core)
+    # turns None into BacktestIntelligenceConfig.from_env(skill_dir) so
+    # backtests match the live code path. Callers that need overlays-off
+    # must pass BacktestIntelligenceConfig.all_off() explicitly.
     assert sig.parameters["intelligence_overlay"].default is None
 
 
