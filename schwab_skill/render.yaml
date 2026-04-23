@@ -110,7 +110,8 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile.saas
     dockerContext: .
-    dockerCommand: celery -A webapp.tasks worker -Q scan,orders,celery --loglevel=info
+    # Dedicated fast-path worker for user-triggered scan + order tasks.
+    dockerCommand: celery -A webapp.tasks worker -Q scan,orders --loglevel=info
     envVars:
       - key: CELERY_WORKER_POOL
         value: solo
@@ -118,6 +119,62 @@ services:
         value: "2"
       - key: SCAN_STAGE_B_MAX_WORKERS
         value: "2"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tradingbot-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: tradingbot-redis
+          type: keyvalue
+          property: connectionString
+      - key: SAAS_RUN_ALEMBIC
+        value: "0"
+      - key: DB_POOL_SIZE
+        value: "2"
+      - key: DB_MAX_OVERFLOW
+        value: "2"
+      - key: CREDENTIAL_ENCRYPTION_KEY
+        sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: SUPABASE_JWT_AUDIENCE
+        sync: false
+      - key: SUPABASE_JWT_ISSUER
+        sync: false
+      - key: SUPABASE_JWT_SECRET_LEGACY
+        sync: false
+      - key: SAAS_BILLING_ENFORCE
+        value: "0"
+      - key: SCHWAB_MARKET_APP_KEY
+        sync: false
+      - key: SCHWAB_MARKET_APP_SECRET
+        sync: false
+      - key: SCHWAB_ACCOUNT_APP_KEY
+        sync: false
+      - key: SCHWAB_ACCOUNT_APP_SECRET
+        sync: false
+      - key: SCHWAB_CALLBACK_URL
+        sync: false
+      - key: SCHWAB_MARKET_CALLBACK_URL
+        sync: false
+      - key: MIROFISH_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_KEY
+        sync: false
+
+  - type: worker
+    name: tradingbot-worker-phase2
+    runtime: docker
+    dockerfilePath: ./Dockerfile.saas
+    dockerContext: .
+    # Isolate long-running Phase 2 backfill/replay jobs from scan latency.
+    dockerCommand: celery -A webapp.tasks worker -Q phase2 --loglevel=info
+    envVars:
+      - key: CELERY_WORKER_POOL
+        value: solo
       - key: DATABASE_URL
         fromDatabase:
           name: tradingbot-db

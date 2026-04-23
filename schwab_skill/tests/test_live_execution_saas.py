@@ -383,6 +383,82 @@ def test_scan_task_status_can_include_recent(saas_client: TestClient, test_db: s
     assert payload["recent_results"][0]["ticker"] == "MSFT"
 
 
+def test_scan_enqueue_routes_to_scan_queue(saas_client: TestClient, test_db: sessionmaker) -> None:
+    db = test_db()
+    try:
+        _seed_user_with_schwab(db)
+    finally:
+        db.close()
+
+    class _Task:
+        id = "scan_task_1"
+
+    with (
+        patch("webapp.main_saas._scan_rate_limit", return_value=None),
+        patch("webapp.main_saas._scan_daily_limit_check", return_value=None),
+        patch("webapp.main_saas.acquire_scan_cooldown", return_value=True),
+        patch("webapp.main_saas.scan_for_user.apply_async", return_value=_Task()) as mock_async,
+    ):
+        resp = saas_client.post("/api/scan?async_mode=true", json={}, headers=_auth_header())
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body.get("ok") is True
+    assert (body.get("data") or {}).get("task_id") == "scan_task_1"
+    assert mock_async.call_args.kwargs.get("queue") == "scan"
+
+
+def test_phase2_stage1_enqueue_routes_to_phase2_queue(saas_client: TestClient, test_db: sessionmaker) -> None:
+    db = test_db()
+    try:
+        _seed_user_with_schwab(db)
+    finally:
+        db.close()
+
+    class _Task:
+        id = "phase2_task_1"
+
+    with (
+        patch("webapp.main_saas._backtest_rate_limit", return_value=None),
+        patch("webapp.main_saas.phase2_stage1_for_user.apply_async", return_value=_Task()) as mock_async,
+    ):
+        resp = saas_client.post("/api/phase2/stage1-runs", headers=_auth_header())
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body.get("ok") is True
+    assert (body.get("data") or {}).get("task_id") == "phase2_task_1"
+    assert mock_async.call_args.kwargs.get("queue") == "phase2"
+
+
+def test_scan_lifecycle_task_id_preserves_response_shape(saas_client: TestClient, test_db: sessionmaker) -> None:
+    db = test_db()
+    try:
+        _seed_user_with_schwab(db)
+        db.add(
+            main_saas.AppState(
+                user_id="user_1",
+                key="task_binding:scan:task_123",
+                value_json=json.dumps({"task_id": "task_123", "scope": "scan"}),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    with patch("webapp.main_saas.AsyncResult") as mock_result:
+        mock_result.return_value.status = "PENDING"
+        mock_result.return_value.ready.return_value = False
+        resp = saas_client.get("/api/scan-lifecycle?task_id=task_123", headers=_auth_header())
+
+    assert resp.status_code == 200
+    payload = resp.json()["data"]
+    assert payload["mode"] == "saas"
+    assert payload["transport"] == "celery"
+    assert payload["task_id"] == "task_123"
+    assert payload["status"] in {"pending", "received", "started", "running", "unknown"}
+
+
 def test_scan_lifecycle_idle_with_last_scan(saas_client: TestClient, test_db: sessionmaker) -> None:
     db = test_db()
     try:

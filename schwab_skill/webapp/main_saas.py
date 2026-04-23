@@ -1068,7 +1068,9 @@ def run_scan(
             status_code=409,
             detail=f"A scan was started recently; wait up to {cooldown}s before retrying.",
         )
-    task = scan_for_user.apply_async(args=[user.id, scan_opts], queue="scan")
+    scan_queue = "scan"
+    task = scan_for_user.apply_async(args=[user.id, scan_opts], queue=scan_queue)
+    LOG.info("Enqueued scan task user_id=%s task_id=%s queue=%s", user.id, task.id, scan_queue)
     _save_user_task_binding(db, user.id, "scan", task.id)
     log_audit(
         db,
@@ -1486,7 +1488,9 @@ def queue_phase2_stage1_run(
     if not ok_scan:
         raise HTTPException(status_code=409, detail=reason)
     _backtest_rate_limit(user.id)
-    task = phase2_stage1_for_user.apply_async(args=[user.id], queue="scan")
+    phase2_queue = "phase2"
+    task = phase2_stage1_for_user.apply_async(args=[user.id], queue=phase2_queue)
+    LOG.info("Enqueued phase2 stage1 task user_id=%s task_id=%s queue=%s", user.id, task.id, phase2_queue)
     _save_user_task_binding(db, user.id, "phase2_stage1", task.id)
     log_audit(
         db,

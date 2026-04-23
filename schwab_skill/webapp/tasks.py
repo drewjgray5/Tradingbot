@@ -53,7 +53,7 @@ _celery_conf: dict[str, Any] = {
         "webapp.scan_for_user": {"queue": "scan"},
         "webapp.execute_order_for_user": {"queue": "orders"},
         "webapp.backtest_for_user": {"queue": "scan"},
-        "webapp.phase2_stage1_for_user": {"queue": "scan"},
+        "webapp.phase2_stage1_for_user": {"queue": "phase2"},
     },
     "task_default_queue": "celery",
 }
