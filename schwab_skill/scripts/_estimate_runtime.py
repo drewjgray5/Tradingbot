@@ -17,7 +17,6 @@ def main() -> int:
         ("late_bull", "2015-01-01", "2017-12-31"),
     ]
 
-    tickers_files = list(root.rglob("chunk_*_tickers.json"))
     chunks_per_era = {}
     for era, _, _ in eras_def:
         era_dir = root / era
@@ -58,9 +57,6 @@ def main() -> int:
     )
     if completed_paths:
         last_t = datetime.fromtimestamp(completed_paths[-1].stat().st_mtime, tz=timezone.utc)
-        progress_path = pathlib.Path(
-            "schwab_skill/validation_artifacts/multi_era_backtest_schwab_only_stage2_only_aug_progress.json"
-        )
         started_at = datetime.fromtimestamp(
             min(p.stat().st_ctime for p in (root / "recent_current").glob("chunk_*_tickers.json")),
             tz=timezone.utc,
@@ -81,7 +77,7 @@ def main() -> int:
         print(f"Estimated total chunks across 5 eras: {total_chunks}")
         print(f"Remaining chunks: {remaining_chunks}")
         print(f"ETA for stage2_only_aug full completion: {eta_hours:.1f} hours ({eta_hours/24:.2f} days)")
-        print(f"Note: later eras (volatility_chop, late_bull) span 2-3 years -> may run slower per chunk")
+        print("Note: later eras (volatility_chop, late_bull) span 2-3 years -> may run slower per chunk")
     else:
         print("No completed chunks yet for throughput estimation.")
 
