@@ -1,21 +1,8 @@
-from __future__ import annotations
-
-import json
-import sys
-from collections import defaultdict
-from pathlib import Path
-from statistics import mean
-from typing import Any
-
-SKILL_DIR = Path(__file__).resolve().parent.parent
+from __future__ import annotationsimport jsonimport sysfrom collections import defaultdictfrom pathlib import Pathfrom statistics import meanfrom typing import AnySKILL_DIR = Path(__file__).resolve().parent.parent
 if str(SKILL_DIR) not in sys.path:
     sys.path.insert(0, str(SKILL_DIR))
 
-from webapp.db import SessionLocal
-from webapp.models import BacktestRun
-
-
-VALIDATION_DIR = SKILL_DIR / "validation_artifacts"
+from webapp.db import SessionLocalfrom webapp.models import BacktestRunVALIDATION_DIR = SKILL_DIR / "validation_artifacts"
 OUTPUT_PATH = SKILL_DIR / "guardrail_analysis_summary.json"
 
 

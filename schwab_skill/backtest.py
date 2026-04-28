@@ -24,25 +24,21 @@ except ImportError:
     print("Install yfinance: pip install yfinance")
     raise
 
+from backtest_guardrails import AdaptiveGuardrailPolicy, load_adaptive_guardrail_policy
 from backtest_intelligence import (
     BacktestIntelligenceConfig,
     apply_event_risk_overlay,
     apply_exec_quality_overlay,
     apply_meta_policy_overlay,
     evaluate_event_risk_for_backtest,
-    simulate_exit_with_manager,
 )
-from backtest_guardrails import AdaptiveGuardrailPolicy, load_adaptive_guardrail_policy
 from config import (
     get_adaptive_stop_base_pct,
     get_adaptive_stop_enabled,
     get_backtest_adaptive_guardrail_policy_path,
     get_backtest_adaptive_guardrails_enabled,
-    get_backtest_portfolio_enabled,
     get_backtest_portfolio_max_positions,
     get_backtest_portfolio_starting_equity,
-    get_backtest_position_size_pct,
-    get_backtest_risk_per_trade_pct,
     get_breakout_confirm_enabled,
     get_forensic_altman_min,
     get_forensic_beneish_max,

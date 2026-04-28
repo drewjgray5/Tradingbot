@@ -31,7 +31,6 @@ def _load_phase1_payload(run_id: str, *, refresh: bool) -> dict[str, Any]:
             str(SKILL_DIR / "scripts" / "phase1_trade_diagnostics.py"),
             "--run-id",
             run_id,
-            "--no-spy",
         ]
         proc = subprocess.run(
             cmd,

@@ -1,16 +1,9 @@
 from __future__ import annotations
 
-
-
 import sys
-
 from pathlib import Path
 
-
-
 import pandas as pd
-
-
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 
@@ -21,12 +14,8 @@ if str(SKILL_DIR) not in sys.path:
 
 
 import backtest  # noqa: E402
-
-from backtest_intelligence import BacktestIntelligenceConfig  # noqa: E402
 from backtest_guardrails import AdaptiveGuardrailPolicy, GuardrailBucket  # noqa: E402
-
-
-
+from backtest_intelligence import BacktestIntelligenceConfig  # noqa: E402
 
 
 def _price_df(prices: list[float], volume: float = 1_000_000.0) -> pd.DataFrame:
