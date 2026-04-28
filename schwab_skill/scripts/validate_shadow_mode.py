@@ -37,6 +37,7 @@ def main() -> int:
 
     os.environ["EXECUTION_SHADOW_MODE"] = "true"
     os.environ["SECTOR_FILTER_ENABLED"] = "false"
+    os.environ["EVENT_RISK_MODE"] = "off"
 
     with (
         patch.object(execution, "DualSchwabAuth", _FakeAuth),
