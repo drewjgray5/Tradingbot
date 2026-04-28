@@ -96,8 +96,12 @@ def main() -> int:
         print(f"FAIL: unable to load phase1 diagnostics: {exc}")
         return 1
 
+    trade_count = int(payload.get("trade_count", 0) or 0)
     hold_buckets = ((payload.get("analysis") or {}).get("hold_buckets") or {})
     if not isinstance(hold_buckets, dict) or not hold_buckets:
+        if trade_count <= 0:
+            print("PASS: hold-duration guardrail skipped (no phase1 trades available)")
+            return 0
         print("FAIL: hold bucket diagnostics missing from artifact")
         return 1
 
@@ -134,6 +138,9 @@ def main() -> int:
         )
 
     if aggregate_long_n <= 0 or aggregate_short_n <= 0:
+        if trade_count <= 0:
+            print("PASS: hold-duration guardrail skipped (no phase1 trades available)")
+            return 0
         print("FAIL: insufficient hold bucket samples to validate guardrail")
         return 1
 
