@@ -95,6 +95,12 @@ def build_portfolio_risk_analytics(summary: dict[str, Any], *, skill_dir: str | 
             "positions_weighted": [],
             "day_pl_total": 0,
             "day_pl_breakdown": [],
+            "recommendation": {
+                "headline": "Build a diversified starter allocation",
+                "reason": "No open positions are currently available for risk analysis.",
+                "suggested_action": "When adding positions, target 3-5 sectors and keep each position below 20% of portfolio value.",
+                "priority": "low",
+            },
         }
 
     sector_buckets: dict[str, float] = {}
@@ -165,6 +171,12 @@ def build_portfolio_risk_analytics(summary: dict[str, Any], *, skill_dir: str | 
     }
 
     day_pl_breakdown.sort(key=lambda x: abs(float(x.get("day_pl", 0) or 0)), reverse=True)
+    recommendation = _build_portfolio_recommendation(
+        concentration=concentration,
+        sector_allocation=sector_allocation,
+        positions_weighted=weighted_positions,
+        day_pl_breakdown=day_pl_breakdown,
+    )
     return {
         "total_value": round(total_value, 2),
         "position_count": len(positions),
@@ -173,6 +185,73 @@ def build_portfolio_risk_analytics(summary: dict[str, Any], *, skill_dir: str | 
         "positions_weighted": weighted_positions,
         "day_pl_total": round(day_pl_total, 2),
         "day_pl_breakdown": day_pl_breakdown[:10],
+        "recommendation": recommendation,
+    }
+
+
+def _build_portfolio_recommendation(
+    *,
+    concentration: dict[str, Any],
+    sector_allocation: list[dict[str, Any]],
+    positions_weighted: list[dict[str, Any]],
+    day_pl_breakdown: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Return one high-level portfolio recommendation from risk metrics."""
+    top_position_pct = float(concentration.get("top_position_pct", 0) or 0)
+    top_5_pct = float(concentration.get("top_5_pct", 0) or 0)
+    sector_count = int(concentration.get("sector_count", 0) or 0)
+    largest_sector = sector_allocation[0] if sector_allocation else {}
+    largest_sector_name = str(largest_sector.get("sector") or "Unknown")
+    largest_sector_weight = float(largest_sector.get("weight_pct", 0) or 0)
+
+    largest_position = (
+        max(positions_weighted, key=lambda row: float(row.get("weight_pct", 0) or 0))
+        if positions_weighted
+        else {}
+    )
+    largest_position_symbol = str(largest_position.get("symbol") or "largest holding")
+
+    if top_position_pct >= 25:
+        return {
+            "headline": "Reduce single-position concentration",
+            "reason": f"{largest_position_symbol} represents {top_position_pct:.2f}% of portfolio value, which raises idiosyncratic drawdown risk.",
+            "suggested_action": f"Trim or hedge {largest_position_symbol} and redeploy exposure across additional uncorrelated names.",
+            "priority": "high",
+        }
+
+    if top_5_pct >= 60:
+        return {
+            "headline": "Broaden exposure beyond top holdings",
+            "reason": f"The top 5 holdings represent {top_5_pct:.2f}% of total portfolio value.",
+            "suggested_action": "Add smaller positions outside the current top 5 names to reduce concentration shocks.",
+            "priority": "medium",
+        }
+
+    if largest_sector_weight >= 35 or (sector_count > 0 and sector_count < 4):
+        return {
+            "headline": "Improve sector diversification",
+            "reason": f"{largest_sector_name} is {largest_sector_weight:.2f}% of portfolio exposure across {sector_count} sectors.",
+            "suggested_action": "Rebalance incremental capital toward underrepresented sectors to smooth regime-specific volatility.",
+            "priority": "medium",
+        }
+
+    biggest_mover = day_pl_breakdown[0] if day_pl_breakdown else {}
+    biggest_mover_day_pl = float(biggest_mover.get("day_pl", 0) or 0)
+    biggest_mover_contrib = abs(float(biggest_mover.get("contribution_pct", 0) or 0))
+    biggest_mover_symbol = str(biggest_mover.get("symbol") or "a single name")
+    if biggest_mover_day_pl < 0 and biggest_mover_contrib >= 0.75:
+        return {
+            "headline": "Limit single-name downside contribution",
+            "reason": f"{biggest_mover_symbol} is driving {biggest_mover_contrib:.2f}% of portfolio value in daily downside.",
+            "suggested_action": "Use tighter position-size/risk limits for this name and offset with lower-correlation exposure.",
+            "priority": "medium",
+        }
+
+    return {
+        "headline": "Maintain balance and rebalance on schedule",
+        "reason": "Current concentration and sector mix appear broadly balanced.",
+        "suggested_action": "Keep periodic rebalancing rules in place and cap new positions near current portfolio risk limits.",
+        "priority": "low",
     }
 
 
