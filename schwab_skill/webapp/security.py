@@ -339,7 +339,15 @@ def require_paid_entitlement(user: User = Depends(get_current_user)) -> User:
     return user
 
 
-def parse_json(raw: str | None, fallback: dict[str, Any] | list[Any]) -> dict[str, Any] | list[Any]:
+def parse_json(raw: Any, fallback: dict[str, Any] | list[Any]) -> dict[str, Any] | list[Any]:
+    if raw is None:
+        return fallback
+    if isinstance(fallback, list):
+        if isinstance(raw, list):
+            return raw
+    else:
+        if isinstance(raw, dict):
+            return raw
     if not raw:
         return fallback
     try:
