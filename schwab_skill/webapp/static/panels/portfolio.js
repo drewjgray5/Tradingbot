@@ -1,12 +1,12 @@
 /**
  * Portfolio panel: positions table + risk analytics card.
  *
- * `refreshPortfolio` paints the positions table and offers a "Run Scan
- * to Begin" CTA when empty; the CTA target is injected (we don't want
- * a circular import on `scan.js`).
+ * `refreshPortfolio` paints the positions table and shows setup guidance
+ * when no account positions are available.
  *
  * `loadPortfolioRisk` paints the risk analytics block underneath
- * (concentration, sector allocation, position weights, day-PL movers).
+ * (concentration, sector allocation, position weights, day-PL movers,
+ * and a single high-level recommendation).
  */
 
 import { api } from "../modules/api.js";
@@ -14,7 +14,7 @@ import { safeText, safeNum, formatMoney, formatDecimal } from "../modules/format
 import { logEvent } from "../modules/logger.js";
 import { state } from "../modules/state.js";
 
-export async function refreshPortfolio({ runScan = () => {} } = {}) {
+export async function refreshPortfolio() {
   const out = await api.get("/api/portfolio");
   const body = document.getElementById("portfolioBody");
   const meta = document.getElementById("portfolioMeta");
@@ -38,14 +38,12 @@ export async function refreshPortfolio({ runScan = () => {} } = {}) {
               <path d="M12 3v18M3 12h18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
               <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.5"/>
             </svg>
-            <div>No open positions yet.</div>
-            <button id="portfolioEmptyCtaBtn" class="btn small secondary" type="button">Run Scan to Begin</button>
+            <div>No open positions in this account yet.</div>
+            <a href="#settingsSection" class="btn small secondary">Open Setup</a>
           </div>
         </td>
       </tr>
     `;
-    const cta = document.getElementById("portfolioEmptyCtaBtn");
-    if (cta) cta.addEventListener("click", runScan);
     return;
   }
   data.positions.slice(0, 25).forEach((p) => {
@@ -81,7 +79,14 @@ export async function loadPortfolioRisk() {
   const d = out.data;
   state.lastPortfolioRiskData = d;
   if (!d.position_count) {
-    panel.innerHTML = `<div class="muted">No positions to analyze.</div>`;
+    const emptyRec = d.recommendation || {};
+    panel.innerHTML = `
+      <div class="muted">No positions to analyze.</div>
+      <div class="risk-recommendation-card" style="margin-top:0.65rem">
+        <div class="risk-section-title">Recommendation</div>
+        <div>${safeText(emptyRec.headline || "Build a diversified starter allocation")}</div>
+        <div class="muted small">${safeText(emptyRec.suggested_action || "When adding positions, spread exposure across multiple sectors and avoid oversized initial positions.")}</div>
+      </div>`;
     return;
   }
 
@@ -116,6 +121,19 @@ export async function loadPortfolioRisk() {
         <div class="risk-kpi-label">Sectors</div>
       </div>
     </div>`;
+
+  if (d.recommendation) {
+    const rec = d.recommendation;
+    const priority = String(rec.priority || "low").toLowerCase();
+    const priorityColor = priority === "high" ? "var(--bad)" : priority === "medium" ? "var(--warn)" : "var(--good)";
+    html += `
+      <div class="risk-section-title">Recommendation</div>
+      <div class="risk-recommendation-card">
+        <div style="font-weight:600;color:${priorityColor}">${safeText(rec.headline || "Portfolio recommendation")}</div>
+        <div class="muted" style="margin-top:0.2rem">${safeText(rec.reason || "")}</div>
+        <div class="muted small" style="margin-top:0.35rem">${safeText(rec.suggested_action || "")}</div>
+      </div>`;
+  }
 
   if (d.sector_allocation && d.sector_allocation.length) {
     const maxSector = Math.max(1, ...d.sector_allocation.map((s) => s.weight_pct));

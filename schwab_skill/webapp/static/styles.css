@@ -3447,6 +3447,12 @@ progress::-moz-progress-bar {
   letter-spacing: 0.04em;
   margin: 16px 0 8px;
 }
+.risk-recommendation-card {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
 .risk-sector-bars, .risk-weight-grid, .risk-pl-list {
   display: flex;
   flex-direction: column;

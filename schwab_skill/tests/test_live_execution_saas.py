@@ -350,6 +350,9 @@ def test_portfolio_risk_route_available_in_saas(saas_client: TestClient, test_db
     data = body.get("data") or {}
     assert data.get("position_count") == 1
     assert isinstance(data.get("sector_allocation"), list)
+    rec = data.get("recommendation") or {}
+    assert isinstance(rec, dict)
+    assert rec.get("headline")
 
 
 def test_pending_trade_delete_endpoints_in_saas(saas_client: TestClient, test_db: sessionmaker) -> None:

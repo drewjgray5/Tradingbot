@@ -1376,14 +1376,34 @@ def get_account_status(
             return "Error: Schwab connection unstable (circuit breaker)"
         token = auth.get_account_token()
         url = f"{SCHWAB_BASE}/trader/v1/accounts"
-        resp = requests.get(url, headers=_get_headers(token, for_get=True), timeout=30)
+        resp = requests.get(
+            url,
+            headers=_get_headers(token, for_get=True),
+            params={"fields": "positions"},
+            timeout=30,
+        )
         if resp.status_code == 401 and auth.account_session.force_refresh():
             token = auth.get_account_token()
+            resp = requests.get(
+                url,
+                headers=_get_headers(token, for_get=True),
+                params={"fields": "positions"},
+                timeout=30,
+            )
+        if not resp.ok and resp.status_code in (400, 404):
+            # Some account configurations reject optional fields; retry base endpoint.
             resp = requests.get(url, headers=_get_headers(token, for_get=True), timeout=30)
         if not resp.ok:
             return _parse_trader_error(resp)
         data = resp.json()
-        accounts = data if isinstance(data, list) else []
+        if isinstance(data, list):
+            accounts = data
+        elif isinstance(data, dict) and isinstance(data.get("accounts"), list):
+            accounts = data.get("accounts", [])
+        elif isinstance(data, dict) and isinstance(data.get("securitiesAccount"), dict):
+            accounts = [data]
+        else:
+            accounts = []
         ids = []
         for acc in accounts:
             sec = acc.get("securitiesAccount", acc)
